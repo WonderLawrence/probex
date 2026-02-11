@@ -381,6 +381,217 @@ fn try_sys_exit_write(ctx: &TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
+/// sys_enter_mmap tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_mmap/format:
+/// - __syscall_nr: offset 8
+/// - addr: offset 16
+/// - len: offset 24
+#[tracepoint]
+pub fn sys_enter_mmap(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_mmap(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_mmap(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let addr: u64 = unsafe { ctx.read_at(16)? };
+    let len: u64 = unsafe { ctx.read_at(24)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallMmapEnter),
+            fd: addr as i64,
+            count: len,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_mmap tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_mmap/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_mmap(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_mmap(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_mmap(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallMmapExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_munmap tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_munmap/format:
+/// - __syscall_nr: offset 8
+/// - addr: offset 16
+/// - len: offset 24
+#[tracepoint]
+pub fn sys_enter_munmap(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_munmap(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_munmap(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let addr: u64 = unsafe { ctx.read_at(16)? };
+    let len: u64 = unsafe { ctx.read_at(24)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallMunmapEnter),
+            fd: addr as i64,
+            count: len,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_munmap tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_munmap/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_munmap(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_munmap(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_munmap(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallMunmapExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_brk tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_brk/format:
+/// - __syscall_nr: offset 8
+/// - brk: offset 16
+#[tracepoint]
+pub fn sys_enter_brk(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_brk(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_brk(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let brk: u64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallBrkEnter),
+            fd: brk as i64,
+            count: 0,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_brk tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_brk/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_brk(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_brk(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_brk(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallBrkExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

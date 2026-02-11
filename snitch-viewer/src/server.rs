@@ -13,6 +13,7 @@ pub struct TraceEvent {
     pub event_type: String,
     pub ts_ns: u64,
     pub pid: u32,
+    pub process_name: Option<String>,
     pub cpu: u8,
     // SchedSwitch fields
     pub prev_pid: Option<u32>,
@@ -61,6 +62,25 @@ pub struct EventTypeCounts {
     pub counts: HashMap<String, usize>,
 }
 
+/// Latency summary statistics in nanoseconds.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct LatencySummary {
+    pub count: usize,
+    pub avg_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub max_ns: u64,
+}
+
+/// Read/write syscall latency summaries.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct SyscallLatencyStats {
+    pub read: LatencySummary,
+    pub write: LatencySummary,
+    pub mmap_alloc_bytes: u64,
+    pub munmap_free_bytes: u64,
+}
+
 /// Filters for querying events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EventFilters {
@@ -94,6 +114,7 @@ pub struct EventsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessLifetime {
     pub pid: u32,
+    pub process_name: Option<String>,
     pub parent_pid: Option<u32>,
     pub start_ns: u64,
     pub end_ns: Option<u64>,
@@ -205,6 +226,28 @@ mod backend {
                 }
             })
             .unwrap_or_default()
+    }
+
+    fn extract_option_string(
+        batch: &datafusion::arrow::record_batch::RecordBatch,
+        col: &str,
+        row: usize,
+    ) -> Option<String> {
+        batch
+            .column_by_name(col)
+            .and_then(|c| c.as_any().downcast_ref::<StringViewArray>())
+            .and_then(|arr| {
+                if arr.is_null(row) {
+                    None
+                } else {
+                    let value = arr.value(row);
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                }
+            })
     }
 
     fn extract_u64(
@@ -389,6 +432,7 @@ mod backend {
                     event_type: extract_string(batch, "event_type", row),
                     ts_ns: extract_u64(batch, "ts_ns", row),
                     pid: extract_u32(batch, "pid", row),
+                    process_name: extract_option_string(batch, "process_name", row),
                     cpu: extract_u8(batch, "cpu", row),
                     prev_pid: extract_option_u32(batch, "prev_pid", row),
                     next_pid: extract_option_u32(batch, "next_pid", row),
@@ -528,6 +572,153 @@ mod backend {
         Ok(EventTypeCounts { counts })
     }
 
+    pub async fn query_pid_event_type_counts(
+        pid: u32,
+        start_ns: Option<u64>,
+        end_ns: Option<u64>,
+    ) -> Result<EventTypeCounts, Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = get_ctx()?;
+
+        let mut conditions = vec![format!("pid = {}", pid)];
+        if let Some(start) = start_ns {
+            conditions.push(format!("ts_ns >= {}", start));
+        }
+        if let Some(end) = end_ns {
+            conditions.push(format!("ts_ns <= {}", end));
+        }
+
+        let where_clause = format!("WHERE {}", conditions.join(" AND "));
+        let sql = format!(
+            "SELECT event_type, COUNT(*) as cnt FROM events {} GROUP BY event_type",
+            where_clause
+        );
+
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        let mut counts = std::collections::HashMap::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let event_type = extract_string(batch, "event_type", row);
+                let cnt = batch
+                    .column_by_name("cnt")
+                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+                    .map(|arr| arr.value(row) as usize)
+                    .unwrap_or(0);
+                counts.insert(event_type, cnt);
+            }
+        }
+
+        Ok(EventTypeCounts { counts })
+    }
+
+    pub async fn query_syscall_latency_stats(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+    ) -> Result<SyscallLatencyStats, Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = get_ctx()?;
+
+        let mut conditions = vec![format!("ts_ns >= {}", start_ns), format!("ts_ns <= {}", end_ns)];
+        if let Some(pid) = pid {
+            conditions.push(format!("pid = {}", pid));
+        }
+
+        let sql = format!(
+            "SELECT pid, ts_ns, event_type, count
+             FROM events
+             WHERE {}
+               AND event_type IN (
+                 'syscall_read_enter', 'syscall_read_exit',
+                 'syscall_write_enter', 'syscall_write_exit',
+                 'syscall_mmap_enter', 'syscall_munmap_enter'
+               )
+             ORDER BY pid, ts_ns",
+            conditions.join(" AND ")
+        );
+
+        let df = ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+
+        let mut pending_read: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+        let mut pending_write: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
+        let mut read_latencies: Vec<u64> = Vec::new();
+        let mut write_latencies: Vec<u64> = Vec::new();
+        let mut mmap_alloc_bytes: u64 = 0;
+        let mut munmap_free_bytes: u64 = 0;
+
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let pid = extract_u32(batch, "pid", row);
+                let ts = extract_u64(batch, "ts_ns", row);
+                let event_type = extract_string(batch, "event_type", row);
+                let count = extract_option_u64(batch, "count", row).unwrap_or(0);
+
+                match event_type.as_str() {
+                    "syscall_read_enter" => pending_read.entry(pid).or_default().push_back(ts),
+                    "syscall_read_exit" => {
+                        if let Some(queue) = pending_read.get_mut(&pid) {
+                            if let Some(start_ts) = queue.pop_front() {
+                                if ts >= start_ts {
+                                    read_latencies.push(ts - start_ts);
+                                }
+                            }
+                        }
+                    }
+                    "syscall_write_enter" => pending_write.entry(pid).or_default().push_back(ts),
+                    "syscall_write_exit" => {
+                        if let Some(queue) = pending_write.get_mut(&pid) {
+                            if let Some(start_ts) = queue.pop_front() {
+                                if ts >= start_ts {
+                                    write_latencies.push(ts - start_ts);
+                                }
+                            }
+                        }
+                    }
+                    "syscall_mmap_enter" => {
+                        mmap_alloc_bytes = mmap_alloc_bytes.saturating_add(count);
+                    }
+                    "syscall_munmap_enter" => {
+                        munmap_free_bytes = munmap_free_bytes.saturating_add(count);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(SyscallLatencyStats {
+            read: summarize_latencies(&read_latencies),
+            write: summarize_latencies(&write_latencies),
+            mmap_alloc_bytes,
+            munmap_free_bytes,
+        })
+    }
+
+    fn summarize_latencies(latencies: &[u64]) -> LatencySummary {
+        if latencies.is_empty() {
+            return LatencySummary::default();
+        }
+
+        let mut sorted = latencies.to_vec();
+        sorted.sort_unstable();
+        let count = sorted.len();
+        let sum: u128 = sorted.iter().map(|v| *v as u128).sum();
+        let avg_ns = (sum / count as u128) as u64;
+        let p50_idx = ((count - 1) * 50) / 100;
+        let p95_idx = ((count - 1) * 95) / 100;
+        let max_ns = *sorted.last().unwrap_or(&0);
+
+        LatencySummary {
+            count,
+            avg_ns,
+            p50_ns: sorted[p50_idx],
+            p95_ns: sorted[p95_idx],
+            max_ns,
+        }
+    }
+
     pub async fn query_summary() -> Result<TraceSummary, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = get_ctx()?;
 
@@ -611,10 +802,25 @@ mod backend {
         let times_df = ctx.sql(times_sql).await?;
         let times_batches = times_df.collect().await?;
 
+        // Best-effort process names for each PID (available in newer traces).
+        // This query may fail on older parquet files that do not have process_name.
+        let name_batches = match ctx
+            .sql(
+                "SELECT pid, process_name, ts_ns FROM events
+                 WHERE process_name IS NOT NULL AND process_name <> ''
+                 ORDER BY ts_ns",
+            )
+            .await
+        {
+            Ok(df) => df.collect().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+
         // Build maps
         let mut fork_info: std::collections::HashMap<u32, (u32, u64)> = std::collections::HashMap::new(); // child -> (parent, ts)
         let mut exit_info: std::collections::HashMap<u32, (i32, u64)> = std::collections::HashMap::new(); // pid -> (exit_code, ts)
         let mut pid_times: std::collections::HashMap<u32, (u64, u64)> = std::collections::HashMap::new(); // pid -> (first, last)
+        let mut pid_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new(); // pid -> name
 
         // Parse fork events
         for batch in &fork_batches {
@@ -648,6 +854,16 @@ mod backend {
             }
         }
 
+        // Parse process names (keep first-seen non-empty name for each PID)
+        for batch in &name_batches {
+            for row in 0..batch.num_rows() {
+                let pid = extract_u32(batch, "pid", row);
+                if let Some(name) = extract_option_string(batch, "process_name", row) {
+                    pid_names.entry(pid).or_insert(name);
+                }
+            }
+        }
+
         // Build process lifetimes
         let mut processes: Vec<ProcessLifetime> = Vec::new();
         for (pid, (first_seen, last_seen)) in &pid_times {
@@ -665,6 +881,7 @@ mod backend {
 
             processes.push(ProcessLifetime {
                 pid: *pid,
+                process_name: pid_names.get(pid).cloned(),
                 parent_pid,
                 start_ns,
                 end_ns,
@@ -786,6 +1003,28 @@ pub async fn get_event_type_counts(
     backend::query_event_type_counts(start_ns, end_ns)
         .await
         .map_err(|e| ServerFnError::new(format!("Event type counts query failed: {}", e)))
+}
+
+#[server]
+pub async fn get_pid_event_type_counts(
+    pid: u32,
+    start_ns: Option<u64>,
+    end_ns: Option<u64>,
+) -> Result<EventTypeCounts, ServerFnError> {
+    backend::query_pid_event_type_counts(pid, start_ns, end_ns)
+        .await
+        .map_err(|e| ServerFnError::new(format!("PID event counts query failed: {}", e)))
+}
+
+#[server]
+pub async fn get_syscall_latency_stats(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+) -> Result<SyscallLatencyStats, ServerFnError> {
+    backend::query_syscall_latency_stats(start_ns, end_ns, pid)
+        .await
+        .map_err(|e| ServerFnError::new(format!("Syscall latency stats query failed: {}", e)))
 }
 
 #[server]

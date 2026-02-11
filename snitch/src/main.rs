@@ -88,6 +88,12 @@
 //! | syscall_read_exit | syscalls:sys_exit_read | ret |
 //! | syscall_write_enter | syscalls:sys_enter_write | fd, count |
 //! | syscall_write_exit | syscalls:sys_exit_write | ret |
+//! | syscall_mmap_enter | syscalls:sys_enter_mmap | address, count(len) |
+//! | syscall_mmap_exit | syscalls:sys_exit_mmap | ret |
+//! | syscall_munmap_enter | syscalls:sys_enter_munmap | address, count(len) |
+//! | syscall_munmap_exit | syscalls:sys_exit_munmap | ret |
+//! | syscall_brk_enter | syscalls:sys_enter_brk | address |
+//! | syscall_brk_exit | syscalls:sys_exit_brk | ret |
 
 use std::{
     ffi::CString,
@@ -157,6 +163,7 @@ struct Event {
     event_type: &'static str,
     ts_ns: u64,
     pid: u32,
+    process_name: Option<String>,
     cpu: u8,
     // SchedSwitch fields
     prev_pid: Option<u32>,
@@ -182,6 +189,7 @@ fn create_schema() -> Schema {
         Field::new("event_type", DataType::Utf8, false),
         Field::new("ts_ns", DataType::UInt64, false),
         Field::new("pid", DataType::UInt32, false),
+        Field::new("process_name", DataType::Utf8, true),
         Field::new("cpu", DataType::UInt8, false),
         // SchedSwitch fields (nullable)
         Field::new("prev_pid", DataType::UInt32, true),
@@ -254,6 +262,7 @@ impl ParquetBatchWriter {
         let mut event_type_builder = StringBuilder::with_capacity(batch_len, batch_len * 20);
         let mut ts_ns_builder = UInt64Builder::with_capacity(batch_len);
         let mut pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut process_name_builder = StringBuilder::with_capacity(batch_len, batch_len * 24);
         let mut cpu_builder = UInt8Builder::with_capacity(batch_len);
         let mut prev_pid_builder = UInt32Builder::with_capacity(batch_len);
         let mut next_pid_builder = UInt32Builder::with_capacity(batch_len);
@@ -271,6 +280,7 @@ impl ParquetBatchWriter {
             event_type_builder.append_value(event.event_type);
             ts_ns_builder.append_value(event.ts_ns);
             pid_builder.append_value(event.pid);
+            process_name_builder.append_option(event.process_name.as_deref());
             cpu_builder.append_value(event.cpu);
             prev_pid_builder.append_option(event.prev_pid);
             next_pid_builder.append_option(event.next_pid);
@@ -289,6 +299,7 @@ impl ParquetBatchWriter {
             Arc::new(event_type_builder.finish()),
             Arc::new(ts_ns_builder.finish()),
             Arc::new(pid_builder.finish()),
+            Arc::new(process_name_builder.finish()),
             Arc::new(cpu_builder.finish()),
             Arc::new(prev_pid_builder.finish()),
             Arc::new(next_pid_builder.finish()),
@@ -460,7 +471,115 @@ fn parse_event(data: &[u8]) -> Option<Event> {
                 ..Default::default()
             })
         }
+        EventType::SyscallMmapEnter => {
+            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
+                return None;
+            }
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            Some(Event {
+                event_type: "syscall_mmap_enter",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                address: Some(event.fd as u64),
+                count: Some(event.count),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallMmapExit => {
+            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
+                return None;
+            }
+            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
+            Some(Event {
+                event_type: "syscall_mmap_exit",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                ret: Some(event.ret),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallMunmapEnter => {
+            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
+                return None;
+            }
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            Some(Event {
+                event_type: "syscall_munmap_enter",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                address: Some(event.fd as u64),
+                count: Some(event.count),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallMunmapExit => {
+            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
+                return None;
+            }
+            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
+            Some(Event {
+                event_type: "syscall_munmap_exit",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                ret: Some(event.ret),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallBrkEnter => {
+            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
+                return None;
+            }
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            Some(Event {
+                event_type: "syscall_brk_enter",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                address: Some(event.fd as u64),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallBrkExit => {
+            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
+                return None;
+            }
+            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
+            Some(Event {
+                event_type: "syscall_brk_exit",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                ret: Some(event.ret),
+                ..Default::default()
+            })
+        }
     }
+}
+
+fn read_process_name(pid: u32) -> Option<String> {
+    let comm_path = format!("/proc/{pid}/comm");
+    std::fs::read_to_string(comm_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn enrich_process_name(
+    event: &mut Event,
+    pid_name_cache: &mut std::collections::HashMap<u32, Option<String>>,
+) {
+    let maybe_name = pid_name_cache
+        .entry(event.pid)
+        .or_insert_with(|| read_process_name(event.pid))
+        .clone();
+    event.process_name = maybe_name;
 }
 
 /// Attach a tracepoint program
@@ -610,6 +729,12 @@ async fn main() -> Result<()> {
     attach_tracepoint(&mut ebpf, "sys_exit_read", "syscalls", "sys_exit_read")?;
     attach_tracepoint(&mut ebpf, "sys_enter_write", "syscalls", "sys_enter_write")?;
     attach_tracepoint(&mut ebpf, "sys_exit_write", "syscalls", "sys_exit_write")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_mmap", "syscalls", "sys_enter_mmap")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_mmap", "syscalls", "sys_exit_mmap")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_munmap", "syscalls", "sys_enter_munmap")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_munmap", "syscalls", "sys_exit_munmap")?;
+    attach_tracepoint(&mut ebpf, "sys_enter_brk", "syscalls", "sys_enter_brk")?;
+    attach_tracepoint(&mut ebpf, "sys_exit_brk", "syscalls", "sys_exit_brk")?;
 
     // Resume child process
     kill(child_pid, Signal::SIGCONT)
@@ -625,6 +750,8 @@ async fn main() -> Result<()> {
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
 
     let mut child_wait_done = false;
+    let mut pid_name_cache: std::collections::HashMap<u32, Option<String>> =
+        std::collections::HashMap::new();
 
     // Event loop
     info!("Starting event loop...");
@@ -642,7 +769,8 @@ async fn main() -> Result<()> {
 
                 // Drain any remaining events
                 while let Some(item) = async_ring_buf.get_mut().next() {
-                    if let Some(event) = parse_event(&item) {
+                    if let Some(mut event) = parse_event(&item) {
+                        enrich_process_name(&mut event, &mut pid_name_cache);
                         writer.push(event)?;
                     }
                 }
@@ -665,7 +793,8 @@ async fn main() -> Result<()> {
 
                 // Process all available events
                 while let Some(item) = guard.get_inner_mut().next() {
-                    if let Some(event) = parse_event(&item) {
+                    if let Some(mut event) = parse_event(&item) {
+                        enrich_process_name(&mut event, &mut pid_name_cache);
                         writer.push(event)?;
                     }
                 }

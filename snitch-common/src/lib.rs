@@ -12,6 +12,12 @@ pub enum EventType {
     SyscallReadExit = 5,
     SyscallWriteEnter = 6,
     SyscallWriteExit = 7,
+    SyscallMmapEnter = 8,
+    SyscallMmapExit = 9,
+    SyscallMunmapEnter = 10,
+    SyscallMunmapExit = 11,
+    SyscallBrkEnter = 12,
+    SyscallBrkExit = 13,
 }
 
 impl TryFrom<u8> for EventType {
@@ -27,6 +33,12 @@ impl TryFrom<u8> for EventType {
             5 => Ok(EventType::SyscallReadExit),
             6 => Ok(EventType::SyscallWriteEnter),
             7 => Ok(EventType::SyscallWriteExit),
+            8 => Ok(EventType::SyscallMmapEnter),
+            9 => Ok(EventType::SyscallMmapExit),
+            10 => Ok(EventType::SyscallMunmapEnter),
+            11 => Ok(EventType::SyscallMunmapExit),
+            12 => Ok(EventType::SyscallBrkEnter),
+            13 => Ok(EventType::SyscallBrkExit),
             v => Err(v),
         }
     }
