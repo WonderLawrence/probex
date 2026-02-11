@@ -141,6 +141,36 @@ pub fn format_event_details(event: &TraceEvent) -> String {
         "syscall_brk_exit" => {
             format!("ret:{}", event.ret.unwrap_or(0))
         }
+        "syscall_io_uring_setup_enter" => {
+            format!(
+                "entries:{} params_ptr:0x{:x}",
+                event.fd.unwrap_or(0),
+                event.count.unwrap_or(0)
+            )
+        }
+        "syscall_io_uring_setup_exit" => {
+            format!("ret:{}", event.ret.unwrap_or(0))
+        }
+        "syscall_io_uring_enter_enter" => {
+            format!(
+                "fd:{} to_submit:{}",
+                event.fd.unwrap_or(-1),
+                event.count.unwrap_or(0)
+            )
+        }
+        "syscall_io_uring_enter_exit" => {
+            format!("ret:{}", event.ret.unwrap_or(0))
+        }
+        "syscall_io_uring_register_enter" => {
+            format!(
+                "fd:{} opcode:{}",
+                event.fd.unwrap_or(-1),
+                event.count.unwrap_or(0)
+            )
+        }
+        "syscall_io_uring_register_exit" => {
+            format!("ret:{}", event.ret.unwrap_or(0))
+        }
         _ => String::new(),
     }
 }

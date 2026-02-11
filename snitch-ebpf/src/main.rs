@@ -592,6 +592,219 @@ fn try_sys_exit_brk(ctx: &TracePointContext) -> Result<u32, i64> {
     Ok(0)
 }
 
+/// sys_enter_io_uring_setup tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_io_uring_setup/format:
+/// - __syscall_nr: offset 8
+/// - entries: offset 16
+/// - p: offset 24
+#[tracepoint]
+pub fn sys_enter_io_uring_setup(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_io_uring_setup(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_io_uring_setup(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let entries: u64 = unsafe { ctx.read_at(16)? };
+    let params_ptr: u64 = unsafe { ctx.read_at(24)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallIoUringSetupEnter),
+            fd: entries as i64,
+            count: params_ptr,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_io_uring_setup tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_io_uring_setup/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_io_uring_setup(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_io_uring_setup(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_io_uring_setup(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallIoUringSetupExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_io_uring_enter tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_io_uring_enter/format:
+/// - __syscall_nr: offset 8
+/// - fd: offset 16
+/// - to_submit: offset 24
+#[tracepoint]
+pub fn sys_enter_io_uring_enter(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_io_uring_enter(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_io_uring_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+    let to_submit: u64 = unsafe { ctx.read_at(24)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallIoUringEnterEnter),
+            fd,
+            count: to_submit,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_io_uring_enter tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_io_uring_enter/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_io_uring_enter(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_io_uring_enter(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_io_uring_enter(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallIoUringEnterExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_enter_io_uring_register tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_enter_io_uring_register/format:
+/// - __syscall_nr: offset 8
+/// - fd: offset 16
+/// - opcode: offset 24
+#[tracepoint]
+pub fn sys_enter_io_uring_register(ctx: TracePointContext) -> u32 {
+    match try_sys_enter_io_uring_register(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_enter_io_uring_register(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let fd: i64 = unsafe { ctx.read_at(16)? };
+    let opcode: u64 = unsafe { ctx.read_at(24)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallEnterEvent>(0) {
+        let event = SyscallEnterEvent {
+            header: make_header(ctx, EventType::SyscallIoUringRegisterEnter),
+            fd,
+            count: opcode,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
+/// sys_exit_io_uring_register tracepoint handler
+/// Tracepoint format from /sys/kernel/tracing/events/syscalls/sys_exit_io_uring_register/format:
+/// - __syscall_nr: offset 8
+/// - ret: offset 16
+#[tracepoint]
+pub fn sys_exit_io_uring_register(ctx: TracePointContext) -> u32 {
+    match try_sys_exit_io_uring_register(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_sys_exit_io_uring_register(ctx: &TracePointContext) -> Result<u32, i64> {
+    let tgid = ctx.tgid();
+    if !is_traced(tgid) {
+        return Ok(0);
+    }
+
+    let ret: i64 = unsafe { ctx.read_at(16)? };
+
+    if let Some(mut buf) = EVENTS.reserve::<SyscallExitEvent>(0) {
+        let event = SyscallExitEvent {
+            header: make_header(ctx, EventType::SyscallIoUringRegisterExit),
+            ret,
+        };
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    }
+
+    Ok(0)
+}
+
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

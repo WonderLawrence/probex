@@ -627,6 +627,7 @@ mod backend {
                AND event_type IN (
                  'syscall_read_enter', 'syscall_read_exit',
                  'syscall_write_enter', 'syscall_write_exit',
+                 'syscall_io_uring_enter_enter', 'syscall_io_uring_enter_exit',
                  'syscall_mmap_enter', 'syscall_munmap_enter'
                )
              ORDER BY pid, ts_ns",
@@ -640,8 +641,11 @@ mod backend {
             std::collections::HashMap::new();
         let mut pending_write: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
             std::collections::HashMap::new();
+        let mut pending_io_uring: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
+            std::collections::HashMap::new();
         let mut read_latencies: Vec<u64> = Vec::new();
         let mut write_latencies: Vec<u64> = Vec::new();
+        let mut io_uring_enter_latencies: Vec<u64> = Vec::new();
         let mut mmap_alloc_bytes: u64 = 0;
         let mut munmap_free_bytes: u64 = 0;
 
@@ -673,6 +677,18 @@ mod backend {
                             }
                         }
                     }
+                    "syscall_io_uring_enter_enter" => {
+                        pending_io_uring.entry(pid).or_default().push_back(ts)
+                    }
+                    "syscall_io_uring_enter_exit" => {
+                        if let Some(queue) = pending_io_uring.get_mut(&pid) {
+                            if let Some(start_ts) = queue.pop_front() {
+                                if ts >= start_ts {
+                                    io_uring_enter_latencies.push(ts - start_ts);
+                                }
+                            }
+                        }
+                    }
                     "syscall_mmap_enter" => {
                         mmap_alloc_bytes = mmap_alloc_bytes.saturating_add(count);
                     }
@@ -682,6 +698,13 @@ mod backend {
                     _ => {}
                 }
             }
+        }
+
+        // io_uring_enter can represent read or write style I/O submissions.
+        // Without SQE opcode tracing, attribute these latencies to both aggregates.
+        if !io_uring_enter_latencies.is_empty() {
+            read_latencies.extend(io_uring_enter_latencies.iter().copied());
+            write_latencies.extend(io_uring_enter_latencies.iter().copied());
         }
 
         Ok(SyscallLatencyStats {

@@ -94,6 +94,12 @@
 //! | syscall_munmap_exit | syscalls:sys_exit_munmap | ret |
 //! | syscall_brk_enter | syscalls:sys_enter_brk | address |
 //! | syscall_brk_exit | syscalls:sys_exit_brk | ret |
+//! | syscall_io_uring_setup_enter | syscalls:sys_enter_io_uring_setup | entries, params_ptr |
+//! | syscall_io_uring_setup_exit | syscalls:sys_exit_io_uring_setup | ret |
+//! | syscall_io_uring_enter_enter | syscalls:sys_enter_io_uring_enter | fd, to_submit |
+//! | syscall_io_uring_enter_exit | syscalls:sys_exit_io_uring_enter | ret |
+//! | syscall_io_uring_register_enter | syscalls:sys_enter_io_uring_register | fd, opcode |
+//! | syscall_io_uring_register_exit | syscalls:sys_exit_io_uring_register | ret |
 
 use std::{
     ffi::CString,
@@ -560,6 +566,96 @@ fn parse_event(data: &[u8]) -> Option<Event> {
                 ..Default::default()
             })
         }
+        EventType::SyscallIoUringSetupEnter => {
+            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
+                return None;
+            }
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            Some(Event {
+                event_type: "syscall_io_uring_setup_enter",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                fd: Some(event.fd),
+                count: Some(event.count),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallIoUringSetupExit => {
+            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
+                return None;
+            }
+            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
+            Some(Event {
+                event_type: "syscall_io_uring_setup_exit",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                ret: Some(event.ret),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallIoUringEnterEnter => {
+            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
+                return None;
+            }
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            Some(Event {
+                event_type: "syscall_io_uring_enter_enter",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                fd: Some(event.fd),
+                count: Some(event.count),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallIoUringEnterExit => {
+            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
+                return None;
+            }
+            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
+            Some(Event {
+                event_type: "syscall_io_uring_enter_exit",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                ret: Some(event.ret),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallIoUringRegisterEnter => {
+            if data.len() < std::mem::size_of::<SyscallEnterEvent>() {
+                return None;
+            }
+            let event: &SyscallEnterEvent =
+                unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
+            Some(Event {
+                event_type: "syscall_io_uring_register_enter",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                fd: Some(event.fd),
+                count: Some(event.count),
+                ..Default::default()
+            })
+        }
+        EventType::SyscallIoUringRegisterExit => {
+            if data.len() < std::mem::size_of::<SyscallExitEvent>() {
+                return None;
+            }
+            let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
+            Some(Event {
+                event_type: "syscall_io_uring_register_exit",
+                ts_ns: event.header.timestamp_ns,
+                pid: event.header.pid,
+                cpu: event.header.cpu,
+                ret: Some(event.ret),
+                ..Default::default()
+            })
+        }
     }
 }
 
@@ -740,6 +836,42 @@ async fn main() -> Result<()> {
     attach_tracepoint(&mut ebpf, "sys_exit_munmap", "syscalls", "sys_exit_munmap")?;
     attach_tracepoint(&mut ebpf, "sys_enter_brk", "syscalls", "sys_enter_brk")?;
     attach_tracepoint(&mut ebpf, "sys_exit_brk", "syscalls", "sys_exit_brk")?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_io_uring_setup",
+        "syscalls",
+        "sys_enter_io_uring_setup",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_io_uring_setup",
+        "syscalls",
+        "sys_exit_io_uring_setup",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_io_uring_enter",
+        "syscalls",
+        "sys_enter_io_uring_enter",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_io_uring_enter",
+        "syscalls",
+        "sys_exit_io_uring_enter",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_enter_io_uring_register",
+        "syscalls",
+        "sys_enter_io_uring_register",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "sys_exit_io_uring_register",
+        "syscalls",
+        "sys_exit_io_uring_register",
+    )?;
 
     // Resume child process
     kill(child_pid, Signal::SIGCONT)

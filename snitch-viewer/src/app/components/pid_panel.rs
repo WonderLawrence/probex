@@ -84,8 +84,8 @@ pub fn PidAggregationCard(
                     if let Some(stats) = latency_stats {
                         div { class: "border-t border-gray-100 pt-1.5",
                             div { class: "grid grid-cols-1 lg:grid-cols-3 gap-2",
-                                LatencyChips { label: "read latency", summary: stats.read.clone() }
-                                LatencyChips { label: "write latency", summary: stats.write.clone() }
+                                LatencyChips { label: "read latency + io_uring", summary: stats.read.clone() }
+                                LatencyChips { label: "write latency + io_uring", summary: stats.write.clone() }
 
                                 div { class: "border border-gray-100 rounded p-2 space-y-1",
                                     div { class: "text-[11px] uppercase tracking-wide text-gray-500", "memory syscall stats" }
