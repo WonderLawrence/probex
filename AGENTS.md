@@ -4,6 +4,7 @@
 2. Always cargo check after coding.
 3. Consider refactoring when a function needs more than 3 args.
 4. When fixing a bug, think from first principles: why it happened, what is the root cause, what is the best place to fix it.
+5. Whenever you want to use web-sys, js-sys, and wasm-bindgen, consider what dioxus already provides. try not to use low level APIs unless necessary.
 
 # Agent guides
 

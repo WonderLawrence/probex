@@ -1,36 +1,141 @@
 # snitch
 
-## Prerequisites
+`snitch` is an eBPF-based Linux process tracer.
+It runs a command, traces kernel events for that command (and forked children), writes a Parquet file, and can launch a web viewer for exploration.
 
-1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
-1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
-1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
-1. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
-1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+## What It Traces
 
-## Build & Run
+`snitch` currently attaches these tracepoints:
 
-Use `cargo build`, `cargo check`, etc. as normal. Run your program with:
+1. `sched:sched_switch`
+2. `sched:sched_process_fork`
+3. `sched:sched_process_exit`
+4. `exceptions:page_fault_user`
+5. `syscalls:sys_enter_read`
+6. `syscalls:sys_exit_read`
+7. `syscalls:sys_enter_write`
+8. `syscalls:sys_exit_write`
+
+Events are filtered by a kernel-side PID map (`TRACED_PIDS`):
+
+1. The target child PID is inserted before the command starts executing.
+2. On fork, children are automatically added.
+3. On process exit, that PID is removed.
+
+## How It Works (Runtime Flow)
+
+1. `snitch` loads embedded eBPF bytecode.
+2. It forks a child and pauses it with `SIGSTOP` before `exec`.
+3. It inserts the child PID into `TRACED_PIDS`.
+4. It attaches all tracepoints.
+5. It sends `SIGCONT`, so the child starts running the target command.
+6. eBPF programs emit typed events into a ring buffer.
+7. Userspace reads events, flattens them, and writes batched Parquet output.
+8. When tracing ends, it optionally launches `snitch-viewer`.
+
+## Quick Start (Linux)
+
+### 1. Prerequisites
+
+1. Stable Rust: `rustup toolchain install stable`
+2. Nightly + `rust-src` (needed for eBPF build): `rustup toolchain install nightly --component rust-src`
+3. `bpf-linker`: `cargo install bpf-linker` (`--no-default-features` on macOS)
+
+You need Linux with eBPF tracepoint support and sufficient privileges (typically root).
+
+### 2. Trace a command
 
 ```shell
-cargo run --release --bin snitch -- sleep 1
+sudo -E cargo run --release -p snitch -- -- sleep 1
 ```
 
-Cargo build scripts are used to automatically build the eBPF correctly and include it in the
-program.
+Default behavior:
 
-## Cross-compiling on macOS
+1. Writes `trace.parquet`
+2. If events were captured, launches `snitch-viewer` on port `8080`
+3. If `snitch-viewer` is missing but `dx` is available in a workspace checkout, `snitch` will auto-build a local viewer bundle once and then launch it
 
-Cross compilation should work on both Intel and Apple Silicon Macs.
+### 3. Common CLI examples
+
+Custom output path:
 
 ```shell
-CC=${ARCH}-linux-musl-gcc cargo build --package snitch --release \
-  --target=${ARCH}-unknown-linux-musl \
-  --config=target.${ARCH}-unknown-linux-musl.linker=\"${ARCH}-linux-musl-gcc\"
+sudo -E cargo run --release -p snitch -- -o /tmp/my-trace.parquet -- sleep 2
 ```
-The cross-compiled program `target/${ARCH}-unknown-linux-musl/release/snitch` can be
-copied to a Linux server or VM and run there.
+
+Do not auto-launch viewer:
+
+```shell
+sudo -E cargo run --release -p snitch -- --no-viewer -- sleep 2
+```
+
+Change viewer port used by auto-launch:
+
+```shell
+sudo -E cargo run --release -p snitch -- --port 9000 -- sleep 2
+```
+
+## Viewer Guide
+
+For local development in this repo, you can launch the viewer with Cargo:
+
+```shell
+cargo run -p snitch-viewer -- --file trace.parquet --port 8080 --address 0.0.0.0
+```
+
+Then open `http://localhost:8080`.
+
+For production/distribution of the fullstack app, build a Dioxus bundle:
+
+```shell
+dx bundle --release --platform server --fullstack -p snitch-viewer
+```
+
+The bundled server binary is typically produced under:
+
+```shell
+target/dx/snitch-viewer/release/web/snitch-viewer
+```
+
+You can also control output location:
+
+```shell
+dx bundle --release --platform server --fullstack -p snitch-viewer --out-dir ./dist
+```
+
+Then run the bundled executable and pass runtime args:
+
+```shell
+./dist/web/snitch-viewer --file trace.parquet --port 8080 --address 0.0.0.0
+```
+
+Viewer features:
+
+1. Event table with pagination
+2. Filter by event type
+3. Filter by PID
+4. Summary stats: total events, distinct event types/PIDs, trace duration
+
+## Current Limitations
+
+1. Linux-only (tracepoint/eBPF based).
+2. `process_exit.exit_code` is currently `0` because that tracepoint does not provide exit status directly in this implementation.
+3. `sched_switch` does not include real TGIDs for prev/next tasks (stored as `0`).
+4. Only read/write syscalls are traced right now.
+
+## Development
+
+Regular checks:
+
+```shell
+cargo check
+```
+
+Integration tests that require root + eBPF support:
+
+```shell
+sudo -E cargo test --package snitch --test integration_test
+```
 
 ## License
 

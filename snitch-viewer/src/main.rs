@@ -38,10 +38,17 @@ fn main() {
     #[cfg(feature = "server")]
     {
         use clap::Parser;
-        
-        env_logger::init();
 
         let args = cli::Args::parse();
+
+        // Dioxus fullstack server launch reads bind settings from `IP`/`PORT`.
+        // SAFETY: we set process env before creating any runtime or launching the server.
+        unsafe {
+            std::env::set_var("IP", &args.address);
+            std::env::set_var("PORT", args.port.to_string());
+        }
+
+        env_logger::init();
 
         let parquet_path = std::path::PathBuf::from(&args.file);
         if !parquet_path.exists() {
