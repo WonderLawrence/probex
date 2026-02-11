@@ -21,6 +21,6 @@ datafusion.workspace = true
 env_logger.workspace = true
 
 [features]
-default = ["server"]
+default = []
 server = ["dioxus/server"]
 web = ["dioxus/web"]

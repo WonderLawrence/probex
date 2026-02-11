@@ -4,8 +4,12 @@
 
 use dioxus::prelude::*;
 
-use crate::server::{get_events, get_summary, EventFilters, EventsResponse, TraceEvent, TraceSummary};
-use crate::{FAVICON, TAILWIND_CSS};
+use crate::server::{
+    EventFilters, EventsResponse, TraceEvent, TraceSummary, get_events, get_summary,
+};
+
+const FAVICON: Asset = asset!("/assets/favicon.ico");
+const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 const RESULTS_PER_PAGE: usize = 50;
 

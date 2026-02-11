@@ -7,7 +7,7 @@ title = "Snitch Trace Viewer"
 
 [web.watcher]
 reload_html = true
-watch_path = ["src", "assets"]
+watch_path = ["src", "assets", "tailwind.css"]
 
 [web.resource.dev]
 style = []

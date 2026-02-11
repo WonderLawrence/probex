@@ -525,7 +525,7 @@ fn wait_for_child_stop(pid: Pid) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
 
@@ -685,7 +685,9 @@ async fn main() -> Result<()> {
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if total_events > 0 && !args.no_viewer {
-        launch_viewer(&args.output, args.port)?;
+        if let Err(error) = launch_viewer(&args.output, args.port) {
+            warn!("Skipping viewer launch: {error}");
+        }
     }
 
     Ok(())
@@ -698,13 +700,13 @@ fn launch_viewer(parquet_file: &str, port: u16) -> Result<()> {
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {}", parquet_file))?;
 
-    // Resolve viewer binary from known locations, optionally building a local bundle
-    // in a workspace checkout when it's missing.
+    // Resolve viewer binary from known locations or PATH.
     let viewer_path = resolve_viewer_binary()?;
     let viewer_dir = viewer_path
         .parent()
         .ok_or_else(|| anyhow!("failed to resolve viewer directory"))?;
 
+    info!("Viewer path: {}", viewer_path.display());
     info!(
         "Launching viewer at http://0.0.0.0:{} for {}",
         port,
@@ -717,7 +719,10 @@ fn launch_viewer(parquet_file: &str, port: u16) -> Result<()> {
         .arg(&parquet_path)
         .arg("--port")
         .arg(port.to_string())
-        .current_dir(viewer_dir);
+        .current_dir(viewer_dir)
+        // `cargo run` sets CARGO_MANIFEST_DIR. If forwarded, Dioxus treats the app as unbundled
+        // and emits absolute source paths for assets (breaking browser loading).
+        .env_remove("CARGO_MANIFEST_DIR");
 
     // Run in foreground so user can Ctrl-C to stop
     let status = cmd
@@ -736,36 +741,17 @@ fn resolve_viewer_binary() -> Result<PathBuf> {
         return Ok(path);
     }
 
-    if let Some(path) = try_build_local_viewer_bundle()? {
-        return Ok(path);
-    }
-
     Err(anyhow!(
-        "snitch-viewer not found. Build with `dx bundle --platform server --fullstack -p snitch-viewer` \
-or install `snitch-viewer` in PATH"
+        "snitch-viewer not found in PATH or known bundle locations; trace was saved, but viewer \
+was not launched"
     ))
 }
 
 fn find_existing_viewer_binary() -> Option<PathBuf> {
     let mut candidates = Vec::new();
 
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(exe_dir.join("snitch-viewer"));
-        candidates.push(exe_dir.join("web").join("snitch-viewer"));
-        candidates.push(exe_dir.join("snitch-viewer").join("web").join("snitch-viewer"));
-    }
-
+    // Prefer Dioxus bundle outputs in the current workspace.
     if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(
-            cwd.join("target")
-                .join("dx")
-                .join("snitch-viewer")
-                .join("debug")
-                .join("web")
-                .join("snitch-viewer"),
-        );
         candidates.push(
             cwd.join("target")
                 .join("dx")
@@ -774,81 +760,43 @@ fn find_existing_viewer_binary() -> Option<PathBuf> {
                 .join("web")
                 .join("snitch-viewer"),
         );
+        candidates.push(
+            cwd.join("target")
+                .join("dx")
+                .join("snitch-viewer")
+                .join("debug")
+                .join("web")
+                .join("snitch-viewer"),
+        );
+    }
+
+    // Then check colocated binaries for packaged distributions.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(exe_dir) = exe.parent()
+    {
+        candidates.push(exe_dir.join("snitch-viewer"));
+        candidates.push(exe_dir.join("web").join("snitch-viewer"));
+        candidates.push(
+            exe_dir
+                .join("snitch-viewer")
+                .join("web")
+                .join("snitch-viewer"),
+        );
     }
 
     for path in candidates {
-        if path.is_file() {
+        if path.is_file() && viewer_binary_is_runnable(&path) {
             return Some(path);
         }
     }
 
-    which::which("snitch-viewer").ok()
+    which::which("snitch-viewer")
+        .ok()
+        .filter(|path| viewer_binary_is_runnable(path))
 }
 
-fn try_build_local_viewer_bundle() -> Result<Option<PathBuf>> {
-    let dx = match which::which("dx") {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-
-    let cwd = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(_) => return Ok(None),
-    };
-
-    let workspace_root = match find_workspace_root(&cwd) {
-        Some(path) => path,
-        None => return Ok(None),
-    };
-
-    info!("snitch-viewer not found; building local Dioxus bundle via dx...");
-
-    let status = std::process::Command::new(dx)
-        .current_dir(&workspace_root)
-        .args([
-            "bundle",
-            "--platform",
-            "server",
-            "--fullstack",
-            "-p",
-            "snitch-viewer",
-        ])
-        .status()
-        .with_context(|| "failed to execute dx bundle for snitch-viewer")?;
-
-    if !status.success() {
-        return Err(anyhow!(
-            "dx bundle failed while preparing snitch-viewer (status: {status})"
-        ));
-    }
-
-    let candidates = [
-        workspace_root
-            .join("target")
-            .join("dx")
-            .join("snitch-viewer")
-            .join("debug")
-            .join("web")
-            .join("snitch-viewer"),
-        workspace_root
-            .join("target")
-            .join("dx")
-            .join("snitch-viewer")
-            .join("release")
-            .join("web")
-            .join("snitch-viewer"),
-    ];
-
-    Ok(candidates.into_iter().find(|p| p.is_file()))
-}
-
-fn find_workspace_root(start: &Path) -> Option<PathBuf> {
-    for dir in start.ancestors() {
-        let has_workspace = dir.join("Cargo.toml").is_file();
-        let has_viewer = dir.join("snitch-viewer").join("Dioxus.toml").is_file();
-        if has_workspace && has_viewer {
-            return Some(dir.to_path_buf());
-        }
-    }
-    None
+fn viewer_binary_is_runnable(path: &Path) -> bool {
+    path.parent()
+        .map(|dir| dir.join("public").is_dir())
+        .unwrap_or(false)
 }

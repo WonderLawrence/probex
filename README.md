@@ -53,7 +53,7 @@ Default behavior:
 
 1. Writes `trace.parquet`
 2. If events were captured, launches `snitch-viewer` on port `8080`
-3. If `snitch-viewer` is missing but `dx` is available in a workspace checkout, `snitch` will auto-build a local viewer bundle once and then launch it
+3. If `snitch-viewer` is missing (or not bundled correctly), tracing still succeeds and `snitch` logs a warning instead of launching the viewer
 
 ### 3. Common CLI examples
 
@@ -77,11 +77,13 @@ sudo -E cargo run --release -p snitch -- --port 9000 -- sleep 2
 
 ## Viewer Guide
 
-For local development in this repo, you can launch the viewer with Cargo:
+For local fullstack development in this repo, use the Dioxus dev server:
 
 ```shell
-cargo run -p snitch-viewer -- --file trace.parquet --port 8080 --address 0.0.0.0
+dx serve -p snitch-viewer
 ```
+
+The server reads `SNITCH_FILE` (default: `trace.parquet`), so set `SNITCH_FILE=/path/to/trace.parquet` when needed.
 
 Then open `http://localhost:8080`.
 

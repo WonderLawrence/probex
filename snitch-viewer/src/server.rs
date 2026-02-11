@@ -61,18 +61,14 @@ pub struct EventsResponse {
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
-        Array, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array, UInt8Array,
+        Array, Int32Array, Int64Array, StringArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use datafusion::prelude::*;
+    use std::io::{Error as IoError, ErrorKind};
     use std::path::PathBuf;
     use std::sync::{Arc, OnceLock};
 
-    static PARQUET_FILE: OnceLock<PathBuf> = OnceLock::new();
     static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
-
-    pub fn set_parquet_file(path: PathBuf) {
-        PARQUET_FILE.set(path).ok();
-    }
 
     fn get_ctx() -> Result<&'static Arc<SessionContext>, Box<dyn std::error::Error + Send + Sync>> {
         SESSION_CTX
@@ -80,8 +76,20 @@ mod backend {
             .ok_or_else(|| "DataFusion session not initialized".into())
     }
 
-    pub async fn init_datafusion() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let parquet_file = PARQUET_FILE.get().ok_or("Parquet file not set")?;
+    pub async fn initialize(
+        parquet_file: PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if SESSION_CTX.get().is_some() {
+            return Ok(());
+        }
+        if !parquet_file.exists() {
+            return Err(IoError::new(
+                ErrorKind::NotFound,
+                format!("Parquet file not found: {}", parquet_file.display()),
+            )
+            .into());
+        }
+
         let ctx = SessionContext::new();
 
         let path_str = parquet_file.to_string_lossy();
@@ -106,8 +114,14 @@ mod backend {
             0
         };
 
-        SESSION_CTX.set(Arc::new(ctx)).ok();
-        log::info!("Loaded {} events from {:?}", count, parquet_file);
+        SESSION_CTX.set(Arc::new(ctx)).map_err(|_| {
+            IoError::new(
+                ErrorKind::AlreadyExists,
+                "DataFusion session already initialized",
+            )
+        })?;
+
+        log::info!("Loaded {count} events from {:?}", parquet_file);
         Ok(())
     }
 
@@ -137,13 +151,7 @@ mod backend {
         batch
             .column_by_name(col)
             .and_then(|c| c.as_any().downcast_ref::<UInt64Array>())
-            .map(|arr| {
-                if arr.is_null(row) {
-                    0
-                } else {
-                    arr.value(row)
-                }
-            })
+            .map(|arr| if arr.is_null(row) { 0 } else { arr.value(row) })
             .unwrap_or(0)
     }
 
@@ -155,13 +163,7 @@ mod backend {
         batch
             .column_by_name(col)
             .and_then(|c| c.as_any().downcast_ref::<UInt32Array>())
-            .map(|arr| {
-                if arr.is_null(row) {
-                    0
-                } else {
-                    arr.value(row)
-                }
-            })
+            .map(|arr| if arr.is_null(row) { 0 } else { arr.value(row) })
             .unwrap_or(0)
     }
 
@@ -173,13 +175,7 @@ mod backend {
         batch
             .column_by_name(col)
             .and_then(|c| c.as_any().downcast_ref::<UInt8Array>())
-            .map(|arr| {
-                if arr.is_null(row) {
-                    0
-                } else {
-                    arr.value(row)
-                }
-            })
+            .map(|arr| if arr.is_null(row) { 0 } else { arr.value(row) })
             .unwrap_or(0)
     }
 
@@ -284,7 +280,11 @@ mod backend {
             .unwrap_or(0);
 
         // Query events with pagination
-        let limit = if filters.limit == 0 { 100 } else { filters.limit };
+        let limit = if filters.limit == 0 {
+            100
+        } else {
+            filters.limit
+        };
         let sql = format!(
             "SELECT * FROM events {} ORDER BY ts_ns ASC LIMIT {} OFFSET {}",
             where_clause, limit, filters.offset
@@ -342,9 +342,7 @@ mod backend {
         let types_batches = types_df.collect().await?;
         let event_types: Vec<String> = types_batches
             .iter()
-            .flat_map(|b| {
-                (0..b.num_rows()).map(move |i| extract_string(b, "event_type", i))
-            })
+            .flat_map(|b| (0..b.num_rows()).map(move |i| extract_string(b, "event_type", i)))
             .filter(|s| !s.is_empty())
             .collect();
 
@@ -391,9 +389,11 @@ mod backend {
 }
 
 #[cfg(feature = "server")]
-pub use backend::init_datafusion;
-#[cfg(feature = "server")]
-pub use backend::set_parquet_file;
+pub async fn initialize(
+    parquet_file: std::path::PathBuf,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    backend::initialize(parquet_file).await
+}
 
 #[server]
 pub async fn get_events(filters: EventFilters) -> Result<EventsResponse, ServerFnError> {
