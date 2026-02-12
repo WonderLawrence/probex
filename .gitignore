@@ -10,3 +10,4 @@ target/
 
 vendor/
 trace.parquet
+trace.maps.parquet

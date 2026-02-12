@@ -63,10 +63,16 @@ pub struct EventHeader {
     pub timestamp_ns: u64,
     pub pid: u32,
     pub tgid: u32,
+    pub stack_id: i32,
+    pub stack_kind: u8,
     pub event_type: u8,
     pub cpu: u8,
-    pub _padding: [u8; 2],
+    pub _padding: [u8; 1],
 }
+
+pub const STACK_KIND_NONE: u8 = 0;
+pub const STACK_KIND_USER: u8 = 1;
+pub const STACK_KIND_KERNEL: u8 = 2;
 
 /// Context switch event
 #[repr(C)]

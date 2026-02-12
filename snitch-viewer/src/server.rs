@@ -13,7 +13,12 @@ pub struct TraceEvent {
     pub event_type: String,
     pub ts_ns: u64,
     pub pid: u32,
+    pub tgid: u32,
     pub process_name: Option<String>,
+    pub stack_id: Option<i32>,
+    pub stack_kind: Option<String>,
+    pub stack_frames: Option<String>,
+    pub stack_trace: Option<String>,
     pub cpu: u8,
     // SchedSwitch fields
     pub prev_pid: Option<u32>,
@@ -135,6 +140,14 @@ pub struct ProcessEventsResponse {
     pub events_by_pid: HashMap<u32, Vec<EventMarker>>,
 }
 
+/// Aggregated flamegraph response for one event type in a range.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct EventFlamegraphResponse {
+    pub event_type: String,
+    pub total_samples: usize,
+    pub svg: Option<String>,
+}
+
 #[cfg(feature = "server")]
 mod backend {
     use super::*;
@@ -142,8 +155,11 @@ mod backend {
         Array, Int32Array, Int64Array, StringViewArray, UInt8Array, UInt32Array, UInt64Array,
     };
     use datafusion::prelude::*;
+    use inferno::flamegraph;
+    use std::collections::{BTreeMap, HashSet};
     use std::io::{Error as IoError, ErrorKind};
     use std::path::PathBuf;
+    use std::process::Command;
     use std::sync::{Arc, OnceLock};
 
     static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
@@ -173,6 +189,32 @@ mod backend {
         let path_str = parquet_file.to_string_lossy();
         ctx.register_parquet("events", path_str.as_ref(), ParquetReadOptions::default())
             .await?;
+
+        let maps_file = parquet_file.with_extension("maps.parquet");
+        if maps_file.exists() {
+            let maps_path = maps_file.to_string_lossy();
+            if let Err(err) = ctx
+                .register_parquet(
+                    "proc_maps",
+                    maps_path.as_ref(),
+                    ParquetReadOptions::default(),
+                )
+                .await
+            {
+                log::warn!(
+                    "failed to load proc maps parquet {}: {}",
+                    maps_file.display(),
+                    err
+                );
+            } else {
+                log::info!("Loaded proc maps from {}", maps_file.display());
+            }
+        } else {
+            log::warn!(
+                "proc maps parquet not found at {}; userspace stack symbolization may be limited",
+                maps_file.display()
+            );
+        }
 
         // Verify we can read the table
         let df = ctx.sql("SELECT COUNT(*) as cnt FROM events").await?;
@@ -351,10 +393,10 @@ mod backend {
         let mut conditions = Vec::new();
 
         // Single event type filter (legacy)
-        if let Some(ref event_type) = filters.event_type {
-            if !event_type.is_empty() {
-                conditions.push(format!("event_type = '{}'", event_type.replace('\'', "''")));
-            }
+        if let Some(ref event_type) = filters.event_type
+            && !event_type.is_empty()
+        {
+            conditions.push(format!("event_type = '{}'", event_type.replace('\'', "''")));
         }
 
         // Multiple event types filter
@@ -425,7 +467,12 @@ mod backend {
                     event_type: extract_string(batch, "event_type", row),
                     ts_ns: extract_u64(batch, "ts_ns", row),
                     pid: extract_u32(batch, "pid", row),
+                    tgid: extract_u32(batch, "tgid", row),
                     process_name: extract_option_string(batch, "process_name", row),
+                    stack_id: extract_option_i32(batch, "stack_id", row),
+                    stack_kind: extract_option_string(batch, "stack_kind", row),
+                    stack_frames: extract_option_string(batch, "stack_frames", row),
+                    stack_trace: extract_option_string(batch, "stack_trace", row),
                     cpu: extract_u8(batch, "cpu", row),
                     prev_pid: extract_option_u32(batch, "prev_pid", row),
                     next_pid: extract_option_u32(batch, "next_pid", row),
@@ -659,34 +706,31 @@ mod backend {
                 match event_type.as_str() {
                     "syscall_read_enter" => pending_read.entry(pid).or_default().push_back(ts),
                     "syscall_read_exit" => {
-                        if let Some(queue) = pending_read.get_mut(&pid) {
-                            if let Some(start_ts) = queue.pop_front() {
-                                if ts >= start_ts {
-                                    read_latencies.push(ts - start_ts);
-                                }
-                            }
+                        if let Some(queue) = pending_read.get_mut(&pid)
+                            && let Some(start_ts) = queue.pop_front()
+                            && ts >= start_ts
+                        {
+                            read_latencies.push(ts - start_ts);
                         }
                     }
                     "syscall_write_enter" => pending_write.entry(pid).or_default().push_back(ts),
                     "syscall_write_exit" => {
-                        if let Some(queue) = pending_write.get_mut(&pid) {
-                            if let Some(start_ts) = queue.pop_front() {
-                                if ts >= start_ts {
-                                    write_latencies.push(ts - start_ts);
-                                }
-                            }
+                        if let Some(queue) = pending_write.get_mut(&pid)
+                            && let Some(start_ts) = queue.pop_front()
+                            && ts >= start_ts
+                        {
+                            write_latencies.push(ts - start_ts);
                         }
                     }
                     "syscall_io_uring_enter_enter" => {
                         pending_io_uring.entry(pid).or_default().push_back(ts)
                     }
                     "syscall_io_uring_enter_exit" => {
-                        if let Some(queue) = pending_io_uring.get_mut(&pid) {
-                            if let Some(start_ts) = queue.pop_front() {
-                                if ts >= start_ts {
-                                    io_uring_enter_latencies.push(ts - start_ts);
-                                }
-                            }
+                        if let Some(queue) = pending_io_uring.get_mut(&pid)
+                            && let Some(start_ts) = queue.pop_front()
+                            && ts >= start_ts
+                        {
+                            io_uring_enter_latencies.push(ts - start_ts);
                         }
                     }
                     "syscall_mmap_enter" => {
@@ -947,7 +991,7 @@ mod backend {
                 let ts_ns = extract_u64(batch, "ts_ns", row);
                 let event_type = extract_string(batch, "event_type", row);
 
-                let events = events_by_pid.entry(pid).or_insert_with(Vec::new);
+                let events = events_by_pid.entry(pid).or_default();
 
                 // Sample events if we have too many for this PID
                 if events.len() < max_events_per_pid {
@@ -968,6 +1012,394 @@ mod backend {
         }
 
         Ok(ProcessEventsResponse { events_by_pid })
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProcMapSegment {
+        start_addr: u64,
+        end_addr: u64,
+        file_offset: u64,
+        path: String,
+    }
+
+    #[derive(Clone, Debug)]
+    struct ProcMapSnapshot {
+        captured_ts_ns: u64,
+        segments: Vec<ProcMapSegment>,
+    }
+
+    #[derive(Clone, Debug)]
+    struct SampledStackRow {
+        tgid: u32,
+        ts_ns: u64,
+        stack_kind: Option<String>,
+        stack_frames: Option<String>,
+        stack_trace: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct OfflineUserSymbolizer {
+        tool: Option<String>,
+        symbol_cache: std::collections::HashMap<(String, u64), Option<String>>,
+    }
+
+    impl OfflineUserSymbolizer {
+        fn new() -> Self {
+            let tool = ["addr2line", "llvm-addr2line"]
+                .iter()
+                .find_map(|candidate| {
+                    Command::new(candidate)
+                        .arg("--version")
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .map(|_| (*candidate).to_string())
+                });
+            Self {
+                tool,
+                symbol_cache: std::collections::HashMap::new(),
+            }
+        }
+
+        fn symbolize_addr(&mut self, path: &str, addr: u64) -> Option<String> {
+            let cache_key = (path.to_string(), addr);
+            if let Some(cached) = self.symbol_cache.get(&cache_key) {
+                return cached.clone();
+            }
+
+            let Some(tool) = self.tool.as_ref() else {
+                self.symbol_cache.insert(cache_key, None);
+                return None;
+            };
+
+            let symbol = Command::new(tool)
+                .arg("-Cf")
+                .arg("-e")
+                .arg(path)
+                .arg(format!("0x{addr:x}"))
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    stdout.lines().next().map(str::trim).map(str::to_string)
+                })
+                .filter(|symbol| !symbol.is_empty() && symbol != "??");
+
+            self.symbol_cache.insert(cache_key, symbol.clone());
+            symbol
+        }
+    }
+
+    fn parse_stack_frames(stack_frames: &str) -> Vec<u64> {
+        stack_frames
+            .split(';')
+            .filter_map(|token| {
+                let trimmed = token.trim();
+                let hex = trimmed
+                    .strip_prefix("0x")
+                    .or_else(|| trimmed.strip_prefix("0X"))
+                    .unwrap_or(trimmed);
+                u64::from_str_radix(hex, 16).ok()
+            })
+            .collect()
+    }
+
+    fn find_snapshot_for_ts(snapshots: &[ProcMapSnapshot], ts_ns: u64) -> Option<&ProcMapSnapshot> {
+        if snapshots.is_empty() {
+            return None;
+        }
+        let idx = snapshots.partition_point(|snapshot| snapshot.captured_ts_ns <= ts_ns);
+        if idx == 0 {
+            Some(&snapshots[0])
+        } else {
+            Some(&snapshots[idx - 1])
+        }
+    }
+
+    fn symbolize_user_frames(
+        tgid: u32,
+        ts_ns: u64,
+        frames: &[u64],
+        map_snapshots: &std::collections::HashMap<u32, Vec<ProcMapSnapshot>>,
+        symbolizer: &mut OfflineUserSymbolizer,
+    ) -> Vec<String> {
+        let mut labels = Vec::with_capacity(frames.len() + 1);
+        labels.push("[user]".to_string());
+
+        let Some(snapshots) = map_snapshots.get(&tgid) else {
+            labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+            return labels;
+        };
+        let Some(snapshot) = find_snapshot_for_ts(snapshots, ts_ns) else {
+            labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
+            return labels;
+        };
+
+        for ip in frames {
+            let maybe_symbol = snapshot
+                .segments
+                .iter()
+                .find(|segment| *ip >= segment.start_addr && *ip < segment.end_addr)
+                .and_then(|segment| {
+                    let relative_addr = ip
+                        .saturating_sub(segment.start_addr)
+                        .saturating_add(segment.file_offset);
+                    symbolizer.symbolize_addr(&segment.path, relative_addr)
+                });
+            labels.push(maybe_symbol.unwrap_or_else(|| format!("0x{ip:x}")));
+        }
+        labels
+    }
+
+    fn sanitize_flame_frame_label(label: &str) -> String {
+        let cleaned = label
+            .replace(';', ":")
+            .replace(['\n', '\r'], " ")
+            .trim()
+            .to_string();
+        if cleaned.is_empty() {
+            "[unknown]".to_string()
+        } else {
+            cleaned
+        }
+    }
+
+    fn render_flamegraph_svg(
+        event_type: &str,
+        folded_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let mut entries: Vec<(&String, &usize)> = folded_counts.iter().collect();
+        entries.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+
+        let mut folded_lines: Vec<String> = Vec::with_capacity(entries.len());
+        for (stack, count) in entries {
+            if stack.is_empty() || *count == 0 {
+                continue;
+            }
+            folded_lines.push(format!("{stack} {count}"));
+        }
+
+        if folded_lines.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut opts = flamegraph::Options::default();
+        opts.title = format!("snitch · {event_type}");
+        opts.count_name = "samples".to_string();
+
+        let input = folded_lines.iter().map(String::as_str);
+        let mut svg = Vec::<u8>::new();
+        flamegraph::from_lines(&mut opts, input, &mut svg)?;
+        Ok(String::from_utf8(svg)?)
+    }
+
+    async fn load_proc_map_snapshots(
+        ctx: &SessionContext,
+        tgids: &HashSet<u32>,
+    ) -> Result<
+        std::collections::HashMap<u32, Vec<ProcMapSnapshot>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        if tgids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let tgid_list: Vec<String> = tgids.iter().map(|tgid| tgid.to_string()).collect();
+        let sql = format!(
+            "SELECT tgid, captured_ts_ns, start_addr, end_addr, file_offset, path
+             FROM proc_maps
+             WHERE tgid IN ({})
+             ORDER BY tgid, captured_ts_ns, start_addr",
+            tgid_list.join(",")
+        );
+
+        let df = match ctx.sql(&sql).await {
+            Ok(df) => df,
+            Err(_) => return Ok(std::collections::HashMap::new()),
+        };
+        let batches = df.collect().await?;
+
+        let mut grouped: std::collections::HashMap<u32, BTreeMap<u64, Vec<ProcMapSegment>>> =
+            std::collections::HashMap::new();
+
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let tgid = extract_u32(batch, "tgid", row);
+                let captured_ts_ns = extract_u64(batch, "captured_ts_ns", row);
+                let segment = ProcMapSegment {
+                    start_addr: extract_u64(batch, "start_addr", row),
+                    end_addr: extract_u64(batch, "end_addr", row),
+                    file_offset: extract_u64(batch, "file_offset", row),
+                    path: extract_string(batch, "path", row),
+                };
+
+                grouped
+                    .entry(tgid)
+                    .or_default()
+                    .entry(captured_ts_ns)
+                    .or_default()
+                    .push(segment);
+            }
+        }
+
+        let mut snapshots_by_tgid: std::collections::HashMap<u32, Vec<ProcMapSnapshot>> =
+            std::collections::HashMap::new();
+        for (tgid, snapshots) in grouped {
+            let ordered = snapshots
+                .into_iter()
+                .map(|(captured_ts_ns, segments)| ProcMapSnapshot {
+                    captured_ts_ns,
+                    segments,
+                })
+                .collect();
+            snapshots_by_tgid.insert(tgid, ordered);
+        }
+
+        Ok(snapshots_by_tgid)
+    }
+
+    pub async fn query_event_flamegraph(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+        event_type: String,
+        max_stacks: usize,
+    ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
+        let ctx = get_ctx()?;
+        if event_type.is_empty() {
+            return Ok(EventFlamegraphResponse::default());
+        }
+
+        let mut conditions = vec![
+            format!("ts_ns >= {}", start_ns),
+            format!("ts_ns <= {}", end_ns),
+            format!("event_type = '{}'", event_type.replace('\'', "''")),
+            "(\
+              (stack_frames IS NOT NULL AND stack_frames <> '')\
+              OR\
+              (stack_trace IS NOT NULL AND stack_trace <> '')\
+             )"
+            .to_string(),
+        ];
+        if let Some(pid) = pid {
+            conditions.push(format!("pid = {}", pid));
+        }
+
+        let sql = format!(
+            "SELECT tgid, ts_ns, stack_kind, stack_frames, stack_trace
+             FROM events
+             WHERE {}
+             ORDER BY ts_ns ASC
+             LIMIT {}",
+            conditions.join(" AND "),
+            max_stacks.max(1)
+        );
+
+        // Older traces may not contain stack columns.
+        let df = match ctx.sql(&sql).await {
+            Ok(df) => df,
+            Err(_) => {
+                let legacy_sql = format!(
+                    "SELECT pid as tgid, ts_ns, CAST(NULL AS Utf8) as stack_kind, CAST(NULL AS Utf8) as stack_frames, stack_trace
+                     FROM events
+                     WHERE {}
+                       AND stack_trace IS NOT NULL
+                       AND stack_trace <> ''
+                     ORDER BY ts_ns ASC
+                     LIMIT {}",
+                    conditions.join(" AND "),
+                    max_stacks.max(1)
+                );
+                match ctx.sql(&legacy_sql).await {
+                    Ok(df) => df,
+                    Err(_) => {
+                        return Ok(EventFlamegraphResponse {
+                            event_type,
+                            total_samples: 0,
+                            svg: None,
+                        });
+                    }
+                }
+            }
+        };
+        let batches = df.collect().await?;
+
+        let mut sampled_rows: Vec<SampledStackRow> = Vec::new();
+        let mut user_tgids: HashSet<u32> = HashSet::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                let tgid = extract_u32(batch, "tgid", row);
+                let ts_ns = extract_u64(batch, "ts_ns", row);
+                let stack_kind = extract_option_string(batch, "stack_kind", row);
+                let stack_frames = extract_option_string(batch, "stack_frames", row);
+                let stack_trace = extract_option_string(batch, "stack_trace", row);
+                if stack_kind.as_deref() == Some("user") && stack_frames.is_some() {
+                    user_tgids.insert(tgid);
+                }
+                sampled_rows.push(SampledStackRow {
+                    tgid,
+                    ts_ns,
+                    stack_kind,
+                    stack_frames,
+                    stack_trace,
+                });
+            }
+        }
+
+        let map_snapshots = load_proc_map_snapshots(ctx, &user_tgids).await?;
+        let mut user_symbolizer = OfflineUserSymbolizer::new();
+
+        let mut folded_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let mut total_samples = 0usize;
+
+        for row in sampled_rows {
+            let labels: Vec<String> = match (row.stack_kind.as_deref(), row.stack_frames.as_deref())
+            {
+                (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
+                    let frames = parse_stack_frames(frames_hex);
+                    symbolize_user_frames(
+                        row.tgid,
+                        row.ts_ns,
+                        &frames,
+                        &map_snapshots,
+                        &mut user_symbolizer,
+                    )
+                }
+                _ => row
+                    .stack_trace
+                    .unwrap_or_default()
+                    .split(';')
+                    .filter(|frame| !frame.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            };
+
+            if labels.is_empty() {
+                continue;
+            }
+
+            total_samples += 1;
+            let folded = labels
+                .into_iter()
+                .map(|label| sanitize_flame_frame_label(&label))
+                .collect::<Vec<_>>()
+                .join(";");
+            *folded_counts.entry(folded).or_insert(0) += 1;
+        }
+
+        let svg = if folded_counts.is_empty() {
+            None
+        } else {
+            Some(render_flamegraph_svg(&event_type, &folded_counts)?)
+        };
+
+        Ok(EventFlamegraphResponse {
+            event_type,
+            total_samples,
+            svg,
+        })
     }
 
     // Simple pseudo-random index for reservoir sampling
@@ -1067,4 +1499,17 @@ pub async fn get_process_events(
     backend::query_process_events(start_ns, end_ns, max_events_per_pid)
         .await
         .map_err(|e| ServerFnError::new(format!("Process events query failed: {}", e)))
+}
+
+#[server]
+pub async fn get_event_flamegraph(
+    start_ns: u64,
+    end_ns: u64,
+    pid: Option<u32>,
+    event_type: String,
+    max_stacks: usize,
+) -> Result<EventFlamegraphResponse, ServerFnError> {
+    backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks)
+        .await
+        .map_err(|e| ServerFnError::new(format!("Event flamegraph query failed: {}", e)))
 }

@@ -9,14 +9,17 @@ mod view_model;
 
 use std::collections::HashSet;
 
-use components::{EventsTable, Pager, PidAggregationCard, ProcessTimeline, ViewerHeader};
+use components::{
+    EventFlamegraphCard, EventsTable, Pager, PidAggregationCard, ProcessTimeline, ViewerHeader,
+};
 use dioxus::prelude::*;
 use view_model::build_pid_event_summary;
 
 use crate::server::{
-    EventTypeCounts, EventsResponse, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetimesResponse, TraceSummary, get_events, get_histogram, get_pid_event_type_counts,
-    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
+    EventFlamegraphResponse, EventTypeCounts, EventsResponse, HistogramResponse,
+    ProcessEventsResponse, ProcessLifetimesResponse, TraceSummary, get_event_flamegraph,
+    get_events, get_histogram, get_pid_event_type_counts, get_process_events,
+    get_process_lifetimes, get_summary, get_syscall_latency_stats,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -24,6 +27,7 @@ const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 const RESULTS_PER_PAGE: usize = 50;
 const HISTOGRAM_BUCKETS: usize = 80;
+const MAX_FLAME_STACKS: usize = 5000;
 
 #[component]
 pub fn App() -> Element {
@@ -43,6 +47,7 @@ fn TraceViewer() -> Element {
     let mut histogram = use_signal(|| Option::<HistogramResponse>::None);
     let mut selected_pid_event_counts = use_signal(|| Option::<EventTypeCounts>::None);
     let mut syscall_latency_stats = use_signal(|| None);
+    let mut event_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
     let mut process_lifetimes = use_signal(|| Option::<ProcessLifetimesResponse>::None);
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
 
@@ -55,9 +60,10 @@ fn TraceViewer() -> Element {
 
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
     let mut selected_pid = use_signal(|| Option::<u32>::None);
+    let mut selected_flame_event_type = use_signal(|| Option::<String>::None);
     let mut current_page = use_signal(|| 0usize);
 
-    let _ = use_resource(move || async move {
+    use_resource(move || async move {
         match get_summary().await {
             Ok(s) => {
                 view_start_ns.set(s.min_ts_ns);
@@ -69,14 +75,14 @@ fn TraceViewer() -> Element {
         }
     });
 
-    let _ = use_resource(move || async move {
+    use_resource(move || async move {
         match get_process_lifetimes().await {
             Ok(lifetimes) => process_lifetimes.set(Some(lifetimes)),
             Err(e) => log::error!("Process lifetimes error: {}", e),
         }
     });
 
-    let _ = use_resource(move || async move {
+    use_resource(move || async move {
         if let Some(s) = summary() {
             match get_histogram(s.min_ts_ns, s.max_ts_ns, HISTOGRAM_BUCKETS).await {
                 Ok(data) => histogram.set(Some(data)),
@@ -85,7 +91,7 @@ fn TraceViewer() -> Element {
         }
     });
 
-    let _ = use_resource(move || async move {
+    use_resource(move || async move {
         let start = view_start_ns();
         let end = view_end_ns();
         if is_dragging_range() || (start == 0 && end == 0) {
@@ -98,7 +104,26 @@ fn TraceViewer() -> Element {
         }
     });
 
-    let _ = use_resource(move || async move {
+    use_resource(move || async move {
+        let start = view_start_ns();
+        let end = view_end_ns();
+        let pid = selected_pid();
+        let selected_event_type = selected_flame_event_type();
+        if is_dragging_range() || (start == 0 && end == 0) {
+            return;
+        }
+
+        if let Some(event_type) = selected_event_type {
+            match get_event_flamegraph(start, end, pid, event_type, MAX_FLAME_STACKS).await {
+                Ok(data) => event_flamegraph.set(Some(data)),
+                Err(e) => log::error!("Event flamegraph error: {}", e),
+            }
+        } else {
+            event_flamegraph.set(None);
+        }
+    });
+
+    use_resource(move || async move {
         let start = view_start_ns();
         let end = view_end_ns();
         if is_dragging_range() || (start == 0 && end == 0) {
@@ -115,7 +140,7 @@ fn TraceViewer() -> Element {
         }
     });
 
-    let _ = use_resource(move || async move {
+    use_resource(move || async move {
         let start = view_start_ns();
         let end = view_end_ns();
         if is_dragging_range() || (start == 0 && end == 0) {
@@ -168,12 +193,9 @@ fn TraceViewer() -> Element {
         });
     };
 
-    let _ = use_resource(move || {
-        let do_search = do_search.clone();
-        async move {
-            if summary().is_some() {
-                do_search(true);
-            }
+    use_resource(move || async move {
+        if summary().is_some() {
+            do_search(true);
         }
     });
 
@@ -228,6 +250,45 @@ fn TraceViewer() -> Element {
                     enabled_event_types.set(types);
                     do_search(true);
                 },
+            }
+
+            {
+                let mut event_type_options: Vec<String> = if selected_pid().is_some() && !pid_summary.breakdown.is_empty() {
+                    pid_summary
+                        .breakdown
+                        .iter()
+                        .map(|(event_type, _)| event_type.clone())
+                        .collect()
+                } else {
+                    summary_data
+                        .as_ref()
+                        .map(|summary| summary.event_types.clone())
+                        .unwrap_or_default()
+                };
+                if let Some(selected_event_type) = selected_flame_event_type()
+                    && !event_type_options
+                        .iter()
+                        .any(|event_type| event_type == &selected_event_type)
+                {
+                    event_type_options.push(selected_event_type);
+                }
+                event_type_options.sort();
+                event_type_options.dedup();
+
+                rsx! {
+            EventFlamegraphCard {
+                selected_event_type: selected_flame_event_type(),
+                event_type_options,
+                selected_pid: selected_pid(),
+                full_start_ns: full_start,
+                view_start_ns: view_start_ns(),
+                view_end_ns: view_end_ns(),
+                on_select_event_type: move |event_type: Option<String>| {
+                    selected_flame_event_type.set(event_type);
+                },
+                flamegraph: event_flamegraph(),
+            }
+                }
             }
 
             if let (Some(summary), Some(lifetimes)) = (summary_data.clone(), process_lifetimes()) {

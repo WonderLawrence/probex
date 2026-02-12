@@ -72,7 +72,9 @@ pub fn PidAggregationCard(
                                     button {
                                         key: "{event_type}",
                                         class: event_badge_class(enabled, event_type),
-                                        onclick: move |_| on_toggle_event_type.call(event_type_clone.clone()),
+                                        onclick: move |_| {
+                                            on_toggle_event_type.call(event_type_clone.clone());
+                                        },
                                         "{event_type}"
                                         span { class: if enabled { "opacity-80" } else { "text-gray-400" }, "{count}" }
                                     }

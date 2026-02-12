@@ -102,6 +102,7 @@
 //! | syscall_io_uring_register_exit | syscalls:sys_exit_io_uring_register | ret |
 
 use std::{
+    collections::{BTreeMap, HashSet},
     ffi::CString,
     fs::File,
     path::{Path, PathBuf},
@@ -118,8 +119,9 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use aya::{
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, MapData, RingBuf, StackTraceMap},
     programs::TracePoint,
+    util::kernel_symbols,
 };
 use clap::Parser;
 use log::{debug, info, warn};
@@ -132,13 +134,14 @@ use nix::{
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use snitch_common::{
-    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, SchedSwitchEvent,
-    SyscallEnterEvent, SyscallExitEvent,
+    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_KERNEL,
+    STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
+const MAP_BATCH_SIZE: usize = 8_192;
 
 #[derive(Parser, Debug)]
 #[command(name = "snitch")]
@@ -169,7 +172,12 @@ struct Event {
     event_type: &'static str,
     ts_ns: u64,
     pid: u32,
+    tgid: u32,
     process_name: Option<String>,
+    stack_id: Option<i32>,
+    stack_kind: Option<&'static str>,
+    stack_frames: Option<String>,
+    stack_trace: Option<String>,
     cpu: u8,
     // SchedSwitch fields
     prev_pid: Option<u32>,
@@ -195,7 +203,12 @@ fn create_schema() -> Schema {
         Field::new("event_type", DataType::Utf8, false),
         Field::new("ts_ns", DataType::UInt64, false),
         Field::new("pid", DataType::UInt32, false),
+        Field::new("tgid", DataType::UInt32, false),
         Field::new("process_name", DataType::Utf8, true),
+        Field::new("stack_id", DataType::Int32, true),
+        Field::new("stack_kind", DataType::Utf8, true),
+        Field::new("stack_frames", DataType::Utf8, true),
+        Field::new("stack_trace", DataType::Utf8, true),
         Field::new("cpu", DataType::UInt8, false),
         // SchedSwitch fields (nullable)
         Field::new("prev_pid", DataType::UInt32, true),
@@ -268,7 +281,12 @@ impl ParquetBatchWriter {
         let mut event_type_builder = StringBuilder::with_capacity(batch_len, batch_len * 20);
         let mut ts_ns_builder = UInt64Builder::with_capacity(batch_len);
         let mut pid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut tgid_builder = UInt32Builder::with_capacity(batch_len);
         let mut process_name_builder = StringBuilder::with_capacity(batch_len, batch_len * 24);
+        let mut stack_id_builder = Int32Builder::with_capacity(batch_len);
+        let mut stack_kind_builder = StringBuilder::with_capacity(batch_len, batch_len * 8);
+        let mut stack_frames_builder = StringBuilder::with_capacity(batch_len, batch_len * 64);
+        let mut stack_trace_builder = StringBuilder::with_capacity(batch_len, batch_len * 48);
         let mut cpu_builder = UInt8Builder::with_capacity(batch_len);
         let mut prev_pid_builder = UInt32Builder::with_capacity(batch_len);
         let mut next_pid_builder = UInt32Builder::with_capacity(batch_len);
@@ -286,7 +304,12 @@ impl ParquetBatchWriter {
             event_type_builder.append_value(event.event_type);
             ts_ns_builder.append_value(event.ts_ns);
             pid_builder.append_value(event.pid);
+            tgid_builder.append_value(event.tgid);
             process_name_builder.append_option(event.process_name.as_deref());
+            stack_id_builder.append_option(event.stack_id);
+            stack_kind_builder.append_option(event.stack_kind);
+            stack_frames_builder.append_option(event.stack_frames.as_deref());
+            stack_trace_builder.append_option(event.stack_trace.as_deref());
             cpu_builder.append_value(event.cpu);
             prev_pid_builder.append_option(event.prev_pid);
             next_pid_builder.append_option(event.next_pid);
@@ -305,7 +328,12 @@ impl ParquetBatchWriter {
             Arc::new(event_type_builder.finish()),
             Arc::new(ts_ns_builder.finish()),
             Arc::new(pid_builder.finish()),
+            Arc::new(tgid_builder.finish()),
             Arc::new(process_name_builder.finish()),
+            Arc::new(stack_id_builder.finish()),
+            Arc::new(stack_kind_builder.finish()),
+            Arc::new(stack_frames_builder.finish()),
+            Arc::new(stack_trace_builder.finish()),
             Arc::new(cpu_builder.finish()),
             Arc::new(prev_pid_builder.finish()),
             Arc::new(next_pid_builder.finish()),
@@ -346,13 +374,33 @@ impl ParquetBatchWriter {
     }
 }
 
+fn stack_kind_from_header(header: &EventHeader) -> Option<&'static str> {
+    match header.stack_kind {
+        STACK_KIND_USER => Some("user"),
+        STACK_KIND_KERNEL => Some("kernel"),
+        _ => None,
+    }
+}
+
+fn event_base(event_type: &'static str, header: &EventHeader) -> Event {
+    Event {
+        event_type,
+        ts_ns: header.timestamp_ns,
+        pid: header.pid,
+        tgid: header.tgid,
+        stack_id: (header.stack_id >= 0).then_some(header.stack_id),
+        stack_kind: stack_kind_from_header(header),
+        cpu: header.cpu,
+        ..Default::default()
+    }
+}
+
 /// Parse event from ring buffer data into a flattened Event struct
 fn parse_event(data: &[u8]) -> Option<Event> {
     if data.len() < std::mem::size_of::<EventHeader>() {
         return None;
     }
 
-    // Read the header to determine event type
     let header: &EventHeader = unsafe { &*(data.as_ptr() as *const EventHeader) };
     let event_type = EventType::try_from(header.event_type).ok()?;
 
@@ -363,14 +411,10 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SchedSwitchEvent = unsafe { &*(data.as_ptr() as *const SchedSwitchEvent) };
             Some(Event {
-                event_type: "sched_switch",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 prev_pid: Some(event.prev_pid),
                 next_pid: Some(event.next_pid),
                 prev_state: Some(event.prev_state),
-                ..Default::default()
+                ..event_base("sched_switch", &event.header)
             })
         }
         EventType::ProcessFork => {
@@ -379,13 +423,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &ProcessForkEvent = unsafe { &*(data.as_ptr() as *const ProcessForkEvent) };
             Some(Event {
-                event_type: "process_fork",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 parent_pid: Some(event.parent_pid),
                 child_pid: Some(event.child_pid),
-                ..Default::default()
+                ..event_base("process_fork", &event.header)
             })
         }
         EventType::ProcessExit => {
@@ -394,12 +434,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &ProcessExitEvent = unsafe { &*(data.as_ptr() as *const ProcessExitEvent) };
             Some(Event {
-                event_type: "process_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 exit_code: Some(event.exit_code),
-                ..Default::default()
+                ..event_base("process_exit", &event.header)
             })
         }
         EventType::PageFault => {
@@ -408,13 +444,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &PageFaultEvent = unsafe { &*(data.as_ptr() as *const PageFaultEvent) };
             Some(Event {
-                event_type: "page_fault",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 address: Some(event.address),
                 error_code: Some(event.error_code),
-                ..Default::default()
+                ..event_base("page_fault", &event.header)
             })
         }
         EventType::SyscallReadEnter => {
@@ -424,13 +456,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_read_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_read_enter", &event.header)
             })
         }
         EventType::SyscallReadExit => {
@@ -439,12 +467,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_read_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_read_exit", &event.header)
             })
         }
         EventType::SyscallWriteEnter => {
@@ -454,13 +478,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_write_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_write_enter", &event.header)
             })
         }
         EventType::SyscallWriteExit => {
@@ -469,12 +489,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_write_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_write_exit", &event.header)
             })
         }
         EventType::SyscallMmapEnter => {
@@ -484,13 +500,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_mmap_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 address: Some(event.fd as u64),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_mmap_enter", &event.header)
             })
         }
         EventType::SyscallMmapExit => {
@@ -499,12 +511,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_mmap_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_mmap_exit", &event.header)
             })
         }
         EventType::SyscallMunmapEnter => {
@@ -514,13 +522,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_munmap_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 address: Some(event.fd as u64),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_munmap_enter", &event.header)
             })
         }
         EventType::SyscallMunmapExit => {
@@ -529,12 +533,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_munmap_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_munmap_exit", &event.header)
             })
         }
         EventType::SyscallBrkEnter => {
@@ -544,12 +544,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_brk_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 address: Some(event.fd as u64),
-                ..Default::default()
+                ..event_base("syscall_brk_enter", &event.header)
             })
         }
         EventType::SyscallBrkExit => {
@@ -558,12 +554,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_brk_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_brk_exit", &event.header)
             })
         }
         EventType::SyscallIoUringSetupEnter => {
@@ -573,13 +565,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_io_uring_setup_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_io_uring_setup_enter", &event.header)
             })
         }
         EventType::SyscallIoUringSetupExit => {
@@ -588,12 +576,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_io_uring_setup_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_io_uring_setup_exit", &event.header)
             })
         }
         EventType::SyscallIoUringEnterEnter => {
@@ -603,13 +587,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_io_uring_enter_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_io_uring_enter_enter", &event.header)
             })
         }
         EventType::SyscallIoUringEnterExit => {
@@ -618,12 +598,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_io_uring_enter_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_io_uring_enter_exit", &event.header)
             })
         }
         EventType::SyscallIoUringRegisterEnter => {
@@ -633,13 +609,9 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             let event: &SyscallEnterEvent =
                 unsafe { &*(data.as_ptr() as *const SyscallEnterEvent) };
             Some(Event {
-                event_type: "syscall_io_uring_register_enter",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 fd: Some(event.fd),
                 count: Some(event.count),
-                ..Default::default()
+                ..event_base("syscall_io_uring_register_enter", &event.header)
             })
         }
         EventType::SyscallIoUringRegisterExit => {
@@ -648,12 +620,8 @@ fn parse_event(data: &[u8]) -> Option<Event> {
             }
             let event: &SyscallExitEvent = unsafe { &*(data.as_ptr() as *const SyscallExitEvent) };
             Some(Event {
-                event_type: "syscall_io_uring_register_exit",
-                ts_ns: event.header.timestamp_ns,
-                pid: event.header.pid,
-                cpu: event.header.cpu,
                 ret: Some(event.ret),
-                ..Default::default()
+                ..event_base("syscall_io_uring_register_exit", &event.header)
             })
         }
     }
@@ -676,6 +644,315 @@ fn enrich_process_name(
         .or_insert_with(|| read_process_name(event.pid))
         .clone();
     event.process_name = maybe_name;
+}
+
+const STACK_FRAME_LIMIT: usize = 64;
+
+fn format_kernel_ip(ip: u64, symbols: Option<&BTreeMap<u64, String>>) -> String {
+    if let Some(symbols) = symbols
+        && let Some((addr, name)) = symbols.range(..=ip).next_back()
+    {
+        let offset = ip.saturating_sub(*addr);
+        return if offset == 0 {
+            name.clone()
+        } else {
+            format!("{name}+0x{offset:x}")
+        };
+    }
+    format!("0x{ip:x}")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProcMapEntry {
+    start: u64,
+    end: u64,
+    offset: u64,
+    path: PathBuf,
+}
+
+#[derive(Default)]
+struct MaterializedStack {
+    stack_frames: Option<String>,
+    stack_trace: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcMapSnapshotRecord {
+    tgid: u32,
+    captured_ts_ns: u64,
+    start_addr: u64,
+    end_addr: u64,
+    file_offset: u64,
+    path: String,
+}
+
+fn create_maps_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("tgid", DataType::UInt32, false),
+        Field::new("captured_ts_ns", DataType::UInt64, false),
+        Field::new("start_addr", DataType::UInt64, false),
+        Field::new("end_addr", DataType::UInt64, false),
+        Field::new("file_offset", DataType::UInt64, false),
+        Field::new("path", DataType::Utf8, false),
+    ])
+}
+
+struct ProcMapsParquetWriter {
+    writer: ArrowWriter<File>,
+    schema: Arc<Schema>,
+    batch: Vec<ProcMapSnapshotRecord>,
+    total_written: usize,
+}
+
+impl ProcMapsParquetWriter {
+    fn new(path: &str) -> Result<Self> {
+        let schema = Arc::new(create_maps_schema());
+        let file =
+            File::create(path).with_context(|| format!("failed to create output file {}", path))?;
+        let props = WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build();
+        let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
+            .with_context(|| "failed to create proc maps parquet writer")?;
+
+        Ok(Self {
+            writer,
+            schema,
+            batch: Vec::with_capacity(MAP_BATCH_SIZE),
+            total_written: 0,
+        })
+    }
+
+    fn push(&mut self, record: ProcMapSnapshotRecord) -> Result<()> {
+        self.batch.push(record);
+        if self.batch.len() >= MAP_BATCH_SIZE {
+            self.flush_batch()?;
+        }
+        Ok(())
+    }
+
+    fn flush_batch(&mut self) -> Result<()> {
+        if self.batch.is_empty() {
+            return Ok(());
+        }
+
+        let batch_len = self.batch.len();
+        let mut tgid_builder = UInt32Builder::with_capacity(batch_len);
+        let mut captured_ts_builder = UInt64Builder::with_capacity(batch_len);
+        let mut start_builder = UInt64Builder::with_capacity(batch_len);
+        let mut end_builder = UInt64Builder::with_capacity(batch_len);
+        let mut offset_builder = UInt64Builder::with_capacity(batch_len);
+        let mut path_builder = StringBuilder::with_capacity(batch_len, batch_len * 48);
+
+        for record in self.batch.drain(..) {
+            tgid_builder.append_value(record.tgid);
+            captured_ts_builder.append_value(record.captured_ts_ns);
+            start_builder.append_value(record.start_addr);
+            end_builder.append_value(record.end_addr);
+            offset_builder.append_value(record.file_offset);
+            path_builder.append_value(record.path);
+        }
+
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(tgid_builder.finish()),
+            Arc::new(captured_ts_builder.finish()),
+            Arc::new(start_builder.finish()),
+            Arc::new(end_builder.finish()),
+            Arc::new(offset_builder.finish()),
+            Arc::new(path_builder.finish()),
+        ];
+
+        let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
+            .with_context(|| "failed to create proc maps record batch")?;
+        self.writer
+            .write(&record_batch)
+            .with_context(|| "failed to write proc maps record batch")?;
+
+        self.total_written += batch_len;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<usize> {
+        self.flush_batch()?;
+        self.writer
+            .close()
+            .with_context(|| "failed to close proc maps writer")?;
+        Ok(self.total_written)
+    }
+}
+
+fn derive_maps_output_path(events_output_path: &str) -> String {
+    let path = Path::new(events_output_path);
+    if path.extension().is_some() {
+        path.with_extension("maps.parquet")
+            .to_string_lossy()
+            .to_string()
+    } else {
+        format!("{events_output_path}.maps.parquet")
+    }
+}
+
+fn read_proc_maps(pid: u32) -> Vec<ProcMapEntry> {
+    let path = format!("/proc/{pid}/maps");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    contents.lines().filter_map(parse_proc_map_line).collect()
+}
+
+fn parse_proc_map_line(line: &str) -> Option<ProcMapEntry> {
+    let mut parts = line.split_whitespace();
+    let range = parts.next()?;
+    let _perms = parts.next()?;
+    let offset_hex = parts.next()?;
+    let _dev = parts.next()?;
+    let _inode = parts.next()?;
+    let raw_path = parts.next()?;
+
+    if raw_path.starts_with('[') {
+        return None;
+    }
+
+    let path = raw_path
+        .strip_suffix("(deleted)")
+        .map(str::trim_end)
+        .unwrap_or(raw_path);
+    if !path.starts_with('/') {
+        return None;
+    }
+
+    let (start_hex, end_hex) = range.split_once('-')?;
+    let start = u64::from_str_radix(start_hex, 16).ok()?;
+    let end = u64::from_str_radix(end_hex, 16).ok()?;
+    let offset = u64::from_str_radix(offset_hex, 16).ok()?;
+
+    Some(ProcMapEntry {
+        start,
+        end,
+        offset,
+        path: PathBuf::from(path),
+    })
+}
+
+fn maybe_capture_proc_maps_snapshot(
+    tgid: u32,
+    captured_ts_ns: u64,
+    force_snapshot: bool,
+    snapshot_cache: &mut std::collections::HashMap<u32, Vec<ProcMapEntry>>,
+    maps_writer: &mut ProcMapsParquetWriter,
+) -> Result<()> {
+    if tgid == 0 {
+        return Ok(());
+    }
+    let maps = read_proc_maps(tgid);
+    if maps.is_empty() {
+        return Ok(());
+    }
+
+    let changed = snapshot_cache.get(&tgid) != Some(&maps);
+    if !force_snapshot && !changed {
+        return Ok(());
+    }
+
+    for entry in &maps {
+        maps_writer.push(ProcMapSnapshotRecord {
+            tgid,
+            captured_ts_ns,
+            start_addr: entry.start,
+            end_addr: entry.end,
+            file_offset: entry.offset,
+            path: entry.path.to_string_lossy().to_string(),
+        })?;
+    }
+    snapshot_cache.insert(tgid, maps);
+    Ok(())
+}
+
+fn format_stack_frames_hex(frames: &[u64]) -> Option<String> {
+    if frames.is_empty() {
+        return None;
+    }
+    Some(
+        frames
+            .iter()
+            .map(|ip| format!("0x{ip:x}"))
+            .collect::<Vec<_>>()
+            .join(";"),
+    )
+}
+
+fn materialize_stack(
+    stack_id: i32,
+    stack_kind: Option<&'static str>,
+    stack_traces: &StackTraceMap<MapData>,
+    kernel_syms: Option<&BTreeMap<u64, String>>,
+) -> MaterializedStack {
+    if stack_id < 0 {
+        return MaterializedStack::default();
+    }
+    let Ok(stack) = stack_traces.get(&(stack_id as u32), 0) else {
+        return MaterializedStack::default();
+    };
+
+    let mut frames: Vec<u64> = stack
+        .frames()
+        .iter()
+        .take(STACK_FRAME_LIMIT)
+        .map(|frame| frame.ip)
+        .collect();
+    if frames.is_empty() {
+        return MaterializedStack::default();
+    }
+    frames.reverse();
+
+    let stack_frames = format_stack_frames_hex(&frames);
+    let stack_trace = match stack_kind {
+        Some("kernel") => {
+            let mut parts = Vec::with_capacity(frames.len() + 1);
+            parts.push("[kernel]".to_string());
+            parts.extend(frames.iter().map(|ip| format_kernel_ip(*ip, kernel_syms)));
+            Some(parts.join(";"))
+        }
+        Some("user") => stack_frames
+            .as_ref()
+            .map(|frames| format!("[user];{frames}")),
+        _ => stack_frames.clone(),
+    };
+
+    MaterializedStack {
+        stack_frames,
+        stack_trace,
+    }
+}
+
+fn enrich_stack_data(
+    event: &mut Event,
+    stack_traces: &StackTraceMap<MapData>,
+    kernel_syms: Option<&BTreeMap<u64, String>>,
+    stack_cache: &mut std::collections::HashMap<(i32, Option<&'static str>), MaterializedStack>,
+) {
+    let Some(stack_id) = event.stack_id else {
+        return;
+    };
+    let key = (stack_id, event.stack_kind);
+    if let Some(cached) = stack_cache.get(&key) {
+        event.stack_frames = cached.stack_frames.clone();
+        event.stack_trace = cached.stack_trace.clone();
+        return;
+    }
+
+    let materialized = materialize_stack(stack_id, event.stack_kind, stack_traces, kernel_syms);
+    event.stack_frames = materialized.stack_frames.clone();
+    event.stack_trace = materialized.stack_trace.clone();
+    stack_cache.insert(key, materialized);
+}
+
+fn should_refresh_maps_for_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "syscall_mmap_enter" | "syscall_munmap_enter" | "syscall_brk_enter" | "process_fork"
+    )
 }
 
 /// Attach a tracepoint program
@@ -881,14 +1158,74 @@ async fn main() -> Result<()> {
     // Create Parquet batch writer
     let mut writer = ParquetBatchWriter::new(&args.output)?;
     info!("Writing events to {}", args.output);
+    let maps_output_path = derive_maps_output_path(&args.output);
+    let mut maps_writer = ProcMapsParquetWriter::new(&maps_output_path)?;
+    info!("Writing proc map snapshots to {}", maps_output_path);
+
+    // Stack trace map for resolving stack ids into raw frame addresses.
+    let stack_traces: StackTraceMap<_> = StackTraceMap::try_from(
+        ebpf.take_map("STACK_TRACES")
+            .ok_or_else(|| anyhow!("map STACK_TRACES not found"))?,
+    )?;
+    let kernel_syms = kernel_symbols().ok();
+    if kernel_syms.is_none() {
+        warn!("kernel symbols unavailable; kernel stack frames will be shown as raw addresses");
+    }
 
     // Get ring buffer
-    let ring_buf = RingBuf::try_from(ebpf.map_mut("EVENTS").unwrap())?;
+    let ring_buf = RingBuf::try_from(
+        ebpf.take_map("EVENTS")
+            .ok_or_else(|| anyhow!("map EVENTS not found"))?,
+    )?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
 
     let mut child_wait_done = false;
     let mut pid_name_cache: std::collections::HashMap<u32, Option<String>> =
         std::collections::HashMap::new();
+    let mut stack_trace_cache: std::collections::HashMap<
+        (i32, Option<&'static str>),
+        MaterializedStack,
+    > = std::collections::HashMap::new();
+    let mut proc_map_snapshot_cache: std::collections::HashMap<u32, Vec<ProcMapEntry>> =
+        std::collections::HashMap::new();
+    let mut seen_tgids: HashSet<u32> = HashSet::new();
+
+    let mut handle_event = |event: &mut Event| -> Result<()> {
+        enrich_process_name(event, &mut pid_name_cache);
+        enrich_stack_data(
+            event,
+            &stack_traces,
+            kernel_syms.as_ref(),
+            &mut stack_trace_cache,
+        );
+
+        if event.tgid > 0 {
+            let is_first_seen = seen_tgids.insert(event.tgid);
+            let should_refresh = is_first_seen || should_refresh_maps_for_event(event.event_type);
+            maybe_capture_proc_maps_snapshot(
+                event.tgid,
+                event.ts_ns,
+                should_refresh,
+                &mut proc_map_snapshot_cache,
+                &mut maps_writer,
+            )?;
+        }
+
+        if event.event_type == "process_fork"
+            && let Some(child_pid) = event.child_pid
+        {
+            maybe_capture_proc_maps_snapshot(
+                child_pid,
+                event.ts_ns,
+                true,
+                &mut proc_map_snapshot_cache,
+                &mut maps_writer,
+            )?;
+            seen_tgids.insert(child_pid);
+        }
+
+        writer.push(std::mem::take(event))
+    };
 
     // Event loop
     info!("Starting event loop...");
@@ -907,8 +1244,7 @@ async fn main() -> Result<()> {
                 // Drain any remaining events
                 while let Some(item) = async_ring_buf.get_mut().next() {
                     if let Some(mut event) = parse_event(&item) {
-                        enrich_process_name(&mut event, &mut pid_name_cache);
-                        writer.push(event)?;
+                        handle_event(&mut event)?;
                     }
                 }
                 info!("Child process {} exited", child_pid);
@@ -931,8 +1267,7 @@ async fn main() -> Result<()> {
                 // Process all available events
                 while let Some(item) = guard.get_inner_mut().next() {
                     if let Some(mut event) = parse_event(&item) {
-                        enrich_process_name(&mut event, &mut pid_name_cache);
-                        writer.push(event)?;
+                        handle_event(&mut event)?;
                     }
                 }
 
@@ -947,7 +1282,9 @@ async fn main() -> Result<()> {
 
     // Finish writing and close the Parquet file
     let total_events = writer.finish()?;
+    let total_maps = maps_writer.finish()?;
     info!("Done. Wrote {} events to {}", total_events, args.output);
+    info!("Wrote {} proc map rows to {}", total_maps, maps_output_path);
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if total_events > 0

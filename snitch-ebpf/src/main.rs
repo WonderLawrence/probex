@@ -3,20 +3,25 @@
 
 use aya_ebpf::{
     EbpfContext,
-    bindings::BPF_RB_FORCE_WAKEUP,
+    bindings::{BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP},
     helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns},
     macros::{map, tracepoint},
-    maps::{HashMap, RingBuf},
+    maps::{HashMap, RingBuf, StackTrace},
     programs::TracePointContext,
 };
 use snitch_common::{
     EventHeader, EventType, MAX_TRACKED_PIDS, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
-    RING_BUF_SIZE, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    RING_BUF_SIZE, STACK_KIND_KERNEL, STACK_KIND_NONE, STACK_KIND_USER, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent,
 };
 
 /// Ring buffer for sending events to userspace
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(RING_BUF_SIZE, 0);
+
+/// Stack trace storage used by bpf_get_stackid.
+#[map]
+static STACK_TRACES: StackTrace = StackTrace::with_max_entries(16384, 0);
 
 /// HashMap to track which PIDs we're tracing
 #[map]
@@ -28,16 +33,36 @@ fn is_traced(pid: u32) -> bool {
     unsafe { TRACED_PIDS.get(&pid).is_some() }
 }
 
+/// Capture stack id for the current event.
+///
+/// We try user stack first (for "who in user code triggered this"), then
+/// fallback to kernel stack if user stack capture fails.
+#[inline(always)]
+fn capture_stack(ctx: &TracePointContext) -> (i32, u8) {
+    if let Ok(stack_id) =
+        unsafe { STACK_TRACES.get_stackid::<TracePointContext>(ctx, BPF_F_USER_STACK as u64) }
+    {
+        return (stack_id as i32, STACK_KIND_USER);
+    }
+    if let Ok(stack_id) = unsafe { STACK_TRACES.get_stackid::<TracePointContext>(ctx, 0) } {
+        return (stack_id as i32, STACK_KIND_KERNEL);
+    }
+    (-1, STACK_KIND_NONE)
+}
+
 /// Create an event header
 #[inline(always)]
 fn make_header(ctx: &TracePointContext, event_type: EventType) -> EventHeader {
+    let (stack_id, stack_kind) = capture_stack(ctx);
     EventHeader {
         timestamp_ns: unsafe { bpf_ktime_get_ns() },
         pid: ctx.pid(),
         tgid: ctx.tgid(),
+        stack_id,
+        stack_kind,
         event_type: event_type as u8,
         cpu: unsafe { bpf_get_smp_processor_id() } as u8,
-        _padding: [0; 2],
+        _padding: [0; 1],
     }
 }
 
@@ -73,19 +98,14 @@ fn try_sched_switch(ctx: &TracePointContext) -> Result<u32, i64> {
 
     // Reserve space in ring buffer for the event
     if let Some(mut buf) = EVENTS.reserve::<SchedSwitchEvent>(0) {
+        let mut header = make_header(ctx, EventType::SchedSwitch);
+        header.pid = if is_traced(prev_pid) {
+            prev_pid
+        } else {
+            next_pid
+        };
         let event = SchedSwitchEvent {
-            header: EventHeader {
-                timestamp_ns: unsafe { bpf_ktime_get_ns() },
-                pid: if is_traced(prev_pid) {
-                    prev_pid
-                } else {
-                    next_pid
-                },
-                tgid: ctx.tgid(),
-                event_type: EventType::SchedSwitch as u8,
-                cpu: unsafe { bpf_get_smp_processor_id() } as u8,
-                _padding: [0; 2],
-            },
+            header,
             prev_pid,
             prev_tgid: 0, // Not available in tracepoint
             next_pid,

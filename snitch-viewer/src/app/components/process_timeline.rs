@@ -147,7 +147,7 @@ pub fn ProcessTimeline(
                     view_start_ns,
                     view_end_ns,
                     enabled_types: enabled_event_types.clone(),
-                    on_change_range: on_change_range.clone(),
+                    on_change_range,
                 }
             }
 
@@ -243,8 +243,7 @@ pub fn ProcessTimeline(
 
                     let left_pct = if in_view {
                         ((bar_start - view_start_ns) as f64 / view_duration * 100.0)
-                            .max(0.0)
-                            .min(100.0)
+                            .clamp(0.0, 100.0)
                     } else {
                         0.0
                     };
@@ -275,6 +274,11 @@ pub fn ProcessTimeline(
                     let pid = proc.pid;
                     let process_name = proc.process_name.as_deref().unwrap_or("unknown");
                     let is_selected = selected_pid == Some(proc.pid);
+                    let process_label_class = if is_selected {
+                        "cursor-pointer overflow-hidden bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5"
+                    } else {
+                        "cursor-pointer hover:text-blue-600 overflow-hidden"
+                    };
                     let process_start_ns = proc.start_ns;
                     let process_end_ns = proc.end_ns.unwrap_or(full_end_ns);
                     let focus_end_ns = if process_end_ns > process_start_ns {
@@ -326,11 +330,7 @@ pub fn ProcessTimeline(
                                         span { class: "inline-flex w-5 h-5" }
                                     }
                                     div {
-                                        class: if is_selected {
-                                            "cursor-pointer overflow-hidden bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5"
-                                        } else {
-                                            "cursor-pointer hover:text-blue-600 overflow-hidden"
-                                        },
+                                        class: process_label_class,
                                         onclick: move |_| on_select_pid.call(pid),
                                         div { class: "text-sm text-gray-700 text-right truncate leading-tight",
                                             if is_selected {
@@ -356,8 +356,7 @@ pub fn ProcessTimeline(
 
                                 {pid_events.iter().map(|event| {
                                     let event_pct = ((event.ts_ns - view_start_ns) as f64 / view_duration * 100.0)
-                                        .max(0.0)
-                                        .min(100.0);
+                                        .clamp(0.0, 100.0);
                                     let event_color = get_event_marker_color(&event.event_type);
 
                                     rsx! {
