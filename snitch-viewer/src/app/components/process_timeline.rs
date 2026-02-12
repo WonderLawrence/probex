@@ -2,8 +2,15 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
-use crate::app::formatting::{format_duration, format_duration_short, get_event_marker_color};
-use crate::server::{EventMarker, HistogramResponse, ProcessEventsResponse, ProcessLifetime};
+use crate::app::formatting::{
+    format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
+    get_event_marker_color,
+};
+use crate::app::view_model::PidEventSummary;
+use crate::server::{
+    EventMarker, HistogramResponse, ProcessEventsResponse, ProcessLifetime, SyscallLatencyStats,
+    TraceSummary,
+};
 
 #[component]
 pub fn ProcessTimeline(
@@ -16,9 +23,17 @@ pub fn ProcessTimeline(
     view_start_ns: u64,
     view_end_ns: u64,
     histogram: Option<HistogramResponse>,
+    // PID aggregation data
+    summary: Option<TraceSummary>,
+    pid_summary: PidEventSummary,
+    latency_stats: Option<SyscallLatencyStats>,
+    total_event_count: usize,
+    // Event handlers
     on_select_pid: EventHandler<u32>,
+    on_select_pid_option: EventHandler<Option<u32>>,
     on_focus_process: EventHandler<(u32, u64, u64)>,
     on_change_range: EventHandler<(u64, u64, bool)>,
+    on_toggle_event_type: EventHandler<String>,
 ) -> Element {
     let mut collapsed_nodes = use_signal(HashSet::<u32>::new);
 
@@ -56,20 +71,24 @@ pub fn ProcessTimeline(
     root_pids.sort_by_key(|pid| process_by_pid.get(pid).map(|p| p.start_ns).unwrap_or(0));
 
     let collapsed_set = collapsed_nodes();
-    let mut ordered_pid_rows: Vec<(u32, usize)> = Vec::with_capacity(sorted_processes.len());
-    for root_pid in &root_pids {
+    let mut ordered_pid_rows: Vec<(u32, TreePosition)> = Vec::with_capacity(sorted_processes.len());
+    let root_count = root_pids.len();
+    for (i, root_pid) in root_pids.iter().enumerate() {
+        let is_last_root = i == root_count - 1;
         append_visible_rows(
             *root_pid,
             0,
             &children_map,
             &collapsed_set,
+            Vec::new(),
+            is_last_root,
             &mut ordered_pid_rows,
         );
     }
 
-    let all_process_rows: Vec<(&ProcessLifetime, usize)> = ordered_pid_rows
+    let all_process_rows: Vec<(&ProcessLifetime, TreePosition)> = ordered_pid_rows
         .iter()
-        .filter_map(|(pid, depth)| process_by_pid.get(pid).map(|proc| (*proc, *depth)))
+        .filter_map(|(pid, tree_pos)| process_by_pid.get(pid).map(|proc| (*proc, tree_pos.clone())))
         .collect();
 
     let visible_in_range_count = sorted_processes
@@ -108,16 +127,16 @@ pub fn ProcessTimeline(
             div { class: "flex items-center justify-between mb-1.5",
                 span { class: "text-sm font-medium text-gray-700", "Process Lifetimes" }
                 div { class: "flex items-center gap-3",
-                    span { class: "text-xs text-gray-400", "{visible_in_range_count} active in view · {sorted_processes.len()} total" }
+                    span { class: "text-xs text-gray-400", "{visible_in_range_count} in view · {sorted_processes.len()} total" }
                     if has_collapsible_nodes {
                         button {
-                            class: "text-xs text-gray-600 hover:text-gray-800 underline disabled:opacity-40 disabled:no-underline",
+                            class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
                             disabled: all_tree_expanded,
                             onclick: move |_| collapsed_nodes.set(HashSet::new()),
-                            "Expand all"
+                            "Expand"
                         }
                         button {
-                            class: "text-xs text-gray-600 hover:text-gray-800 underline disabled:opacity-40 disabled:no-underline",
+                            class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
                             disabled: all_tree_collapsed,
                             onclick: {
                                 let collapse_targets = collapsible_nodes.clone();
@@ -129,7 +148,7 @@ pub fn ProcessTimeline(
                                     collapsed_nodes.set(all_collapsed);
                                 }
                             },
-                            "Collapse all"
+                            "Collapse"
                         }
                     }
                 }
@@ -151,17 +170,47 @@ pub fn ProcessTimeline(
                 }
             }
 
-            div { class: "flex items-center justify-between mb-1.5",
-                div { class: "text-sm text-gray-700",
-                    span { class: "font-mono", "{format_duration(view_start_ns - full_start_ns)}" }
-                    span { class: "text-gray-400 mx-2", "→" }
-                    span { class: "font-mono", "{format_duration(view_end_ns - full_start_ns)}" }
-                    span { class: "text-gray-400 ml-2", "({format_duration(view_duration_ns)})" }
+            // Compact controls row: PID selector + time range + stats + navigation
+            div { class: "flex items-center gap-2 mb-1.5 flex-wrap",
+                // PID selector
+                div { class: "flex items-center gap-1.5 shrink-0",
+                    span { class: "text-xs text-gray-500", "PID" }
+                    select {
+                        class: "px-1.5 py-0.5 border border-gray-200 rounded text-xs bg-white min-w-[70px]",
+                        value: selected_pid.map(|p| p.to_string()).unwrap_or_default(),
+                        onchange: move |evt| {
+                            on_select_pid_option.call(evt.value().parse::<u32>().ok());
+                        },
+                        option { value: "", "All" }
+                        {
+                            summary
+                                .as_ref()
+                                .map(|s| {
+                                    s.unique_pids.iter().map(|pid| rsx! {
+                                        option { key: "{pid}", value: "{pid}", "{pid}" }
+                                    })
+                                })
+                                .into_iter()
+                                .flatten()
+                        }
+                    }
+                    span { class: "text-xs text-gray-400", "{total_event_count} ev" }
                 }
 
-                div { class: "flex items-center gap-1",
+                div { class: "w-px h-4 bg-gray-200 shrink-0" }
+
+                // Time range display
+                div { class: "text-xs text-gray-600 shrink-0",
+                    span { class: "font-mono", "{format_duration(view_start_ns - full_start_ns)}" }
+                    span { class: "text-gray-400 mx-1", "→" }
+                    span { class: "font-mono", "{format_duration(view_end_ns - full_start_ns)}" }
+                    span { class: "text-gray-400 ml-1", "({format_duration(view_duration_ns)})" }
+                }
+
+                // Navigation buttons
+                div { class: "flex items-center gap-0.5 ml-auto shrink-0",
                     button {
-                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_start_ns <= full_start_ns,
                         onclick: move |_| {
                             let shift = view_duration_ns / 4;
@@ -172,7 +221,7 @@ pub fn ProcessTimeline(
                         "◀"
                     }
                     button {
-                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_end_ns >= full_end_ns,
                         onclick: move |_| {
                             let shift = view_duration_ns / 4;
@@ -182,11 +231,8 @@ pub fn ProcessTimeline(
                         },
                         "▶"
                     }
-
-                    div { class: "w-px h-5 bg-gray-200 mx-1" }
-
                     button {
-                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_duration_ns < 1000,
                         onclick: move |_| {
                             let center = view_start_ns + view_duration_ns / 2;
@@ -198,7 +244,7 @@ pub fn ProcessTimeline(
                         "+"
                     }
                     button {
-                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_duration_ns >= full_duration_ns,
                         onclick: move |_| {
                             let center = view_start_ns + view_duration_ns / 2;
@@ -210,19 +256,69 @@ pub fn ProcessTimeline(
                         },
                         "−"
                     }
-
-                    div { class: "w-px h-5 bg-gray-200 mx-1" }
-
                     button {
-                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded",
+                        class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded",
                         onclick: move |_| on_change_range.call((full_start_ns, full_end_ns, true)),
                         "Reset"
                     }
                 }
             }
 
+            // Event type badges row (when PID selected)
+            if selected_pid.is_some() && !pid_summary.breakdown.is_empty() {
+                div { class: "flex flex-wrap gap-1 mb-1.5",
+                    {pid_summary.breakdown.iter().map(|(event_type, count)| {
+                        let enabled = enabled_event_types.contains(event_type);
+                        let event_type_clone = event_type.clone();
+                        let badge_class = event_badge_class(enabled, event_type);
+                        rsx! {
+                            button {
+                                key: "{event_type}",
+                                class: badge_class,
+                                onclick: move |_| {
+                                    on_toggle_event_type.call(event_type_clone.clone());
+                                },
+                                "{event_type}"
+                                span { class: if enabled { "opacity-70" } else { "text-gray-400" }, " {count}" }
+                            }
+                        }
+                    })}
+                }
+            }
+
+            // Latency stats row (when PID selected and has data)
+            if let Some(stats) = &latency_stats {
+                if stats.read.count > 0 || stats.write.count > 0 || stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0 {
+                    div { class: "flex flex-wrap gap-4 text-xs text-gray-600 mb-1.5",
+                        if stats.read.count > 0 {
+                            span { class: "whitespace-nowrap",
+                                span { class: "text-gray-400", "read " }
+                                span { class: "text-gray-400", "{stats.read.count}× " }
+                                span { class: "text-gray-400", "avg/p50/p95/max " }
+                                "{format_duration(stats.read.avg_ns)}/{format_duration(stats.read.p50_ns)}/{format_duration(stats.read.p95_ns)}/{format_duration(stats.read.max_ns)}"
+                            }
+                        }
+                        if stats.write.count > 0 {
+                            span { class: "whitespace-nowrap",
+                                span { class: "text-gray-400", "write " }
+                                span { class: "text-gray-400", "{stats.write.count}× " }
+                                span { class: "text-gray-400", "avg/p50/p95/max " }
+                                "{format_duration(stats.write.avg_ns)}/{format_duration(stats.write.p50_ns)}/{format_duration(stats.write.p95_ns)}/{format_duration(stats.write.max_ns)}"
+                            }
+                        }
+                        if stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0 {
+                            span { class: "whitespace-nowrap",
+                                span { class: "text-gray-400", "mem " }
+                                span { class: "text-gray-400", "+/−/net " }
+                                "{format_bytes(stats.mmap_alloc_bytes)}/{format_bytes(stats.munmap_free_bytes)}/{format_net_bytes_signed(stats.mmap_alloc_bytes, stats.munmap_free_bytes)}"
+                            }
+                        }
+                    }
+                }
+            }
+
             div { class: "flex items-center mb-1",
-                div { class: "w-48 shrink-0" }
+                div { class: "w-56 shrink-0" }
                 div { class: "flex-1 flex justify-between text-xs text-gray-400",
                     span { "{format_duration(view_start_ns - full_start_ns)}" }
                     span { "{format_duration(view_end_ns - full_start_ns)}" }
@@ -231,8 +327,8 @@ pub fn ProcessTimeline(
             }
 
             div { class: if all_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
-                {visible_process_rows.iter().map(|(proc, depth)| {
-                    let indent = (*depth).min(6);
+                {visible_process_rows.iter().map(|(proc, tree_pos)| {
+                    let depth = tree_pos.ancestor_is_last.len();
 
                     let view_duration_ns = view_end_ns.saturating_sub(view_start_ns).max(1);
                     let view_duration = view_duration_ns as f64;
@@ -265,19 +361,16 @@ pub fn ProcessTimeline(
                         "bg-blue-200"
                     };
 
-                    let has_parent = proc.parent_pid.is_some();
-                    let has_children = children_map
-                        .get(&proc.pid)
-                        .map(|children| !children.is_empty())
-                        .unwrap_or(false);
+                    let has_children = tree_pos.has_children;
                     let is_collapsed = collapsed_set.contains(&proc.pid);
+                    let collapsed_count = tree_pos.descendant_count;
                     let pid = proc.pid;
                     let process_name = proc.process_name.as_deref().unwrap_or("unknown");
                     let is_selected = selected_pid == Some(proc.pid);
                     let process_label_class = if is_selected {
-                        "cursor-pointer overflow-hidden bg-blue-50 border border-blue-200 rounded px-1.5 py-0.5"
+                        "cursor-pointer overflow-hidden bg-blue-50 border border-blue-200 rounded px-1 py-0.5 min-w-0"
                     } else {
-                        "cursor-pointer hover:text-blue-600 overflow-hidden"
+                        "cursor-pointer hover:bg-gray-50 overflow-hidden px-1 py-0.5 min-w-0"
                     };
                     let process_start_ns = proc.start_ns;
                     let process_end_ns = proc.end_ns.unwrap_or(full_end_ns);
@@ -300,47 +393,82 @@ pub fn ProcessTimeline(
                         })
                         .unwrap_or_default();
 
+                    // Build tree line prefixes
+                    let tree_pos_clone = tree_pos.clone();
+
                     rsx! {
                         div {
                             key: "{proc.pid}",
-                            class: "flex items-center gap-2 h-8 group",
+                            class: "flex items-center gap-2 h-7 group",
 
                             div {
-                                class: "w-48 shrink-0 overflow-hidden",
-                                style: "padding-left: {indent * 6}px; font-variant-numeric: tabular-nums;",
+                                class: "w-56 shrink-0 flex items-center",
+                                style: "font-variant-numeric: tabular-nums;",
                                 title: "{process_name} (PID {proc.pid})",
-                                div { class: "flex items-start justify-end gap-1.5",
-                                    if has_children {
-                                        button {
-                                            class: "inline-flex items-center justify-center w-4 h-4 text-sm leading-none font-semibold text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded",
-                                            title: if is_collapsed { "Expand children" } else { "Collapse children" },
-                                            onclick: move |_| {
-                                                let mut collapsed = collapsed_nodes();
-                                                if collapsed.contains(&pid) {
-                                                    collapsed.remove(&pid);
-                                                } else {
-                                                    collapsed.insert(pid);
-                                                }
-                                                collapsed_nodes.set(collapsed);
-                                            },
-                                            if is_collapsed { "▸" } else { "▾" }
-                                        }
-                                    } else {
-                                        span { class: "inline-flex w-4 h-4" }
-                                    }
-                                    div {
-                                        class: process_label_class,
-                                        onclick: move |_| on_select_pid.call(pid),
-                                        div { class: "text-xs text-gray-700 text-right truncate leading-tight",
-                                            if is_selected {
-                                                span { class: "inline-block w-1 h-1 rounded-full bg-blue-600 mr-1 align-middle" }
+
+                                // Tree structure lines
+                                div { class: "flex items-center h-full shrink-0",
+                                    // Draw ancestor columns (│ or space)
+                                    {tree_pos_clone.ancestor_is_last.iter().enumerate().map(|(i, is_last)| {
+                                        rsx! {
+                                            span {
+                                                key: "{i}",
+                                                class: "inline-block w-4 text-center text-gray-300 select-none",
+                                                style: "font-family: monospace;",
+                                                if *is_last { " " } else { "│" }
                                             }
-                                            if has_parent { "└ " }
+                                        }
+                                    })}
+
+                                    // Draw branch connector for this node (├ or └)
+                                    if depth > 0 {
+                                        span {
+                                            class: "inline-block w-4 text-center text-gray-300 select-none",
+                                            style: "font-family: monospace;",
+                                            if tree_pos_clone.is_last_child { "└" } else { "├" }
+                                        }
+                                    }
+                                }
+
+                                // Expand/collapse button or spacer
+                                if has_children {
+                                    button {
+                                        class: "inline-flex items-center justify-center w-5 h-5 text-xs font-bold text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded shrink-0",
+                                        title: if is_collapsed { "Expand children" } else { "Collapse children" },
+                                        onclick: move |_| {
+                                            let mut collapsed = collapsed_nodes();
+                                            if collapsed.contains(&pid) {
+                                                collapsed.remove(&pid);
+                                            } else {
+                                                collapsed.insert(pid);
+                                            }
+                                            collapsed_nodes.set(collapsed);
+                                        },
+                                        if is_collapsed { "▶" } else { "▼" }
+                                    }
+                                } else {
+                                    span { class: "inline-block w-5 shrink-0" }
+                                }
+
+                                // Process info
+                                div {
+                                    class: process_label_class,
+                                    onclick: move |_| on_select_pid.call(pid),
+                                    div { class: "flex items-center gap-1",
+                                        if is_selected {
+                                            span { class: "inline-block w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0" }
+                                        }
+                                        span { class: "text-xs text-gray-700 truncate",
                                             "{process_name}"
                                         }
-                                        div { class: "text-[10px] font-mono text-gray-500 text-right whitespace-nowrap leading-tight",
-                                            "PID {proc.pid}"
+                                        if is_collapsed && collapsed_count > 0 {
+                                            span { class: "text-[10px] text-gray-400 bg-gray-100 px-1 rounded shrink-0",
+                                                "+{collapsed_count}"
+                                            }
                                         }
+                                    }
+                                    div { class: "text-[10px] font-mono text-gray-400 whitespace-nowrap",
+                                        "PID {proc.pid}"
                                     }
                                 }
                             }
@@ -566,20 +694,103 @@ fn TimelineOverview(
     }
 }
 
+fn event_badge_class(enabled: bool, event_type: &str) -> String {
+    if enabled {
+        format!(
+            "inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium border {} bg-transparent hover:bg-gray-50",
+            event_badge_tone(event_type)
+        )
+    } else {
+        "inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium border border-gray-200 text-gray-400 bg-transparent hover:bg-gray-50".to_string()
+    }
+}
+
+fn event_badge_tone(event_type: &str) -> &'static str {
+    match event_type {
+        "sched_switch" => "border-blue-300 text-blue-700",
+        "process_fork" => "border-green-300 text-green-700",
+        "process_exit" => "border-red-300 text-red-700",
+        "page_fault" => "border-amber-300 text-amber-700",
+        _ if event_type.contains("read") => "border-sky-300 text-sky-700",
+        _ if event_type.contains("write") => "border-orange-300 text-orange-700",
+        _ if event_type.contains("mmap") || event_type.contains("munmap") || event_type.contains("brk") => "border-purple-300 text-purple-700",
+        _ if event_type.contains("syscall") => "border-indigo-300 text-indigo-700",
+        _ => "border-gray-300 text-gray-700",
+    }
+}
+
+/// Tree position info for rendering tree lines
+#[derive(Clone)]
+struct TreePosition {
+    /// For each ancestor level, whether that ancestor was the last child at its level
+    /// This determines whether to draw │ (not last) or space (last) for each column
+    ancestor_is_last: Vec<bool>,
+    /// Whether this node is the last child of its parent
+    is_last_child: bool,
+    /// Whether this node has children
+    has_children: bool,
+    /// Number of total descendants (for collapse badge)
+    descendant_count: usize,
+}
+
+fn count_descendants(pid: u32, children_map: &HashMap<u32, Vec<u32>>) -> usize {
+    let mut count = 0;
+    if let Some(children) = children_map.get(&pid) {
+        count += children.len();
+        for child in children {
+            count += count_descendants(*child, children_map);
+        }
+    }
+    count
+}
+
 fn append_visible_rows(
     pid: u32,
     depth: usize,
     children_map: &HashMap<u32, Vec<u32>>,
     collapsed_nodes: &HashSet<u32>,
-    out: &mut Vec<(u32, usize)>,
+    ancestor_is_last: Vec<bool>,
+    is_last_child: bool,
+    out: &mut Vec<(u32, TreePosition)>,
 ) {
-    out.push((pid, depth));
+    let has_children = children_map
+        .get(&pid)
+        .map(|c| !c.is_empty())
+        .unwrap_or(false);
+    let descendant_count = if collapsed_nodes.contains(&pid) {
+        count_descendants(pid, children_map)
+    } else {
+        0
+    };
+
+    out.push((
+        pid,
+        TreePosition {
+            ancestor_is_last: ancestor_is_last.clone(),
+            is_last_child,
+            has_children,
+            descendant_count,
+        },
+    ));
+
     if collapsed_nodes.contains(&pid) {
         return;
     }
     if let Some(children) = children_map.get(&pid) {
-        for child in children {
-            append_visible_rows(*child, depth + 1, children_map, collapsed_nodes, out);
+        let child_count = children.len();
+        for (i, child) in children.iter().enumerate() {
+            let is_last = i == child_count - 1;
+            let mut child_ancestor_is_last = ancestor_is_last.clone();
+            child_ancestor_is_last.push(is_last_child);
+            append_visible_rows(
+                *child,
+                depth + 1,
+                children_map,
+                collapsed_nodes,
+                child_ancestor_is_last,
+                is_last,
+                out,
+            );
         }
     }
 }

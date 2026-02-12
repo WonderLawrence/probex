@@ -9,9 +9,7 @@ mod view_model;
 
 use std::collections::HashSet;
 
-use components::{
-    EventFlamegraphCard, EventsTable, Pager, PidAggregationCard, ProcessTimeline, ViewerHeader,
-};
+use components::{EventFlamegraphCard, EventsTable, Pager, ProcessTimeline, ViewerHeader};
 use dioxus::prelude::*;
 use view_model::build_pid_event_summary;
 
@@ -227,31 +225,6 @@ fn TraceViewer() -> Element {
                 div { class: "bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded-lg text-xs", "{err}" }
             }
 
-            PidAggregationCard {
-                summary: summary_data.clone(),
-                selected_pid: selected_pid(),
-                total_count,
-                total_pages,
-                current_page: current_page(),
-                pid_summary: pid_summary.clone(),
-                enabled_event_types: enabled_event_types(),
-                latency_stats: syscall_latency_stats(),
-                on_select_pid: move |pid| {
-                    selected_pid.set(pid);
-                    do_search(true);
-                },
-                on_toggle_event_type: move |event_type: String| {
-                    let mut types = enabled_event_types();
-                    if types.contains(&event_type) {
-                        types.remove(&event_type);
-                    } else {
-                        types.insert(event_type);
-                    }
-                    enabled_event_types.set(types);
-                    do_search(true);
-                },
-            }
-
             if let (Some(summary), Some(lifetimes)) = (summary_data.clone(), process_lifetimes()) {
                 ProcessTimeline {
                     processes: lifetimes.processes,
@@ -263,8 +236,18 @@ fn TraceViewer() -> Element {
                     view_start_ns: view_start_ns(),
                     view_end_ns: view_end_ns(),
                     histogram: hist_data,
+                    // PID aggregation data
+                    summary: summary_data.clone(),
+                    pid_summary: pid_summary.clone(),
+                    latency_stats: syscall_latency_stats(),
+                    total_event_count: total_count,
+                    // Event handlers
                     on_select_pid: move |pid: u32| {
                         selected_pid.set(Some(pid));
+                        do_search(true);
+                    },
+                    on_select_pid_option: move |pid: Option<u32>| {
+                        selected_pid.set(pid);
                         do_search(true);
                     },
                     on_focus_process: move |(pid, start, end): (u32, u64, u64)| {
@@ -291,6 +274,16 @@ fn TraceViewer() -> Element {
                         if commit {
                             do_search(true);
                         }
+                    },
+                    on_toggle_event_type: move |event_type: String| {
+                        let mut types = enabled_event_types();
+                        if types.contains(&event_type) {
+                            types.remove(&event_type);
+                        } else {
+                            types.insert(event_type);
+                        }
+                        enabled_event_types.set(types);
+                        do_search(true);
                     },
                 }
             }
