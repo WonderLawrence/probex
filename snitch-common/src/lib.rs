@@ -80,6 +80,9 @@ pub const STACK_KIND_USER: u8 = 1;
 pub const STACK_KIND_KERNEL: u8 = 2;
 pub const STACK_KIND_BOTH: u8 = STACK_KIND_USER | STACK_KIND_KERNEL;
 
+/// Maximum number of frame-pointer-derived user frames emitted in each cpu sample event.
+pub const MAX_CPU_SAMPLE_FRAMES: usize = 127;
+
 // CPU sampler stats indices (per-CPU array slot 0).
 pub const CPU_SAMPLE_STATS_LEN: usize = 7;
 pub const CPU_SAMPLE_STAT_CALLBACK_TOTAL: usize = 0;
@@ -89,6 +92,16 @@ pub const CPU_SAMPLE_STAT_RINGBUF_DROPPED: usize = 3;
 pub const CPU_SAMPLE_STAT_USER_STACK: usize = 4;
 pub const CPU_SAMPLE_STAT_KERNEL_STACK: usize = 5;
 pub const CPU_SAMPLE_STAT_NO_STACK: usize = 6;
+
+/// CPU sample event carrying explicit user-space return addresses from frame-pointer walking.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CpuSampleEvent {
+    pub header: EventHeader,
+    pub frame_count: u16,
+    pub _padding: [u8; 6],
+    pub frames: [u64; MAX_CPU_SAMPLE_FRAMES],
+}
 
 /// Context switch event
 #[repr(C)]
@@ -153,6 +166,7 @@ pub const PROCESS_EXIT_EVENT_SIZE: usize = core::mem::size_of::<ProcessExitEvent
 pub const PAGE_FAULT_EVENT_SIZE: usize = core::mem::size_of::<PageFaultEvent>();
 pub const SYSCALL_ENTER_EVENT_SIZE: usize = core::mem::size_of::<SyscallEnterEvent>();
 pub const SYSCALL_EXIT_EVENT_SIZE: usize = core::mem::size_of::<SyscallExitEvent>();
+pub const CPU_SAMPLE_EVENT_SIZE: usize = core::mem::size_of::<CpuSampleEvent>();
 
 // Ring buffer size (8MB)
 pub const RING_BUF_SIZE: u32 = 8 * 1024 * 1024;

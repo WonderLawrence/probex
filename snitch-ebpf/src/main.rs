@@ -4,17 +4,18 @@
 use aya_ebpf::{
     EbpfContext,
     bindings::{BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP},
-    helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns},
+    helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_probe_read_user},
     macros::{map, perf_event, tracepoint},
     maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
     programs::{PerfEventContext, TracePointContext},
 };
 use snitch_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
-    CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
-    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, EventHeader, EventType, MAX_TRACKED_PIDS,
-    PageFaultEvent, ProcessExitEvent, ProcessForkEvent, RING_BUF_SIZE, STACK_KIND_KERNEL,
-    STACK_KIND_NONE, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STAT_USER_STACK,
+    CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType, MAX_CPU_SAMPLE_FRAMES,
+    MAX_TRACKED_PIDS, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, RING_BUF_SIZE,
+    STACK_KIND_KERNEL, STACK_KIND_NONE, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent,
+    SyscallExitEvent,
 };
 
 /// Ring buffer for sending events to userspace
@@ -48,9 +49,8 @@ fn bump_cpu_sample_stat(index: usize) {
     }
 }
 
-/// Capture both user and kernel stack ids for the current sample.
 #[inline(always)]
-fn capture_stacks<C: EbpfContext>(ctx: &C) -> (i32, i32, u8) {
+fn capture_stack_ids<C: EbpfContext>(ctx: &C) -> (i32, i32, u8) {
     let user_stack_id = unsafe { STACK_TRACES.get_stackid::<C>(ctx, BPF_F_USER_STACK as u64) }
         .map(|stack_id| stack_id as i32)
         .unwrap_or(-1);
@@ -69,9 +69,26 @@ fn capture_stacks<C: EbpfContext>(ctx: &C) -> (i32, i32, u8) {
     (user_stack_id, kernel_stack_id, stack_kind)
 }
 
-/// Create an event header without stack capture.
+/// Create an event header with stack capture from bpf_get_stackid.
 #[inline(always)]
 fn make_header<C: EbpfContext>(ctx: &C, event_type: EventType) -> EventHeader {
+    let (stack_id, kernel_stack_id, stack_kind) = capture_stack_ids(ctx);
+    EventHeader {
+        timestamp_ns: unsafe { bpf_ktime_get_ns() },
+        pid: ctx.pid(),
+        tgid: ctx.tgid(),
+        stack_id,
+        kernel_stack_id,
+        stack_kind,
+        event_type: event_type as u8,
+        cpu: unsafe { bpf_get_smp_processor_id() } as u8,
+        _padding: [0; 5],
+    }
+}
+
+/// Create an event header without stack capture.
+#[inline(always)]
+fn make_header_without_stack<C: EbpfContext>(ctx: &C, event_type: EventType) -> EventHeader {
     EventHeader {
         timestamp_ns: unsafe { bpf_ktime_get_ns() },
         pid: ctx.pid(),
@@ -85,21 +102,65 @@ fn make_header<C: EbpfContext>(ctx: &C, event_type: EventType) -> EventHeader {
     }
 }
 
-/// Create a cpu sample header with dual-stack capture.
 #[inline(always)]
-fn make_cpu_sample_header(ctx: &PerfEventContext) -> EventHeader {
-    let (stack_id, kernel_stack_id, stack_kind) = capture_stacks(ctx);
-    EventHeader {
-        timestamp_ns: unsafe { bpf_ktime_get_ns() },
-        pid: ctx.pid(),
-        tgid: ctx.tgid(),
-        stack_id,
-        kernel_stack_id,
-        stack_kind,
-        event_type: EventType::CpuSample as u8,
-        cpu: unsafe { bpf_get_smp_processor_id() } as u8,
-        _padding: [0; 5],
+fn is_plausible_user_instruction_ip(ip: u64) -> bool {
+    ip >= 0x1000 && ip < (1u64 << 63) && ip != u64::MAX
+}
+
+#[inline(always)]
+fn is_plausible_user_stack_ptr(ptr: u64) -> bool {
+    ptr >= 0x1000 && ptr < (1u64 << 63) && (ptr & 0x7) == 0
+}
+
+#[inline(always)]
+fn capture_user_frames_fp(ctx: &PerfEventContext, frames: &mut [u64; MAX_CPU_SAMPLE_FRAMES]) -> u16 {
+    let regs = unsafe { &(*ctx.ctx).regs };
+
+    let mut depth = 0usize;
+    let first_ip = regs.rip as u64;
+    if is_plausible_user_instruction_ip(first_ip) {
+        frames[depth] = first_ip;
+        depth += 1;
     }
+
+    let mut frame_ptr = regs.rbp as u64;
+    let mut prev_frame_ptr = 0u64;
+
+    for _ in 1..MAX_CPU_SAMPLE_FRAMES {
+        if depth >= MAX_CPU_SAMPLE_FRAMES
+            || !is_plausible_user_stack_ptr(frame_ptr)
+            || frame_ptr <= prev_frame_ptr
+        {
+            break;
+        }
+
+        let frame_ptr_addr = frame_ptr as *const u64;
+        let next_frame_ptr = match unsafe { bpf_probe_read_user(frame_ptr_addr) } {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let return_ip = match unsafe { bpf_probe_read_user(frame_ptr_addr.wrapping_add(1)) } {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        if !is_plausible_user_instruction_ip(return_ip) {
+            break;
+        }
+
+        frames[depth] = return_ip;
+        depth += 1;
+
+        if !is_plausible_user_stack_ptr(next_frame_ptr)
+            || next_frame_ptr <= frame_ptr
+            || next_frame_ptr.saturating_sub(frame_ptr) > (1 << 20)
+        {
+            break;
+        }
+        prev_frame_ptr = frame_ptr;
+        frame_ptr = next_frame_ptr;
+    }
+
+    depth as u16
 }
 
 #[perf_event]
@@ -118,20 +179,29 @@ fn try_cpu_sample(ctx: &PerfEventContext) -> Result<u32, i64> {
         return Ok(0);
     }
 
-    if let Some(mut buf) = EVENTS.reserve::<EventHeader>(0) {
-        let event = make_cpu_sample_header(ctx);
-        bump_cpu_sample_stat(CPU_SAMPLE_STAT_EMITTED);
-        if (event.stack_kind & STACK_KIND_USER) != 0 {
-            bump_cpu_sample_stat(CPU_SAMPLE_STAT_USER_STACK);
-        }
-        if (event.stack_kind & STACK_KIND_KERNEL) != 0 {
-            bump_cpu_sample_stat(CPU_SAMPLE_STAT_KERNEL_STACK);
-        }
-        if event.stack_kind == STACK_KIND_NONE {
-            bump_cpu_sample_stat(CPU_SAMPLE_STAT_NO_STACK);
-        }
+    if let Some(mut buf) = EVENTS.reserve::<CpuSampleEvent>(0) {
+        let event_ptr = buf.as_mut_ptr();
         unsafe {
-            (*buf.as_mut_ptr()) = event;
+            *event_ptr = CpuSampleEvent {
+                header: make_header_without_stack(ctx, EventType::CpuSample),
+                frame_count: 0,
+                _padding: [0; 6],
+                frames: [0; MAX_CPU_SAMPLE_FRAMES],
+            };
+        }
+        let frame_count = unsafe { capture_user_frames_fp(ctx, &mut (*event_ptr).frames) };
+        unsafe {
+            (*event_ptr).frame_count = frame_count;
+            if frame_count > 0 {
+                (*event_ptr).header.stack_kind = STACK_KIND_USER;
+            }
+        }
+
+        bump_cpu_sample_stat(CPU_SAMPLE_STAT_EMITTED);
+        if frame_count > 0 {
+            bump_cpu_sample_stat(CPU_SAMPLE_STAT_USER_STACK);
+        } else {
+            bump_cpu_sample_stat(CPU_SAMPLE_STAT_NO_STACK);
         }
         buf.submit(BPF_RB_FORCE_WAKEUP as u64);
     } else {

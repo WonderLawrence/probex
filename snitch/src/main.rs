@@ -140,9 +140,9 @@ use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterPr
 use snitch_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
-    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, EventHeader, EventType, PageFaultEvent,
-    ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER,
-    SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
+    MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH,
+    STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 
@@ -644,7 +644,26 @@ fn parse_event(data: &[u8]) -> Option<Event> {
                 ..event_base("syscall_io_uring_register_exit", &event.header)
             })
         }
-        EventType::CpuSample => Some(event_base("cpu_sample", header)),
+        EventType::CpuSample => {
+            if data.len() < std::mem::size_of::<CpuSampleEvent>() {
+                return None;
+            }
+            let event: &CpuSampleEvent = unsafe { &*(data.as_ptr() as *const CpuSampleEvent) };
+            let frame_count = usize::from(event.frame_count).min(MAX_CPU_SAMPLE_FRAMES);
+            // Frame-pointer walk captures frames from leaf to root.
+            // Flamegraph folding expects root to leaf.
+            let mut frames: Vec<u64> = event.frames[..frame_count].to_vec();
+            frames.reverse();
+
+            let mut out = event_base("cpu_sample", &event.header);
+            if let Some(stack_frames) = format_stack_frames_hex(&frames) {
+                out.stack_frames = Some(stack_frames.clone());
+                out.stack_trace = Some(format!("[user];{stack_frames}"));
+            } else {
+                out.stack_kind = None;
+            }
+            Some(out)
+        }
     }
 }
 
@@ -667,7 +686,7 @@ fn enrich_process_name(
     event.process_name = maybe_name;
 }
 
-const STACK_FRAME_LIMIT: usize = 127;
+const STACK_FRAME_LIMIT: usize = 256;
 
 fn format_kernel_ip(ip: u64, symbols: Option<&BTreeMap<u64, String>>) -> String {
     if let Some(symbols) = symbols
@@ -937,7 +956,10 @@ fn read_stack_frames(
     frames
 }
 
-fn format_kernel_stack_trace(frames: &[u64], symbols: Option<&BTreeMap<u64, String>>) -> Option<String> {
+fn format_kernel_stack_trace(
+    frames: &[u64],
+    symbols: Option<&BTreeMap<u64, String>>,
+) -> Option<String> {
     if frames.is_empty() {
         return None;
     }
@@ -1072,8 +1094,7 @@ fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u64) 
 
     info!(
         "Attached CPU sampler at {} Hz for pid {} (inherit=true)",
-        frequency_hz,
-        target_pid
+        frequency_hz, target_pid
     );
     Ok(())
 }
