@@ -16,6 +16,8 @@ It runs a command, traces kernel events for that command (and forked children), 
 7. `syscalls:sys_enter_write`
 8. `syscalls:sys_exit_write`
 
+9. `perf_event` CPU clock sampler (perf-style frequency sampling, default `999` Hz)
+
 Events are filtered by a kernel-side PID map (`TRACED_PIDS`):
 
 1. The target child PID is inserted before the command starts executing.
@@ -74,6 +76,16 @@ Do not auto-launch viewer:
 ```shell
 sudo -E cargo run --release -p snitch -- --no-viewer -- sleep 2
 ```
+
+Enable perf-style CPU sampling at 99 Hz:
+
+```shell
+sudo -E cargo run --release -p snitch -- --sample-freq 99 -- sleep 5
+```
+
+For deep user-space call stacks, build traced binaries with frame pointers
+enabled (for Rust: `RUSTFLAGS="-C force-frame-pointers=yes"`), otherwise
+sampling stacks can look shallow or noisy.
 
 Change viewer port used by auto-launch:
 

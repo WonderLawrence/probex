@@ -5,14 +5,16 @@ use aya_ebpf::{
     EbpfContext,
     bindings::{BPF_F_USER_STACK, BPF_RB_FORCE_WAKEUP},
     helpers::{bpf_get_smp_processor_id, bpf_ktime_get_ns},
-    macros::{map, tracepoint},
-    maps::{HashMap, RingBuf, StackTrace},
-    programs::TracePointContext,
+    macros::{map, perf_event, tracepoint},
+    maps::{HashMap, PerCpuArray, RingBuf, StackTrace},
+    programs::{PerfEventContext, TracePointContext},
 };
 use snitch_common::{
-    EventHeader, EventType, MAX_TRACKED_PIDS, PageFaultEvent, ProcessExitEvent, ProcessForkEvent,
-    RING_BUF_SIZE, STACK_KIND_KERNEL, STACK_KIND_NONE, STACK_KIND_USER, SchedSwitchEvent,
-    SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
+    CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
+    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, EventHeader, EventType, MAX_TRACKED_PIDS,
+    PageFaultEvent, ProcessExitEvent, ProcessForkEvent, RING_BUF_SIZE, STACK_KIND_KERNEL,
+    STACK_KIND_NONE, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
 };
 
 /// Ring buffer for sending events to userspace
@@ -27,10 +29,23 @@ static STACK_TRACES: StackTrace = StackTrace::with_max_entries(16384, 0);
 #[map]
 static TRACED_PIDS: HashMap<u32, u8> = HashMap::with_max_entries(MAX_TRACKED_PIDS, 0);
 
+/// Per-CPU counters for cpu sampling diagnostics.
+#[map]
+static CPU_SAMPLE_STATS: PerCpuArray<[u64; CPU_SAMPLE_STATS_LEN]> = PerCpuArray::with_max_entries(1, 0);
+
 /// Check if a PID is being traced
 #[inline(always)]
 fn is_traced(pid: u32) -> bool {
     unsafe { TRACED_PIDS.get(&pid).is_some() }
+}
+
+#[inline(always)]
+fn bump_cpu_sample_stat(index: usize) {
+    if let Some(ptr) = CPU_SAMPLE_STATS.get_ptr_mut(0) {
+        unsafe {
+            (*ptr)[index] = (*ptr)[index].wrapping_add(1);
+        }
+    }
 }
 
 /// Capture stack id for the current event.
@@ -38,13 +53,11 @@ fn is_traced(pid: u32) -> bool {
 /// We try user stack first (for "who in user code triggered this"), then
 /// fallback to kernel stack if user stack capture fails.
 #[inline(always)]
-fn capture_stack(ctx: &TracePointContext) -> (i32, u8) {
-    if let Ok(stack_id) =
-        unsafe { STACK_TRACES.get_stackid::<TracePointContext>(ctx, BPF_F_USER_STACK as u64) }
-    {
+fn capture_stack<C: EbpfContext>(ctx: &C) -> (i32, u8) {
+    if let Ok(stack_id) = unsafe { STACK_TRACES.get_stackid::<C>(ctx, BPF_F_USER_STACK as u64) } {
         return (stack_id as i32, STACK_KIND_USER);
     }
-    if let Ok(stack_id) = unsafe { STACK_TRACES.get_stackid::<TracePointContext>(ctx, 0) } {
+    if let Ok(stack_id) = unsafe { STACK_TRACES.get_stackid::<C>(ctx, 0) } {
         return (stack_id as i32, STACK_KIND_KERNEL);
     }
     (-1, STACK_KIND_NONE)
@@ -52,7 +65,7 @@ fn capture_stack(ctx: &TracePointContext) -> (i32, u8) {
 
 /// Create an event header
 #[inline(always)]
-fn make_header(ctx: &TracePointContext, event_type: EventType) -> EventHeader {
+fn make_header<C: EbpfContext>(ctx: &C, event_type: EventType) -> EventHeader {
     let (stack_id, stack_kind) = capture_stack(ctx);
     EventHeader {
         timestamp_ns: unsafe { bpf_ktime_get_ns() },
@@ -64,6 +77,41 @@ fn make_header(ctx: &TracePointContext, event_type: EventType) -> EventHeader {
         cpu: unsafe { bpf_get_smp_processor_id() } as u8,
         _padding: [0; 1],
     }
+}
+
+#[perf_event]
+pub fn cpu_sample(ctx: PerfEventContext) -> u32 {
+    match try_cpu_sample(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => 1,
+    }
+}
+
+fn try_cpu_sample(ctx: &PerfEventContext) -> Result<u32, i64> {
+    bump_cpu_sample_stat(CPU_SAMPLE_STAT_CALLBACK_TOTAL);
+
+    if !is_traced(ctx.tgid()) {
+        bump_cpu_sample_stat(CPU_SAMPLE_STAT_FILTERED_NOT_TRACED);
+        return Ok(0);
+    }
+
+    if let Some(mut buf) = EVENTS.reserve::<EventHeader>(0) {
+        let event = make_header(ctx, EventType::CpuSample);
+        bump_cpu_sample_stat(CPU_SAMPLE_STAT_EMITTED);
+        match event.stack_kind {
+            STACK_KIND_USER => bump_cpu_sample_stat(CPU_SAMPLE_STAT_USER_STACK),
+            STACK_KIND_KERNEL => bump_cpu_sample_stat(CPU_SAMPLE_STAT_KERNEL_STACK),
+            _ => bump_cpu_sample_stat(CPU_SAMPLE_STAT_NO_STACK),
+        }
+        unsafe {
+            (*buf.as_mut_ptr()) = event;
+        }
+        buf.submit(BPF_RB_FORCE_WAKEUP as u64);
+    } else {
+        bump_cpu_sample_stat(CPU_SAMPLE_STAT_RINGBUF_DROPPED);
+    }
+
+    Ok(0)
 }
 
 /// sched_switch tracepoint handler

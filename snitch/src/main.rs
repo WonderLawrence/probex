@@ -100,6 +100,7 @@
 //! | syscall_io_uring_enter_exit | syscalls:sys_exit_io_uring_enter | ret |
 //! | syscall_io_uring_register_enter | syscalls:sys_enter_io_uring_register | fd, opcode |
 //! | syscall_io_uring_register_exit | syscalls:sys_exit_io_uring_register | ret |
+//! | cpu_sample | perf_event (cpu clock) | stack sample |
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -119,8 +120,11 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use aya::{
-    maps::{HashMap, MapData, RingBuf, StackTraceMap},
-    programs::TracePoint,
+    maps::{HashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
+    programs::{
+        TracePoint,
+        perf_event::{PerfEvent, PerfEventConfig, PerfEventScope, SamplePolicy, SoftwareEvent},
+    },
     util::kernel_symbols,
 };
 use clap::Parser;
@@ -134,8 +138,11 @@ use nix::{
 };
 use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
 use snitch_common::{
-    EventHeader, EventType, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_KERNEL,
-    STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
+    CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
+    CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, EventHeader, EventType, PageFaultEvent,
+    ProcessExitEvent, ProcessForkEvent, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 
@@ -159,6 +166,10 @@ struct Args {
     /// Don't launch the viewer after tracing
     #[arg(long)]
     no_viewer: bool,
+
+    /// Perf-style CPU clock sampling frequency (Hz)
+    #[arg(long, value_name = "HZ", default_value_t = 999)]
+    sample_freq: u64,
 
     /// Command to run
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -624,6 +635,7 @@ fn parse_event(data: &[u8]) -> Option<Event> {
                 ..event_base("syscall_io_uring_register_exit", &event.header)
             })
         }
+        EventType::CpuSample => Some(event_base("cpu_sample", header)),
     }
 }
 
@@ -882,6 +894,12 @@ fn format_stack_frames_hex(frames: &[u64]) -> Option<String> {
     )
 }
 
+fn is_plausible_user_instruction_ip(ip: u64) -> bool {
+    // User-space instruction pointers should never be tiny sentinel values
+    // and should stay in the user half of virtual address space.
+    ip >= 0x1000 && ip < (1u64 << 63) && ip != u64::MAX
+}
+
 fn materialize_stack(
     stack_id: i32,
     stack_kind: Option<&'static str>,
@@ -901,6 +919,12 @@ fn materialize_stack(
         .take(STACK_FRAME_LIMIT)
         .map(|frame| frame.ip)
         .collect();
+    if stack_kind == Some("user") {
+        // Aya exposes raw frames as produced by bpf_get_stackid(). Filtering out
+        // impossible user IPs here avoids polluting flamegraph roots with junk
+        // values when user-space unwinding is partial.
+        frames.retain(|ip| is_plausible_user_instruction_ip(*ip));
+    }
     if frames.is_empty() {
         return MaterializedStack::default();
     }
@@ -972,6 +996,50 @@ fn attach_tracepoint(
         .with_context(|| format!("failed to attach {}:{}", category, name))?;
     info!("Attached tracepoint {}:{}", category, name);
     Ok(())
+}
+
+fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u64) -> Result<()> {
+    if frequency_hz == 0 {
+        return Err(anyhow!("--sample-freq must be greater than 0"));
+    }
+
+    let program: &mut PerfEvent = ebpf
+        .program_mut("cpu_sample")
+        .ok_or_else(|| anyhow!("program cpu_sample not found"))?
+        .try_into()?;
+    program.load()?;
+
+    program.attach(
+        PerfEventConfig::Software(SoftwareEvent::CpuClock),
+        PerfEventScope::OneProcess {
+            pid: target_pid,
+            cpu: None,
+        },
+        SamplePolicy::Frequency(frequency_hz),
+        true,
+    )?;
+
+    info!(
+        "Attached CPU sampler at {} Hz for pid {} (inherit=true)",
+        frequency_hz,
+        target_pid
+    );
+    Ok(())
+}
+
+fn read_cpu_sample_stats(
+    stats_map: &PerCpuArray<MapData, [u64; CPU_SAMPLE_STATS_LEN]>,
+) -> Result<[u64; CPU_SAMPLE_STATS_LEN]> {
+    let per_cpu = stats_map
+        .get(&0, 0)
+        .context("failed to read CPU_SAMPLE_STATS[0]")?;
+    let mut totals = [0u64; CPU_SAMPLE_STATS_LEN];
+    for cpu_stats in per_cpu.iter() {
+        for (idx, value) in cpu_stats.iter().enumerate() {
+            totals[idx] = totals[idx].saturating_add(*value);
+        }
+    }
+    Ok(totals)
 }
 
 fn spawn_child(program: &str, args: &[String]) -> Result<Pid> {
@@ -1149,6 +1217,9 @@ async fn main() -> Result<()> {
         "syscalls",
         "sys_exit_io_uring_register",
     )?;
+    let target_pid = u32::try_from(child_pid.as_raw())
+        .context("child pid is negative and cannot be used for perf scope")?;
+    attach_cpu_sampler(&mut ebpf, target_pid, args.sample_freq)?;
 
     // Resume child process
     kill(child_pid, Signal::SIGCONT)
@@ -1166,6 +1237,10 @@ async fn main() -> Result<()> {
     let stack_traces: StackTraceMap<_> = StackTraceMap::try_from(
         ebpf.take_map("STACK_TRACES")
             .ok_or_else(|| anyhow!("map STACK_TRACES not found"))?,
+    )?;
+    let cpu_sample_stats: PerCpuArray<_, [u64; CPU_SAMPLE_STATS_LEN]> = PerCpuArray::try_from(
+        ebpf.take_map("CPU_SAMPLE_STATS")
+            .ok_or_else(|| anyhow!("map CPU_SAMPLE_STATS not found"))?,
     )?;
     let kernel_syms = kernel_symbols().ok();
     if kernel_syms.is_none() {
@@ -1202,13 +1277,15 @@ async fn main() -> Result<()> {
         if event.tgid > 0 {
             let is_first_seen = seen_tgids.insert(event.tgid);
             let should_refresh = is_first_seen || should_refresh_maps_for_event(event.event_type);
-            maybe_capture_proc_maps_snapshot(
-                event.tgid,
-                event.ts_ns,
-                should_refresh,
-                &mut proc_map_snapshot_cache,
-                &mut maps_writer,
-            )?;
+            if should_refresh {
+                maybe_capture_proc_maps_snapshot(
+                    event.tgid,
+                    event.ts_ns,
+                    should_refresh,
+                    &mut proc_map_snapshot_cache,
+                    &mut maps_writer,
+                )?;
+            }
         }
 
         if event.event_type == "process_fork"
@@ -1278,6 +1355,40 @@ async fn main() -> Result<()> {
 
     if !child_wait_done {
         let _ = child_wait.await;
+    }
+
+    match read_cpu_sample_stats(&cpu_sample_stats) {
+        Ok(stats) => {
+            let callback_total = stats[CPU_SAMPLE_STAT_CALLBACK_TOTAL];
+            let filtered = stats[CPU_SAMPLE_STAT_FILTERED_NOT_TRACED];
+            let emitted = stats[CPU_SAMPLE_STAT_EMITTED];
+            let dropped = stats[CPU_SAMPLE_STAT_RINGBUF_DROPPED];
+            let accepted = callback_total.saturating_sub(filtered);
+            let drop_pct = if accepted == 0 {
+                0.0
+            } else {
+                (dropped as f64) * 100.0 / (accepted as f64)
+            };
+            info!(
+                "CPU sampler stats: callbacks={}, filtered_not_traced={}, accepted={}, emitted={}, dropped_ringbuf={} ({:.2}%), user_stack={}, kernel_stack={}, no_stack={}",
+                callback_total,
+                filtered,
+                accepted,
+                emitted,
+                dropped,
+                drop_pct,
+                stats[CPU_SAMPLE_STAT_USER_STACK],
+                stats[CPU_SAMPLE_STAT_KERNEL_STACK],
+                stats[CPU_SAMPLE_STAT_NO_STACK],
+            );
+            if dropped > 0 {
+                warn!(
+                    "Detected {} cpu_sample drops due to ringbuf reservation failure (traced samples only)",
+                    dropped
+                );
+            }
+        }
+        Err(error) => warn!("Failed to read CPU sampler stats: {error}"),
     }
 
     // Finish writing and close the Parquet file

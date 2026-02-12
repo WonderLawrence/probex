@@ -24,7 +24,7 @@ pub fn EventFlamegraphCard(
         format!(
             "<!doctype html><html><head><meta charset=\"utf-8\"/><style>\
              html,body{{margin:0;padding:0;width:100%;height:100%;overflow:auto;background:#fff;}}\
-             svg{{display:block;max-width:100%;height:auto;}}\
+             svg{{display:block;width:100% !important;min-width:100%;height:auto !important;}}\
              </style></head><body>{svg}</body></html>",
             svg = svg_doc
         )

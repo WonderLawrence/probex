@@ -66,7 +66,12 @@ fn TraceViewer() -> Element {
             Ok(s) => {
                 view_start_ns.set(s.min_ts_ns);
                 view_end_ns.set(s.max_ts_ns);
-                enabled_event_types.set(s.event_types.iter().cloned().collect());
+                let mut default_event_types: HashSet<String> =
+                    s.event_types.iter().cloned().collect();
+                if default_event_types.len() > 1 {
+                    default_event_types.remove("cpu_sample");
+                }
+                enabled_event_types.set(default_event_types);
                 summary.set(Some(s));
             }
             Err(e) => error_msg.set(Some(format!("Failed to load summary: {}", e))),

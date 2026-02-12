@@ -24,6 +24,7 @@ pub enum EventType {
     SyscallIoUringEnterExit = 17,
     SyscallIoUringRegisterEnter = 18,
     SyscallIoUringRegisterExit = 19,
+    CpuSample = 20,
 }
 
 impl TryFrom<u8> for EventType {
@@ -51,6 +52,7 @@ impl TryFrom<u8> for EventType {
             17 => Ok(EventType::SyscallIoUringEnterExit),
             18 => Ok(EventType::SyscallIoUringRegisterEnter),
             19 => Ok(EventType::SyscallIoUringRegisterExit),
+            20 => Ok(EventType::CpuSample),
             v => Err(v),
         }
     }
@@ -73,6 +75,16 @@ pub struct EventHeader {
 pub const STACK_KIND_NONE: u8 = 0;
 pub const STACK_KIND_USER: u8 = 1;
 pub const STACK_KIND_KERNEL: u8 = 2;
+
+// CPU sampler stats indices (per-CPU array slot 0).
+pub const CPU_SAMPLE_STATS_LEN: usize = 7;
+pub const CPU_SAMPLE_STAT_CALLBACK_TOTAL: usize = 0;
+pub const CPU_SAMPLE_STAT_FILTERED_NOT_TRACED: usize = 1;
+pub const CPU_SAMPLE_STAT_EMITTED: usize = 2;
+pub const CPU_SAMPLE_STAT_RINGBUF_DROPPED: usize = 3;
+pub const CPU_SAMPLE_STAT_USER_STACK: usize = 4;
+pub const CPU_SAMPLE_STAT_KERNEL_STACK: usize = 5;
+pub const CPU_SAMPLE_STAT_NO_STACK: usize = 6;
 
 /// Context switch event
 #[repr(C)]
@@ -138,8 +150,8 @@ pub const PAGE_FAULT_EVENT_SIZE: usize = core::mem::size_of::<PageFaultEvent>();
 pub const SYSCALL_ENTER_EVENT_SIZE: usize = core::mem::size_of::<SyscallEnterEvent>();
 pub const SYSCALL_EXIT_EVENT_SIZE: usize = core::mem::size_of::<SyscallExitEvent>();
 
-// Ring buffer size (2MB)
-pub const RING_BUF_SIZE: u32 = 2 * 1024 * 1024;
+// Ring buffer size (8MB)
+pub const RING_BUF_SIZE: u32 = 8 * 1024 * 1024;
 
 // Maximum number of tracked PIDs
 pub const MAX_TRACKED_PIDS: u32 = 8192;

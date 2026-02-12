@@ -157,7 +157,8 @@ mod backend {
     use datafusion::prelude::*;
     use inferno::flamegraph;
     use std::collections::{BTreeMap, HashSet};
-    use std::io::{Error as IoError, ErrorKind};
+    use std::fs::File;
+    use std::io::{Error as IoError, ErrorKind, Read, Seek, SeekFrom};
     use std::path::PathBuf;
     use std::process::Command;
     use std::sync::{Arc, OnceLock};
@@ -970,6 +971,12 @@ mod backend {
         end_ns: u64,
         max_events_per_pid: usize,
     ) -> Result<ProcessEventsResponse, Box<dyn std::error::Error + Send + Sync>> {
+        if max_events_per_pid == 0 {
+            return Ok(ProcessEventsResponse {
+                events_by_pid: std::collections::HashMap::new(),
+            });
+        }
+
         let ctx = get_ctx()?;
 
         // Query events in the time range, grouped by PID
@@ -984,6 +991,8 @@ mod backend {
 
         let mut events_by_pid: std::collections::HashMap<u32, Vec<EventMarker>> =
             std::collections::HashMap::new();
+        let mut events_seen_by_pid: std::collections::HashMap<u32, usize> =
+            std::collections::HashMap::new();
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
@@ -992,13 +1001,15 @@ mod backend {
                 let event_type = extract_string(batch, "event_type", row);
 
                 let events = events_by_pid.entry(pid).or_default();
+                let seen = events_seen_by_pid.entry(pid).or_default();
+                *seen += 1;
 
                 // Sample events if we have too many for this PID
                 if events.len() < max_events_per_pid {
                     events.push(EventMarker { ts_ns, event_type });
                 } else {
                     // Reservoir sampling: replace with decreasing probability
-                    let idx = rand_index(events.len() + 1);
+                    let idx = rand_index(*seen);
                     if idx < max_events_per_pid {
                         events[idx] = EventMarker { ts_ns, event_type };
                     }
@@ -1037,10 +1048,24 @@ mod backend {
         stack_trace: Option<String>,
     }
 
+    #[derive(Clone, Debug)]
+    struct ElfLoadSegment {
+        file_offset: u64,
+        file_size: u64,
+        vaddr: u64,
+    }
+
+    #[derive(Clone, Copy)]
+    enum ElfEndian {
+        Little,
+        Big,
+    }
+
     #[derive(Default)]
     struct OfflineUserSymbolizer {
         tool: Option<String>,
         symbol_cache: std::collections::HashMap<(String, u64), Option<String>>,
+        elf_segments_cache: std::collections::HashMap<String, Option<Vec<ElfLoadSegment>>>,
     }
 
     impl OfflineUserSymbolizer {
@@ -1058,7 +1083,24 @@ mod backend {
             Self {
                 tool,
                 symbol_cache: std::collections::HashMap::new(),
+                elf_segments_cache: std::collections::HashMap::new(),
             }
+        }
+
+        fn symbolize_runtime_addr(
+            &mut self,
+            path: &str,
+            runtime_ip: u64,
+            map_start: u64,
+            map_file_offset: u64,
+        ) -> Option<String> {
+            let file_offset = runtime_ip
+                .saturating_sub(map_start)
+                .saturating_add(map_file_offset);
+            let normalized_addr = self
+                .file_offset_to_elf_vaddr(path, file_offset)
+                .unwrap_or(file_offset);
+            self.symbolize_addr(path, normalized_addr)
         }
 
         fn symbolize_addr(&mut self, path: &str, addr: u64) -> Option<String> {
@@ -1089,6 +1131,175 @@ mod backend {
             self.symbol_cache.insert(cache_key, symbol.clone());
             symbol
         }
+
+        fn file_offset_to_elf_vaddr(&mut self, path: &str, file_offset: u64) -> Option<u64> {
+            let segments = self
+                .elf_segments_cache
+                .entry(path.to_string())
+                .or_insert_with(|| parse_elf_load_segments(path))
+                .as_ref()?;
+            file_offset_to_vaddr(segments, file_offset)
+        }
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize, endian: ElfEndian) -> Option<u16> {
+        let slice = bytes.get(offset..offset + 2)?;
+        let value = [slice[0], slice[1]];
+        Some(match endian {
+            ElfEndian::Little => u16::from_le_bytes(value),
+            ElfEndian::Big => u16::from_be_bytes(value),
+        })
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize, endian: ElfEndian) -> Option<u32> {
+        let slice = bytes.get(offset..offset + 4)?;
+        let value = [slice[0], slice[1], slice[2], slice[3]];
+        Some(match endian {
+            ElfEndian::Little => u32::from_le_bytes(value),
+            ElfEndian::Big => u32::from_be_bytes(value),
+        })
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize, endian: ElfEndian) -> Option<u64> {
+        let slice = bytes.get(offset..offset + 8)?;
+        let value = [
+            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
+        ];
+        Some(match endian {
+            ElfEndian::Little => u64::from_le_bytes(value),
+            ElfEndian::Big => u64::from_be_bytes(value),
+        })
+    }
+
+    fn parse_elf_load_segments(path: &str) -> Option<Vec<ElfLoadSegment>> {
+        const PT_LOAD: u32 = 1;
+
+        let mut file = File::open(path).ok()?;
+        let mut ident = [0u8; 16];
+        file.read_exact(&mut ident).ok()?;
+
+        if ident[0] != 0x7f || ident[1] != b'E' || ident[2] != b'L' || ident[3] != b'F' {
+            return None;
+        }
+
+        let class = ident[4];
+        let endian = match ident[5] {
+            1 => ElfEndian::Little,
+            2 => ElfEndian::Big,
+            _ => return None,
+        };
+
+        let header_len = match class {
+            1 => 52usize,
+            2 => 64usize,
+            _ => return None,
+        };
+        let mut header = vec![0u8; header_len];
+        header[..16].copy_from_slice(&ident);
+        file.read_exact(&mut header[16..]).ok()?;
+
+        let (phoff, phentsize, phnum) = match class {
+            1 => (
+                read_u32(&header, 28, endian)? as u64,
+                read_u16(&header, 42, endian)? as usize,
+                read_u16(&header, 44, endian)? as usize,
+            ),
+            2 => (
+                read_u64(&header, 32, endian)?,
+                read_u16(&header, 54, endian)? as usize,
+                read_u16(&header, 56, endian)? as usize,
+            ),
+            _ => return None,
+        };
+
+        if phentsize == 0 || phnum == 0 {
+            return Some(Vec::new());
+        }
+
+        let table_len = phentsize.checked_mul(phnum)?;
+        if table_len == 0 {
+            return Some(Vec::new());
+        }
+
+        let mut phdr_table = vec![0u8; table_len];
+        file.seek(SeekFrom::Start(phoff)).ok()?;
+        file.read_exact(&mut phdr_table).ok()?;
+
+        let mut segments: Vec<ElfLoadSegment> = Vec::new();
+        for idx in 0..phnum {
+            let start = idx.saturating_mul(phentsize);
+            let end = start.saturating_add(phentsize);
+            let Some(ph) = phdr_table.get(start..end) else {
+                continue;
+            };
+
+            match class {
+                1 => {
+                    if ph.len() < 32 {
+                        continue;
+                    }
+                    let Some(p_type) = read_u32(ph, 0, endian) else {
+                        continue;
+                    };
+                    if p_type != PT_LOAD {
+                        continue;
+                    }
+                    let (Some(p_offset), Some(p_vaddr), Some(p_filesz)) = (
+                        read_u32(ph, 4, endian),
+                        read_u32(ph, 8, endian),
+                        read_u32(ph, 16, endian),
+                    ) else {
+                        continue;
+                    };
+                    segments.push(ElfLoadSegment {
+                        file_offset: p_offset as u64,
+                        file_size: p_filesz as u64,
+                        vaddr: p_vaddr as u64,
+                    });
+                }
+                2 => {
+                    if ph.len() < 56 {
+                        continue;
+                    }
+                    let Some(p_type) = read_u32(ph, 0, endian) else {
+                        continue;
+                    };
+                    if p_type != PT_LOAD {
+                        continue;
+                    }
+                    let (Some(p_offset), Some(p_vaddr), Some(p_filesz)) = (
+                        read_u64(ph, 8, endian),
+                        read_u64(ph, 16, endian),
+                        read_u64(ph, 32, endian),
+                    ) else {
+                        continue;
+                    };
+                    segments.push(ElfLoadSegment {
+                        file_offset: p_offset,
+                        file_size: p_filesz,
+                        vaddr: p_vaddr,
+                    });
+                }
+                _ => return None,
+            }
+        }
+
+        Some(segments)
+    }
+
+    fn file_offset_to_vaddr(segments: &[ElfLoadSegment], file_offset: u64) -> Option<u64> {
+        segments.iter().find_map(|segment| {
+            let end = segment.file_offset.checked_add(segment.file_size)?;
+            if file_offset >= segment.file_offset && file_offset < end {
+                Some(
+                    segment
+                        .vaddr
+                        .saturating_add(file_offset.saturating_sub(segment.file_offset)),
+                )
+            } else {
+                None
+            }
+        })
     }
 
     fn parse_stack_frames(stack_frames: &str) -> Vec<u64> {
@@ -1117,6 +1328,13 @@ mod backend {
         }
     }
 
+    fn find_segment_for_ip(snapshot: &ProcMapSnapshot, ip: u64) -> Option<&ProcMapSegment> {
+        snapshot
+            .segments
+            .iter()
+            .find(|segment| ip >= segment.start_addr && ip < segment.end_addr)
+    }
+
     fn symbolize_user_frames(
         tgid: u32,
         ts_ns: u64,
@@ -1136,17 +1354,26 @@ mod backend {
             return labels;
         };
 
-        for ip in frames {
-            let maybe_symbol = snapshot
-                .segments
-                .iter()
-                .find(|segment| *ip >= segment.start_addr && *ip < segment.end_addr)
-                .and_then(|segment| {
-                    let relative_addr = ip
-                        .saturating_sub(segment.start_addr)
-                        .saturating_add(segment.file_offset);
-                    symbolizer.symbolize_addr(&segment.path, relative_addr)
-                });
+        let mapped_segments: Vec<Option<&ProcMapSegment>> = frames
+            .iter()
+            .map(|ip| find_segment_for_ip(snapshot, *ip))
+            .collect();
+        // When we do have a snapshot, leading unmapped entries are usually unwind
+        // noise; trimming them keeps folded stacks stable.
+        let start_idx = mapped_segments
+            .iter()
+            .position(|segment| segment.is_some())
+            .unwrap_or(0);
+
+        for (ip, maybe_segment) in frames.iter().zip(mapped_segments).skip(start_idx) {
+            let maybe_symbol = maybe_segment.and_then(|segment| {
+                symbolizer.symbolize_runtime_addr(
+                    &segment.path,
+                    *ip,
+                    segment.start_addr,
+                    segment.file_offset,
+                )
+            });
             labels.push(maybe_symbol.unwrap_or_else(|| format!("0x{ip:x}")));
         }
         labels
@@ -1267,7 +1494,7 @@ mod backend {
         max_stacks: usize,
     ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
         let ctx = get_ctx()?;
-        if event_type.is_empty() {
+        if event_type.is_empty() || max_stacks == 0 {
             return Ok(EventFlamegraphResponse::default());
         }
 
@@ -1289,11 +1516,8 @@ mod backend {
         let sql = format!(
             "SELECT tgid, ts_ns, stack_kind, stack_frames, stack_trace
              FROM events
-             WHERE {}
-             ORDER BY ts_ns ASC
-             LIMIT {}",
-            conditions.join(" AND "),
-            max_stacks.max(1)
+             WHERE {}",
+            conditions.join(" AND ")
         );
 
         // Older traces may not contain stack columns.
@@ -1305,11 +1529,8 @@ mod backend {
                      FROM events
                      WHERE {}
                        AND stack_trace IS NOT NULL
-                       AND stack_trace <> ''
-                     ORDER BY ts_ns ASC
-                     LIMIT {}",
-                    conditions.join(" AND "),
-                    max_stacks.max(1)
+                       AND stack_trace <> ''",
+                    conditions.join(" AND ")
                 );
                 match ctx.sql(&legacy_sql).await {
                     Ok(df) => df,
@@ -1326,7 +1547,19 @@ mod backend {
         let batches = df.collect().await?;
 
         let mut sampled_rows: Vec<SampledStackRow> = Vec::new();
-        let mut user_tgids: HashSet<u32> = HashSet::new();
+        let mut rows_seen = 0usize;
+        let mut rng_state = {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+
+            let mut hasher = DefaultHasher::new();
+            start_ns.hash(&mut hasher);
+            end_ns.hash(&mut hasher);
+            pid.hash(&mut hasher);
+            event_type.hash(&mut hasher);
+            hasher.finish() | 1
+        };
+
         for batch in &batches {
             for row in 0..batch.num_rows() {
                 let tgid = extract_u32(batch, "tgid", row);
@@ -1334,18 +1567,33 @@ mod backend {
                 let stack_kind = extract_option_string(batch, "stack_kind", row);
                 let stack_frames = extract_option_string(batch, "stack_frames", row);
                 let stack_trace = extract_option_string(batch, "stack_trace", row);
-                if stack_kind.as_deref() == Some("user") && stack_frames.is_some() {
-                    user_tgids.insert(tgid);
-                }
-                sampled_rows.push(SampledStackRow {
+                let sampled_row = SampledStackRow {
                     tgid,
                     ts_ns,
                     stack_kind,
                     stack_frames,
                     stack_trace,
-                });
+                };
+
+                rows_seen += 1;
+                if sampled_rows.len() < max_stacks {
+                    sampled_rows.push(sampled_row);
+                    continue;
+                }
+
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let idx = (rng_state as usize) % rows_seen;
+                if idx < max_stacks {
+                    sampled_rows[idx] = sampled_row;
+                }
             }
         }
+
+        let user_tgids: HashSet<u32> = sampled_rows
+            .iter()
+            .filter(|row| row.stack_kind.as_deref() == Some("user") && row.stack_frames.is_some())
+            .map(|row| row.tgid)
+            .collect();
 
         let map_snapshots = load_proc_map_snapshots(ctx, &user_tgids).await?;
         let mut user_symbolizer = OfflineUserSymbolizer::new();
