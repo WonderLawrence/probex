@@ -18,6 +18,17 @@ pub fn EventFlamegraphCard(
     let flamegraph_data = flamegraph.unwrap_or_default();
     let total = flamegraph_data.total_samples;
     let svg_doc = flamegraph_data.svg.unwrap_or_default();
+    let framed_svg_doc = if svg_doc.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<!doctype html><html><head><meta charset=\"utf-8\"/><style>\
+             html,body{{margin:0;padding:0;width:100%;height:100%;overflow:auto;background:#fff;}}\
+             svg{{display:block;max-width:100%;height:auto;}}\
+             </style></head><body>{svg}</body></html>",
+            svg = svg_doc
+        )
+    };
     let range_width = view_end_ns.saturating_sub(view_start_ns);
     let start_offset = view_start_ns.saturating_sub(full_start_ns);
     let end_offset = view_end_ns.saturating_sub(full_start_ns);
@@ -72,8 +83,8 @@ pub fn EventFlamegraphCard(
                     div { class: "text-xs text-gray-400", "Flamegraph rendering returned empty SVG" }
                 } else {
                     iframe {
-                        class: "w-full h-[420px] border border-gray-100 rounded bg-white",
-                        srcdoc: "{svg_doc}",
+                        class: "w-full h-[360px] border border-gray-100 rounded bg-white",
+                        srcdoc: "{framed_svg_doc}",
                     }
                 }
             }

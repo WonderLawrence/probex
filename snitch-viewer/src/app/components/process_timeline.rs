@@ -104,8 +104,8 @@ pub fn ProcessTimeline(
         .unwrap_or_default();
 
     rsx! {
-        div { class: "bg-white border border-gray-200 rounded-lg p-3",
-            div { class: "flex items-center justify-between mb-2",
+        div { class: "bg-white border border-gray-200 rounded-lg p-2.5",
+            div { class: "flex items-center justify-between mb-1.5",
                 span { class: "text-sm font-medium text-gray-700", "Process Lifetimes" }
                 div { class: "flex items-center gap-3",
                     span { class: "text-xs text-gray-400", "{visible_in_range_count} active in view · {sorted_processes.len()} total" }
@@ -135,7 +135,7 @@ pub fn ProcessTimeline(
                 }
             }
 
-            div { class: "space-y-1 mb-2",
+            div { class: "space-y-1 mb-1.5",
                 div { class: "flex justify-between text-xs text-gray-400",
                     span { "0" }
                     span { "{format_duration(full_duration_ns)}" }
@@ -151,7 +151,7 @@ pub fn ProcessTimeline(
                 }
             }
 
-            div { class: "flex items-center justify-between mb-2",
+            div { class: "flex items-center justify-between mb-1.5",
                 div { class: "text-sm text-gray-700",
                     span { class: "font-mono", "{format_duration(view_start_ns - full_start_ns)}" }
                     span { class: "text-gray-400 mx-2", "→" }
@@ -161,7 +161,7 @@ pub fn ProcessTimeline(
 
                 div { class: "flex items-center gap-1",
                     button {
-                        class: "px-2 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_start_ns <= full_start_ns,
                         onclick: move |_| {
                             let shift = view_duration_ns / 4;
@@ -172,7 +172,7 @@ pub fn ProcessTimeline(
                         "◀"
                     }
                     button {
-                        class: "px-2 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_end_ns >= full_end_ns,
                         onclick: move |_| {
                             let shift = view_duration_ns / 4;
@@ -186,7 +186,7 @@ pub fn ProcessTimeline(
                     div { class: "w-px h-5 bg-gray-200 mx-1" }
 
                     button {
-                        class: "px-2 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_duration_ns < 1000,
                         onclick: move |_| {
                             let center = view_start_ns + view_duration_ns / 2;
@@ -198,7 +198,7 @@ pub fn ProcessTimeline(
                         "+"
                     }
                     button {
-                        class: "px-2 py-1 text-sm bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
+                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_duration_ns >= full_duration_ns,
                         onclick: move |_| {
                             let center = view_start_ns + view_duration_ns / 2;
@@ -214,7 +214,7 @@ pub fn ProcessTimeline(
                     div { class: "w-px h-5 bg-gray-200 mx-1" }
 
                     button {
-                        class: "px-2 py-1 text-xs bg-gray-100 hover:bg-gray-200 rounded",
+                        class: "px-2 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded",
                         onclick: move |_| on_change_range.call((full_start_ns, full_end_ns, true)),
                         "Reset"
                     }
@@ -222,15 +222,15 @@ pub fn ProcessTimeline(
             }
 
             div { class: "flex items-center mb-1",
-                div { class: "w-52 shrink-0" }
+                div { class: "w-48 shrink-0" }
                 div { class: "flex-1 flex justify-between text-xs text-gray-400",
                     span { "{format_duration(view_start_ns - full_start_ns)}" }
                     span { "{format_duration(view_end_ns - full_start_ns)}" }
                 }
-                div { class: "w-24 shrink-0" }
+                div { class: "w-20 shrink-0" }
             }
 
-            div { class: if all_process_rows.len() > 15 { "space-y-1 max-h-[72vh] overflow-y-auto" } else { "space-y-1" },
+            div { class: if all_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
                 {visible_process_rows.iter().map(|(proc, depth)| {
                     let indent = (*depth).min(6);
 
@@ -286,7 +286,6 @@ pub fn ProcessTimeline(
                     } else {
                         (process_start_ns + 1).min(full_end_ns)
                     };
-
                     let pid_events: Vec<&EventMarker> = events_map
                         .get(&proc.pid)
                         .map(|events| {
@@ -304,16 +303,16 @@ pub fn ProcessTimeline(
                     rsx! {
                         div {
                             key: "{proc.pid}",
-                            class: "flex items-center gap-3 h-10 group",
+                            class: "flex items-center gap-2 h-8 group",
 
                             div {
-                                class: "w-52 shrink-0 overflow-hidden",
-                                style: "padding-left: {indent * 8}px; font-variant-numeric: tabular-nums;",
+                                class: "w-48 shrink-0 overflow-hidden",
+                                style: "padding-left: {indent * 6}px; font-variant-numeric: tabular-nums;",
                                 title: "{process_name} (PID {proc.pid})",
                                 div { class: "flex items-start justify-end gap-1.5",
                                     if has_children {
                                         button {
-                                            class: "inline-flex items-center justify-center w-5 h-5 text-base leading-none font-semibold text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded",
+                                            class: "inline-flex items-center justify-center w-4 h-4 text-sm leading-none font-semibold text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded",
                                             title: if is_collapsed { "Expand children" } else { "Collapse children" },
                                             onclick: move |_| {
                                                 let mut collapsed = collapsed_nodes();
@@ -327,26 +326,26 @@ pub fn ProcessTimeline(
                                             if is_collapsed { "▸" } else { "▾" }
                                         }
                                     } else {
-                                        span { class: "inline-flex w-5 h-5" }
+                                        span { class: "inline-flex w-4 h-4" }
                                     }
                                     div {
                                         class: process_label_class,
                                         onclick: move |_| on_select_pid.call(pid),
-                                        div { class: "text-sm text-gray-700 text-right truncate leading-tight",
+                                        div { class: "text-xs text-gray-700 text-right truncate leading-tight",
                                             if is_selected {
-                                                span { class: "inline-block w-1.5 h-1.5 rounded-full bg-blue-600 mr-1 align-middle" }
+                                                span { class: "inline-block w-1 h-1 rounded-full bg-blue-600 mr-1 align-middle" }
                                             }
                                             if has_parent { "└ " }
                                             "{process_name}"
                                         }
-                                        div { class: "text-xs font-mono text-gray-500 text-right whitespace-nowrap leading-tight",
+                                        div { class: "text-[10px] font-mono text-gray-500 text-right whitespace-nowrap leading-tight",
                                             "PID {proc.pid}"
                                         }
                                     }
                                 }
                             }
 
-                            div { class: "flex-1 relative h-8 bg-gray-100 rounded overflow-hidden",
+                            div { class: "flex-1 relative h-5 bg-gray-100 rounded overflow-hidden",
                                 if in_view {
                                     div {
                                         class: "absolute top-0 bottom-0 {bar_color} rounded",
@@ -402,7 +401,7 @@ pub fn ProcessTimeline(
                                 }
                             }
 
-                            div { class: "w-24 text-sm text-gray-400 shrink-0 truncate",
+                            div { class: "w-20 text-xs text-gray-400 shrink-0 truncate",
                                 if !in_view {
                                     "—"
                                 } else if proc.did_exit {

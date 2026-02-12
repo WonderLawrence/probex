@@ -252,45 +252,6 @@ fn TraceViewer() -> Element {
                 },
             }
 
-            {
-                let mut event_type_options: Vec<String> = if selected_pid().is_some() && !pid_summary.breakdown.is_empty() {
-                    pid_summary
-                        .breakdown
-                        .iter()
-                        .map(|(event_type, _)| event_type.clone())
-                        .collect()
-                } else {
-                    summary_data
-                        .as_ref()
-                        .map(|summary| summary.event_types.clone())
-                        .unwrap_or_default()
-                };
-                if let Some(selected_event_type) = selected_flame_event_type()
-                    && !event_type_options
-                        .iter()
-                        .any(|event_type| event_type == &selected_event_type)
-                {
-                    event_type_options.push(selected_event_type);
-                }
-                event_type_options.sort();
-                event_type_options.dedup();
-
-                rsx! {
-            EventFlamegraphCard {
-                selected_event_type: selected_flame_event_type(),
-                event_type_options,
-                selected_pid: selected_pid(),
-                full_start_ns: full_start,
-                view_start_ns: view_start_ns(),
-                view_end_ns: view_end_ns(),
-                on_select_event_type: move |event_type: Option<String>| {
-                    selected_flame_event_type.set(event_type);
-                },
-                flamegraph: event_flamegraph(),
-            }
-                }
-            }
-
             if let (Some(summary), Some(lifetimes)) = (summary_data.clone(), process_lifetimes()) {
                 ProcessTimeline {
                     processes: lifetimes.processes,
@@ -331,6 +292,45 @@ fn TraceViewer() -> Element {
                             do_search(true);
                         }
                     },
+                }
+            }
+
+            {
+                let mut event_type_options: Vec<String> = if selected_pid().is_some() && !pid_summary.breakdown.is_empty() {
+                    pid_summary
+                        .breakdown
+                        .iter()
+                        .map(|(event_type, _)| event_type.clone())
+                        .collect()
+                } else {
+                    summary_data
+                        .as_ref()
+                        .map(|summary| summary.event_types.clone())
+                        .unwrap_or_default()
+                };
+                if let Some(selected_event_type) = selected_flame_event_type()
+                    && !event_type_options
+                        .iter()
+                        .any(|event_type| event_type == &selected_event_type)
+                {
+                    event_type_options.push(selected_event_type);
+                }
+                event_type_options.sort();
+                event_type_options.dedup();
+
+                rsx! {
+            EventFlamegraphCard {
+                selected_event_type: selected_flame_event_type(),
+                event_type_options,
+                selected_pid: selected_pid(),
+                full_start_ns: full_start,
+                view_start_ns: view_start_ns(),
+                view_end_ns: view_end_ns(),
+                on_select_event_type: move |event_type: Option<String>| {
+                    selected_flame_event_type.set(event_type);
+                },
+                flamegraph: event_flamegraph(),
+            }
                 }
             }
 
