@@ -100,6 +100,7 @@ pub struct TraceSummary {
     pub unique_pids: Vec<u32>,
     pub min_ts_ns: u64,
     pub max_ts_ns: u64,
+    pub cpu_sample_frequency_hz: Option<u64>,
 }
 
 /// Response containing events and metadata.
@@ -155,17 +156,28 @@ pub struct EventFlamegraphResponse {
 mod backend {
     use super::*;
     use datafusion::arrow::array::{
-        Array, Int32Array, Int64Array, StringViewArray, UInt8Array, UInt32Array, UInt64Array,
+        Array, Float64Array, Int32Array, Int64Array, StringViewArray, UInt8Array, UInt32Array,
+        UInt64Array,
     };
     use datafusion::prelude::*;
     use inferno::flamegraph;
+    use parquet::file::reader::{FileReader, SerializedFileReader};
     use std::collections::{BTreeMap, HashSet};
+    use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, OnceLock};
     use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
     static SESSION_CTX: OnceLock<Arc<SessionContext>> = OnceLock::new();
+    static TRACE_FILE_METADATA: OnceLock<TraceFileMetadata> = OnceLock::new();
+
+    const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "snitch.sample_freq_hz";
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct TraceFileMetadata {
+        cpu_sample_frequency_hz: Option<u64>,
+    }
 
     fn get_ctx() -> Result<&'static Arc<SessionContext>, Box<dyn std::error::Error + Send + Sync>> {
         SESSION_CTX
@@ -186,6 +198,9 @@ mod backend {
             )
             .into());
         }
+
+        let metadata = read_trace_file_metadata(&parquet_file);
+        let _ = TRACE_FILE_METADATA.set(metadata);
 
         let ctx = SessionContext::new();
 
@@ -246,6 +261,32 @@ mod backend {
 
         log::info!("Loaded {count} events from {:?}", parquet_file);
         Ok(())
+    }
+
+    fn read_trace_file_metadata(parquet_file: &Path) -> TraceFileMetadata {
+        let Ok(file) = File::open(parquet_file) else {
+            return TraceFileMetadata::default();
+        };
+        let Ok(reader) = SerializedFileReader::new(file) else {
+            return TraceFileMetadata::default();
+        };
+
+        let cpu_sample_frequency_hz = reader
+            .metadata()
+            .file_metadata()
+            .key_value_metadata()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.key == PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY)
+            })
+            .and_then(|entry| entry.value.as_ref())
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|hz| *hz > 0);
+
+        TraceFileMetadata {
+            cpu_sample_frequency_hz,
+        }
     }
 
     fn extract_string(
@@ -508,11 +549,8 @@ mod backend {
         let ctx = get_ctx()?;
 
         let range = end_ns.saturating_sub(start_ns);
-        let bucket_size = if num_buckets > 0 && range > 0 {
-            range / num_buckets as u64
-        } else {
-            1
-        };
+        let bucket_count = num_buckets.max(1);
+        let bucket_size = range.div_ceil(bucket_count as u64).max(1);
 
         // Query to get counts grouped by bucket and event type
         let sql = format!(
@@ -530,9 +568,19 @@ mod backend {
         let df = ctx.sql(&sql).await?;
         let batches = df.collect().await?;
 
-        // Build buckets
-        let mut bucket_map: std::collections::HashMap<i64, HistogramBucket> =
-            std::collections::HashMap::new();
+        // Always return a fixed bucket count so downstream timeline math remains stable.
+        let mut buckets = (0..bucket_count)
+            .map(|bucket_idx| {
+                let bucket_start = start_ns + (bucket_idx as u64 * bucket_size);
+                let bucket_end = bucket_start.saturating_add(bucket_size).min(end_ns);
+                HistogramBucket {
+                    bucket_start_ns: bucket_start,
+                    bucket_end_ns: bucket_end,
+                    count: 0,
+                    counts_by_type: std::collections::HashMap::new(),
+                }
+            })
+            .collect::<Vec<_>>();
 
         let mut total_in_range = 0usize;
 
@@ -540,8 +588,24 @@ mod backend {
             for row in 0..batch.num_rows() {
                 let bucket_idx = batch
                     .column_by_name("bucket_idx")
-                    .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
-                    .map(|arr| arr.value(row))
+                    .and_then(|column| {
+                        column
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .map(|arr| arr.value(row))
+                            .or_else(|| {
+                                column
+                                    .as_any()
+                                    .downcast_ref::<UInt64Array>()
+                                    .map(|arr| arr.value(row) as i64)
+                            })
+                            .or_else(|| {
+                                column
+                                    .as_any()
+                                    .downcast_ref::<Float64Array>()
+                                    .map(|arr| arr.value(row).floor() as i64)
+                            })
+                    })
                     .unwrap_or(0);
 
                 let event_type = extract_string(batch, "event_type", row);
@@ -553,24 +617,16 @@ mod backend {
 
                 total_in_range += cnt;
 
-                let bucket = bucket_map.entry(bucket_idx).or_insert_with(|| {
-                    let bucket_start = start_ns + (bucket_idx as u64 * bucket_size);
-                    let bucket_end = bucket_start + bucket_size;
-                    HistogramBucket {
-                        bucket_start_ns: bucket_start,
-                        bucket_end_ns: bucket_end.min(end_ns),
-                        count: 0,
-                        counts_by_type: std::collections::HashMap::new(),
-                    }
-                });
+                let clamped_idx =
+                    (bucket_idx.max(0) as usize).min(bucket_count.saturating_sub(1));
+                let bucket = buckets
+                    .get_mut(clamped_idx)
+                    .expect("histogram bucket index should be in range");
 
                 bucket.count += cnt;
                 *bucket.counts_by_type.entry(event_type).or_insert(0) += cnt;
             }
         }
-
-        let mut buckets: Vec<HistogramBucket> = bucket_map.into_values().collect();
-        buckets.sort_by_key(|b| b.bucket_start_ns);
 
         Ok(HistogramResponse {
             buckets,
@@ -847,6 +903,9 @@ mod backend {
             unique_pids,
             min_ts_ns,
             max_ts_ns,
+            cpu_sample_frequency_hz: TRACE_FILE_METADATA
+                .get()
+                .and_then(|metadata| metadata.cpu_sample_frequency_hz),
         })
     }
 
@@ -974,7 +1033,7 @@ mod backend {
         end_ns: u64,
         max_events_per_pid: usize,
     ) -> Result<ProcessEventsResponse, Box<dyn std::error::Error + Send + Sync>> {
-        const CPU_SAMPLE_BUCKETS: usize = 200;
+        const CPU_SAMPLE_BUCKETS: usize = 600;
 
         if max_events_per_pid == 0 {
             return Ok(ProcessEventsResponse {

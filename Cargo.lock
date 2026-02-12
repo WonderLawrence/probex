@@ -5267,6 +5267,7 @@ dependencies = [
  "env_logger",
  "inferno",
  "log",
+ "parquet",
  "serde",
  "tokio",
  "wholesym",

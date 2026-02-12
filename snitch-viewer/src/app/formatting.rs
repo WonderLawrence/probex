@@ -1,11 +1,11 @@
 pub fn get_event_marker_color(event_type: &str) -> &'static str {
     match event_type {
-        "sched_switch" => "bg-blue-600",
-        "process_fork" => "bg-green-600",
-        "process_exit" => "bg-red-600",
-        "page_fault" => "bg-orange-500",
-        _ if event_type.contains("syscall") => "bg-purple-600",
-        _ => "bg-gray-600",
+        "sched_switch" => "#2563eb",
+        "process_fork" => "#16a34a",
+        "process_exit" => "#dc2626",
+        "page_fault" => "#f97316",
+        _ if event_type.contains("syscall") => "#7c3aed",
+        _ => "#4b5563",
     }
 }
 

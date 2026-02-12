@@ -136,7 +136,11 @@ use nix::{
     },
     unistd::{ForkResult, Pid, fork},
 };
-use parquet::{arrow::ArrowWriter, basic::Compression, file::properties::WriterProperties};
+use parquet::{
+    arrow::ArrowWriter,
+    basic::Compression,
+    file::{metadata::KeyValue, properties::WriterProperties},
+};
 use snitch_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
@@ -149,6 +153,7 @@ use tokio::{io::unix::AsyncFd, signal};
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
 const MAP_BATCH_SIZE: usize = 8_192;
+const PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY: &str = "snitch.sample_freq_hz";
 
 #[derive(Parser, Debug)]
 #[command(name = "snitch")]
@@ -255,13 +260,18 @@ struct ParquetBatchWriter {
 
 impl ParquetBatchWriter {
     /// Create a new ParquetBatchWriter that writes to the specified file
-    fn new(path: &str) -> Result<Self> {
+    fn new(path: &str, sample_freq_hz: u64) -> Result<Self> {
         let schema = Arc::new(create_schema());
         let file =
             File::create(path).with_context(|| format!("failed to create output file {}", path))?;
 
+        let key_value_metadata = vec![KeyValue::new(
+            PARQUET_METADATA_SAMPLE_FREQ_HZ_KEY.to_string(),
+            sample_freq_hz.to_string(),
+        )];
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_key_value_metadata(Some(key_value_metadata))
             .build();
 
         let writer = ArrowWriter::try_new(file, schema.clone(), Some(props))
@@ -1299,7 +1309,7 @@ async fn main() -> Result<()> {
     info!("Resumed child process {}", child_pid);
 
     // Create Parquet batch writer
-    let mut writer = ParquetBatchWriter::new(&args.output)?;
+    let mut writer = ParquetBatchWriter::new(&args.output, args.sample_freq)?;
     info!("Writing events to {}", args.output);
     let maps_output_path = derive_maps_output_path(&args.output);
     let mut maps_writer = ProcMapsParquetWriter::new(&maps_output_path)?;

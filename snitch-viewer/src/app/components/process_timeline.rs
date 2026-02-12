@@ -9,8 +9,8 @@ use crate::app::formatting::{
 };
 use crate::app::view_model::PidEventSummary;
 use crate::server::{
-    EventFlamegraphResponse, EventMarker, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetime, SyscallLatencyStats, TraceSummary,
+    EventFlamegraphResponse, HistogramResponse, ProcessEventsResponse, ProcessLifetime,
+    SyscallLatencyStats, TraceSummary,
 };
 
 #[component]
@@ -125,11 +125,17 @@ pub fn ProcessTimeline(
         return rsx! {};
     }
 
-    let events_map = process_events
+    let (events_map, cpu_sample_counts_map, cpu_sample_bucket_count) = process_events
         .as_ref()
-        .map(|pe| &pe.events_by_pid)
-        .cloned()
-        .unwrap_or_default();
+        .map(|pe| {
+            (
+                pe.events_by_pid.clone(),
+                pe.cpu_sample_counts_by_pid.clone(),
+                pe.cpu_sample_bucket_count,
+            )
+        })
+        .unwrap_or_else(|| (HashMap::new(), HashMap::new(), 0));
+    let sample_frequency_hz = summary.as_ref().and_then(|s| s.cpu_sample_frequency_hz);
     let stats = latency_stats.unwrap_or_default();
     let has_read_stats = stats.read.count > 0;
     let has_write_stats = stats.write.count > 0;
@@ -286,7 +292,7 @@ pub fn ProcessTimeline(
 
             // Event type badges row (always rendered to avoid layout flicker)
             div { class: "flex flex-wrap items-center gap-1 mb-1.5 min-h-[1.5rem]",
-                if selected_pid.is_some() && !pid_summary.breakdown.is_empty() {
+                if !pid_summary.breakdown.is_empty() {
                     {pid_summary.breakdown.iter().map(|(event_type, count)| {
                         let enabled = enabled_event_types.contains(event_type);
                         let event_type_clone = event_type.clone();
@@ -303,10 +309,8 @@ pub fn ProcessTimeline(
                             }
                         }
                     })}
-                } else if selected_pid.is_some() {
-                    span { class: "text-xs text-gray-400", "No event badges for selected PID in this range" }
                 } else {
-                    span { class: "text-xs text-gray-400", "Select a PID to enable event badges and flamegraph filters" }
+                    span { class: "text-xs text-gray-400", "No event badges in this range" }
                 }
             }
 
@@ -378,12 +382,12 @@ pub fn ProcessTimeline(
 
                     let bar_color = if proc.did_exit {
                         if proc.exit_code == Some(0) {
-                            "bg-green-200"
+                            "bg-emerald-50"
                         } else {
-                            "bg-red-200"
+                            "bg-rose-50"
                         }
                     } else {
-                        "bg-blue-200"
+                        "bg-slate-100"
                     };
 
                     let has_children = tree_pos.has_children;
@@ -404,7 +408,7 @@ pub fn ProcessTimeline(
                     } else {
                         (process_start_ns + 1).min(full_end_ns)
                     };
-                    let pid_events: Vec<&EventMarker> = events_map
+                    let event_markers: Vec<CanvasEventMarker> = events_map
                         .get(&proc.pid)
                         .map(|events| {
                             events
@@ -414,9 +418,52 @@ pub fn ProcessTimeline(
                                         && e.ts_ns >= view_start_ns
                                         && e.ts_ns <= view_end_ns
                                 })
+                                .map(|event| {
+                                    let pct = ((event.ts_ns - view_start_ns) as f64 / view_duration
+                                        * 100.0)
+                                        .clamp(0.0, 100.0);
+                                    CanvasEventMarker {
+                                        pct,
+                                        color_hex: get_event_marker_color(&event.event_type),
+                                    }
+                                })
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let cpu_usage_points = cpu_sample_counts_map
+                        .get(&proc.pid)
+                        .map(|bucket_counts| {
+                            build_cpu_usage_points(
+                                bucket_counts,
+                                cpu_sample_bucket_count,
+                                sample_frequency_hz,
+                                view_duration_ns,
+                            )
+                        })
+                        .unwrap_or_default();
+                    let fork_pct = if proc.was_forked
+                        && proc.start_ns >= view_start_ns
+                        && proc.start_ns <= view_end_ns
+                    {
+                        Some(left_pct)
+                    } else {
+                        None
+                    };
+                    let exit_marker = if proc.did_exit {
+                        if let Some(end) = proc.end_ns {
+                            if end >= view_start_ns && end <= view_end_ns {
+                                let exit_pct =
+                                    ((end - view_start_ns) as f64 / view_duration * 100.0).max(0.0);
+                                Some((exit_pct, proc.exit_code == Some(0)))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     // Build tree line prefixes
                     let tree_pos_clone = tree_pos.clone();
                     let row_is_selected = is_selected;
@@ -511,45 +558,12 @@ pub fn ProcessTimeline(
                                         }
                                     }
 
-                                    {pid_events.iter().map(|event| {
-                                        let event_pct = ((event.ts_ns - view_start_ns) as f64 / view_duration * 100.0)
-                                            .clamp(0.0, 100.0);
-                                        let event_color = get_event_marker_color(&event.event_type);
-
-                                        rsx! {
-                                            div {
-                                                key: "{event.ts_ns}",
-                                                class: "absolute top-0 bottom-0 w-px {event_color}",
-                                                style: "left: {event_pct}%;",
-                                                title: "{event.event_type} @ {format_duration(event.ts_ns - full_start_ns)}",
-                                            }
-                                        }
-                                    })}
-
-                                    if proc.was_forked && proc.start_ns >= view_start_ns && proc.start_ns <= view_end_ns {
-                                        div {
-                                            class: "absolute top-0 bottom-0 w-1 bg-green-600",
-                                            style: "left: {left_pct}%;",
-                                            title: "Fork from PID {proc.parent_pid.unwrap_or(0)}",
-                                        }
-                                    }
-
-                                    if proc.did_exit {
-                                        if let Some(end) = proc.end_ns {
-                                            if end >= view_start_ns && end <= view_end_ns {
-                                                {
-                                                    let exit_pct = ((end - view_start_ns) as f64 / view_duration * 100.0).max(0.0);
-                                                    let exit_color = if proc.exit_code == Some(0) { "bg-green-600" } else { "bg-red-600" };
-                                                    rsx! {
-                                                        div {
-                                                            class: "absolute top-0 bottom-0 w-1 {exit_color}",
-                                                            style: "left: {exit_pct}%;",
-                                                            title: "Exit code: {proc.exit_code.unwrap_or(0)}",
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    ProcessActivityCanvas {
+                                        usage_points: cpu_usage_points,
+                                        event_markers,
+                                        fork_pct,
+                                        exit_pct: exit_marker.map(|(pct, _)| pct),
+                                        exit_ok: exit_marker.map(|(_, ok)| ok).unwrap_or(false),
                                     }
 
                                     div {
@@ -671,9 +685,13 @@ fn TimelineOverview(
         })
         .unwrap_or(1)
         .max(1);
-
     let is_dragging = drag().is_some();
     let drag_kind = drag().map(|d| d.kind);
+    let drag_overlay_cursor = if drag_kind == Some(DragKind::Pan) {
+        "grabbing"
+    } else {
+        "ew-resize"
+    };
 
     // Compute new range from a drag delta in pixels
     let compute_range = move |d: DragState, current_page_x: f64| -> (u64, u64) {
@@ -836,15 +854,6 @@ fn TimelineOverview(
                     drag_preview_range.set(None);
                 }
             },
-            onmouseleave: move |_| {
-                if drag().is_some() {
-                    if let Some((start, end)) = drag_preview_range() {
-                        on_change_range.call((start, end, true));
-                    }
-                    drag.set(None);
-                    drag_preview_range.set(None);
-                }
-            },
 
             // Histogram background
             if let Some(h) = histogram {
@@ -856,7 +865,11 @@ fn TimelineOverview(
                             .filter(|(event_type, _)| enabled_types.contains(*event_type))
                             .map(|(_, count)| *count)
                             .sum();
-                        let height_pct = (count as f64 / max_count as f64 * 100.0).max(1.0);
+                        let height_pct = if count == 0 {
+                            0.0
+                        } else {
+                            (count as f64 / max_count as f64 * 100.0).max(1.0)
+                        };
 
                         rsx! {
                             div {
@@ -926,8 +939,191 @@ fn TimelineOverview(
                     }
                 }
             }
+
+            // Capture drag events across the whole viewport so handles keep tracking
+            // even when the cursor leaves the timeline element.
+            if is_dragging {
+                div {
+                    class: "fixed inset-0 z-50",
+                    style: "cursor: {drag_overlay_cursor};",
+                    onmousemove: move |evt: MouseEvent| {
+                        let Some(d) = drag() else { return };
+                        let (start, end) = compute_range(d, evt.page_coordinates().x);
+                        if drag_preview_range() != Some((start, end)) {
+                            drag_preview_range.set(Some((start, end)));
+                        }
+                    },
+                    onmouseup: move |_| {
+                        if drag().is_some() {
+                            if let Some((start, end)) = drag_preview_range() {
+                                on_change_range.call((start, end, true));
+                            }
+                            drag.set(None);
+                            drag_preview_range.set(None);
+                        }
+                    },
+                }
+            }
         }
     }
+}
+
+#[derive(Clone, PartialEq)]
+struct CanvasEventMarker {
+    pct: f64,
+    color_hex: &'static str,
+}
+
+#[component]
+fn ProcessActivityCanvas(
+    usage_points: Vec<f64>,
+    event_markers: Vec<CanvasEventMarker>,
+    fork_pct: Option<f64>,
+    exit_pct: Option<f64>,
+    exit_ok: bool,
+) -> Element {
+    let (usage_area_path, usage_line_path) = build_usage_paths(&usage_points);
+    let marker_paths = build_vertical_marker_paths(&event_markers);
+
+    rsx! {
+        svg {
+            class: "absolute inset-0 w-full h-full pointer-events-none",
+            view_box: "0 0 100 100",
+            preserve_aspect_ratio: "none",
+
+            if let Some(area_path) = usage_area_path {
+                path {
+                    d: "{area_path}",
+                    fill: "rgba(30, 64, 175, 0.18)",
+                    stroke: "none",
+                }
+            }
+
+            if let Some(line_path) = usage_line_path {
+                path {
+                    d: "{line_path}",
+                    fill: "none",
+                    stroke: "rgba(30, 64, 175, 0.7)",
+                    stroke_width: "0.9",
+                    vector_effect: "non-scaling-stroke",
+                }
+            }
+
+            {marker_paths.iter().map(|(color_hex, path_data)| {
+                rsx! {
+                    path {
+                        key: "{color_hex}",
+                        d: "{path_data}",
+                        fill: "none",
+                        stroke: "{color_hex}",
+                        stroke_width: "0.45",
+                        vector_effect: "non-scaling-stroke",
+                    }
+                }
+            })}
+
+            if let Some(fork_x) = fork_pct {
+                line {
+                    x1: "{fork_x.clamp(0.0, 100.0)}",
+                    y1: "0",
+                    x2: "{fork_x.clamp(0.0, 100.0)}",
+                    y2: "100",
+                    stroke: "#16a34a",
+                    stroke_width: "0.9",
+                    vector_effect: "non-scaling-stroke",
+                }
+            }
+
+            if let Some(exit_x) = exit_pct {
+                line {
+                    x1: "{exit_x.clamp(0.0, 100.0)}",
+                    y1: "0",
+                    x2: "{exit_x.clamp(0.0, 100.0)}",
+                    y2: "100",
+                    stroke: if exit_ok { "#16a34a" } else { "#dc2626" },
+                    stroke_width: "0.9",
+                    vector_effect: "non-scaling-stroke",
+                }
+            }
+        }
+    }
+}
+
+fn build_usage_paths(usage_points: &[f64]) -> (Option<String>, Option<String>) {
+    if usage_points.is_empty() {
+        return (None, None);
+    }
+
+    let point_count = usage_points.len();
+    let mut line_path = String::new();
+    let mut area_path = String::new();
+    let mut last_x = 0.0;
+
+    for (idx, usage) in usage_points.iter().enumerate() {
+        let x = ((idx as f64) + 0.5) / point_count as f64 * 100.0;
+        let y = 100.0 - usage.clamp(0.0, 100.0);
+        last_x = x;
+        if idx == 0 {
+            line_path = format!("M{:.3} {:.3}", x, y);
+            area_path = format!("M{:.3} 100L{:.3} {:.3}", x, x, y);
+        } else {
+            line_path.push_str(&format!("L{:.3} {:.3}", x, y));
+            area_path.push_str(&format!("L{:.3} {:.3}", x, y));
+        }
+    }
+
+    area_path.push_str(&format!("L{:.3} 100Z", last_x));
+    (Some(area_path), Some(line_path))
+}
+
+fn build_vertical_marker_paths(markers: &[CanvasEventMarker]) -> Vec<(&'static str, String)> {
+    let mut grouped: HashMap<&'static str, Vec<f64>> = HashMap::new();
+    for marker in markers {
+        grouped
+            .entry(marker.color_hex)
+            .or_default()
+            .push(marker.pct.clamp(0.0, 100.0));
+    }
+
+    let mut grouped_vec: Vec<(&'static str, Vec<f64>)> = grouped.into_iter().collect();
+    grouped_vec.sort_by(|a, b| a.0.cmp(b.0));
+
+    grouped_vec
+        .into_iter()
+        .map(|(color_hex, mut points)| {
+            points.sort_by(|a, b| a.total_cmp(b));
+            let mut path_data = String::new();
+            for x in points {
+                path_data.push_str(&format!("M{:.3} 0V100", x));
+            }
+            (color_hex, path_data)
+        })
+        .collect()
+}
+
+fn build_cpu_usage_points(
+    bucket_counts: &[u16],
+    bucket_count: usize,
+    sample_frequency_hz: Option<u64>,
+    view_duration_ns: u64,
+) -> Vec<f64> {
+    // Older traces may not have sampling frequency in parquet metadata.
+    // Fall back to snitch's historical default so usage overlay still renders.
+    let sample_frequency_hz = sample_frequency_hz.unwrap_or(999);
+    if bucket_count == 0 || bucket_counts.is_empty() {
+        return Vec::new();
+    }
+
+    let clamped_bucket_count = bucket_count.min(bucket_counts.len());
+    let bucket_size_ns = view_duration_ns.max(1).div_ceil(bucket_count as u64).max(1);
+    let expected_samples_per_bucket =
+        (sample_frequency_hz as f64 * (bucket_size_ns as f64 / 1_000_000_000.0)).max(0.001);
+
+    bucket_counts
+        .iter()
+        .take(clamped_bucket_count)
+        .map(|count| ((*count as f64 / expected_samples_per_bucket) * 100.0).clamp(0.0, 100.0))
+        .collect()
 }
 
 fn event_badge_class(enabled: bool, event_type: &str) -> String {

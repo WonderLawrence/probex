@@ -15,9 +15,9 @@ use view_model::build_pid_event_summary;
 
 use crate::server::{
     EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetimesResponse, TraceSummary, get_event_flamegraph, get_histogram,
-    get_pid_event_type_counts, get_process_events, get_process_lifetimes, get_summary,
-    get_syscall_latency_stats,
+    ProcessLifetimesResponse, TraceSummary, get_event_flamegraph, get_event_type_counts,
+    get_histogram, get_pid_event_type_counts, get_process_events, get_process_lifetimes,
+    get_summary, get_syscall_latency_stats,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -25,7 +25,7 @@ const TAILWIND_CSS: Asset = asset!("/assets/tailwind.css");
 
 const HISTOGRAM_BUCKETS: usize = 80;
 const MAX_FLAME_STACKS: usize = 5000;
-const MAX_PROCESS_MARKERS_PER_PID: usize = 100;
+const MAX_PROCESS_MARKERS_PER_PID: usize = 500;
 
 #[component]
 pub fn App() -> Element {
@@ -140,7 +140,10 @@ fn TraceViewer() -> Element {
                 Err(e) => log::error!("Selected PID event counts error: {}", e),
             }
         } else {
-            selected_pid_event_counts.set(None);
+            match get_event_type_counts(Some(start), Some(end)).await {
+                Ok(counts) => selected_pid_event_counts.set(Some(counts)),
+                Err(e) => log::error!("Event counts error: {}", e),
+            }
         }
     });
 
@@ -151,13 +154,9 @@ fn TraceViewer() -> Element {
             return;
         }
 
-        if let Some(pid) = selected_pid() {
-            match get_syscall_latency_stats(start, end, Some(pid)).await {
-                Ok(stats) => syscall_latency_stats.set(Some(stats)),
-                Err(e) => log::error!("Syscall latency stats error: {}", e),
-            }
-        } else {
-            syscall_latency_stats.set(None);
+        match get_syscall_latency_stats(start, end, selected_pid()).await {
+            Ok(stats) => syscall_latency_stats.set(Some(stats)),
+            Err(e) => log::error!("Syscall latency stats error: {}", e),
         }
     });
 

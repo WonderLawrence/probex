@@ -18,6 +18,7 @@ log.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { workspace = true, features = ["full"] }
 datafusion.workspace = true
+parquet.workspace = true
 env_logger.workspace = true
 inferno = "0.12"
 wholesym = "0.8.1"
