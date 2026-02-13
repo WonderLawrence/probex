@@ -1,17 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context as _, Result, anyhow};
 use axum::{
     Json, Router,
     extract::Query,
-    http::StatusCode,
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::get,
 };
+use rust_embed::Embed;
 use serde::Deserialize;
-use tower_http::services::{ServeDir, ServeFile};
 
 use crate::viewer_backend;
+
+const INDEX_HTML: &str = "index.html";
+
+#[derive(Embed)]
+#[folder = "../target/dx/snitch-viewer/release/web/public/"]
+struct ViewerAssets;
 
 #[derive(Debug, Deserialize)]
 struct HistogramQuery {
@@ -65,13 +71,18 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .await
         .map_err(|error| anyhow!("failed to initialize viewer backend: {error}"))?;
 
-    let public_dir = resolve_viewer_public_dir()?;
     let bind_addr = format!("0.0.0.0:{port}");
-    log::info!(
-        "Launching integrated viewer server at http://{} for {}",
-        bind_addr,
-        parquet_path.display()
-    );
+    let launch_urls = viewer_launch_urls(port);
+    let primary_url = launch_urls
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("http://localhost:{port}"));
+    let alt_urls = launch_urls.iter().skip(1).cloned().collect::<Vec<String>>();
+    if alt_urls.is_empty() {
+        log::info!("Launching viewer at {primary_url}");
+    } else {
+        log::info!("Launching viewer at {primary_url}, {}", alt_urls.join(", "));
+    }
 
     let api_router = Router::new()
         .route("/api/summary", get(get_summary))
@@ -83,10 +94,7 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/process_events", get(get_process_events))
         .route("/api/event_flamegraph", get(get_event_flamegraph));
 
-    let index_file = public_dir.join("index.html");
-    let static_service = ServeDir::new(public_dir).not_found_service(ServeFile::new(index_file));
-
-    let app = api_router.fallback_service(static_service);
+    let app = api_router.fallback(get(static_handler));
 
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
@@ -172,53 +180,93 @@ where
     }
 }
 
-fn resolve_viewer_public_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("SNITCH_VIEWER_PUBLIC_DIR") {
-        let candidate = PathBuf::from(path);
-        if viewer_public_dir_is_valid(&candidate) {
-            return Ok(candidate);
-        }
+async fn static_handler(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+
+    if path.is_empty() || path == INDEX_HTML {
+        return index_html_response();
     }
 
-    let mut candidates = Vec::new();
-
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(
-            cwd.join("target")
-                .join("dx")
-                .join("snitch-viewer")
-                .join("release")
-                .join("web")
-                .join("public"),
-        );
-        candidates.push(
-            cwd.join("target")
-                .join("dx")
-                .join("snitch-viewer")
-                .join("debug")
-                .join("web")
-                .join("public"),
-        );
+    if let Some(response) = embedded_asset_response(path) {
+        return response;
     }
 
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(exe_dir) = exe.parent()
-    {
-        candidates.push(exe_dir.join("public"));
-        candidates.push(exe_dir.join("web").join("public"));
+    // Keep API misses as real 404s; treat non-file routes as SPA paths.
+    if path.starts_with("api/") || path.contains('.') {
+        return (StatusCode::NOT_FOUND, "404 Not Found").into_response();
     }
 
-    for candidate in candidates {
-        if viewer_public_dir_is_valid(&candidate) {
-            return Ok(candidate);
-        }
-    }
-
-    Err(anyhow!(
-        "snitch-viewer web assets not found. Build them with: dx bundle --release --platform web -p snitch-viewer"
-    ))
+    index_html_response()
 }
 
-fn viewer_public_dir_is_valid(path: &Path) -> bool {
-    path.is_dir() && path.join("index.html").is_file()
+fn index_html_response() -> Response {
+    match embedded_asset_response(INDEX_HTML) {
+        Some(response) => response,
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "viewer assets are not embedded. Build frontend first with `dx bundle --release --platform web -p snitch-viewer`, then rebuild snitch.",
+        )
+            .into_response(),
+    }
+}
+
+fn embedded_asset_response(path: &str) -> Option<Response> {
+    ViewerAssets::get(path).map(|asset| {
+        (
+            [(header::CONTENT_TYPE, asset.metadata.mimetype())],
+            asset.data,
+        )
+            .into_response()
+    })
+}
+
+fn viewer_launch_urls(port: u16) -> Vec<String> {
+    fn push_unique(urls: &mut Vec<String>, url: String) {
+        if !urls.iter().any(|existing| existing == &url) {
+            urls.push(url);
+        }
+    }
+
+    let mut urls = Vec::new();
+    push_unique(&mut urls, format!("http://localhost:{port}"));
+
+    if let Some(hostname) = detect_hostname() {
+        push_unique(&mut urls, format!("http://{hostname}:{port}"));
+    }
+
+    urls
+}
+
+fn detect_hostname() -> Option<String> {
+    fn normalize_hostname(value: &str) -> Option<String> {
+        let trimmed = value.trim().trim_end_matches('.');
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "localhost" || lower == "localhost.localdomain" {
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    if let Ok(value) = std::env::var("HOSTNAME")
+        && let Some(hostname) = normalize_hostname(&value)
+    {
+        return Some(hostname);
+    }
+
+    if let Ok(value) = std::env::var("COMPUTERNAME")
+        && let Some(hostname) = normalize_hostname(&value)
+    {
+        return Some(hostname);
+    }
+
+    if let Ok(contents) = std::fs::read_to_string("/etc/hostname")
+        && let Some(hostname) = normalize_hostname(&contents)
+    {
+        return Some(hostname);
+    }
+
+    None
 }

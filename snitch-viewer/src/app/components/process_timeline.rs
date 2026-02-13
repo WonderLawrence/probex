@@ -562,6 +562,16 @@ pub fn ProcessTimeline(
                                             }
                                         }
                                     },
+                                    onresize: {
+                                        let mut process_bar_width_px = process_bar_width_px;
+                                        move |evt| {
+                                            if let Ok(size) = evt.data().get_border_box_size()
+                                                && size.width > 0.0
+                                            {
+                                                process_bar_width_px.set(size.width);
+                                            }
+                                        }
+                                    },
                                     onmousedown: {
                                         let mut process_bar_drag_state = process_bar_drag_state;
                                         let mut process_bar_drag_preview = process_bar_drag_preview;
@@ -573,14 +583,14 @@ pub fn ProcessTimeline(
                                                 return;
                                             }
 
-                                            let page_x = evt.page_coordinates().x;
-                                            let bar_left_page_x = page_x - evt.element_coordinates().x;
+                                            let client_x = evt.client_coordinates().x;
+                                            let bar_left_client_x = client_x - evt.element_coordinates().x;
 
                                             process_bar_drag_state.set(Some(ProcessBarDragState {
                                                 pid,
-                                                bar_left_page_x,
+                                                bar_left_client_x,
                                                 bar_width_px: bar_width,
-                                                anchor_page_x: page_x,
+                                                anchor_client_x: client_x,
                                             }));
                                             process_bar_drag_preview.set(None);
                                         }
@@ -595,15 +605,15 @@ pub fn ProcessTimeline(
                                             if drag_state.pid != pid {
                                                 return;
                                             }
-                                            let moved_px = (evt.page_coordinates().x
-                                                - drag_state.anchor_page_x)
+                                            let moved_px = (evt.client_coordinates().x
+                                                - drag_state.anchor_client_x)
                                                 .abs();
                                             if moved_px < PROCESS_BAR_SELECTION_THRESHOLD_PX {
                                                 return;
                                             }
                                             if let Some(preview) = build_process_bar_drag_preview(
                                                 drag_state,
-                                                evt.page_coordinates().x,
+                                                evt.client_coordinates().x,
                                                 range.view_start_ns,
                                                 range.view_end_ns,
                                             ) && process_bar_drag_preview() != Some(preview)
@@ -726,7 +736,7 @@ pub fn ProcessTimeline(
                             };
                             if let Some(preview) = build_process_bar_drag_preview(
                                 drag_state,
-                                evt.page_coordinates().x,
+                                evt.client_coordinates().x,
                                 range.view_start_ns,
                                 range.view_end_ns,
                             ) && process_bar_drag_preview() != Some(preview)
@@ -765,8 +775,8 @@ enum DragKind {
 #[derive(Clone, Copy)]
 struct DragState {
     kind: DragKind,
-    /// Mouse X in page coordinates at drag start.
-    start_page_x: f64,
+    /// Mouse X in client coordinates at drag start.
+    start_client_x: f64,
     /// Container width in pixels (estimated at drag start).
     container_width: f64,
     /// View start offset (ns from full_start) at drag start.
@@ -780,9 +790,9 @@ const PROCESS_BAR_SELECTION_THRESHOLD_PX: f64 = 3.0;
 #[derive(Clone, Copy)]
 struct ProcessBarDragState {
     pid: u32,
-    bar_left_page_x: f64,
+    bar_left_client_x: f64,
     bar_width_px: f64,
-    anchor_page_x: f64,
+    anchor_client_x: f64,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -859,12 +869,12 @@ fn TimelineOverview(
     };
 
     // Compute new range from a drag delta in pixels
-    let compute_range = move |d: DragState, current_page_x: f64| -> (u64, u64) {
+    let compute_range = move |d: DragState, current_client_x: f64| -> (u64, u64) {
         let cw = d.container_width;
         if cw <= 0.0 {
             return (view_start_ns, view_end_ns);
         }
-        let dx_px = current_page_x - d.start_page_x;
+        let dx_px = current_client_x - d.start_client_x;
         let dx_frac = dx_px / cw;
         let dx_ns = (dx_frac * full_range).round() as i64;
 
@@ -957,6 +967,13 @@ fn TimelineOverview(
                     container_width_px.set(rect.width());
                 }
             },
+            onresize: move |evt| {
+                if let Ok(size) = evt.data().get_border_box_size()
+                    && size.width > 0.0
+                {
+                    container_width_px.set(size.width);
+                }
+            },
             onmousedown: move |evt: MouseEvent| {
                 evt.prevent_default();
                 let cw = container_width_px();
@@ -996,7 +1013,7 @@ fn TimelineOverview(
 
                     drag.set(Some(DragState {
                         kind,
-                        start_page_x: evt.page_coordinates().x,
+                        start_client_x: evt.client_coordinates().x,
                         container_width: cw,
                         initial_start_offset: snap_start,
                         initial_end_offset: snap_end,
@@ -1005,7 +1022,7 @@ fn TimelineOverview(
             },
             onmousemove: move |evt: MouseEvent| {
                 let Some(d) = drag() else { return };
-                let (start, end) = compute_range(d, evt.page_coordinates().x);
+                let (start, end) = compute_range(d, evt.client_coordinates().x);
                 if drag_preview_range() != Some((start, end)) {
                     drag_preview_range.set(Some((start, end)));
                 }
@@ -1100,7 +1117,7 @@ fn TimelineOverview(
                     style: "cursor: {drag_overlay_cursor};",
                     onmousemove: move |evt: MouseEvent| {
                         let Some(d) = drag() else { return };
-                        let (start, end) = compute_range(d, evt.page_coordinates().x);
+                        let (start, end) = compute_range(d, evt.client_coordinates().x);
                         if drag_preview_range() != Some((start, end)) {
                             drag_preview_range.set(Some((start, end)));
                         }
@@ -1307,7 +1324,7 @@ fn build_overview_histogram_area_path(
 
 fn build_process_bar_drag_preview(
     drag_state: ProcessBarDragState,
-    current_page_x: f64,
+    current_client_x: f64,
     view_start_ns: u64,
     view_end_ns: u64,
 ) -> Option<ProcessBarDragPreview> {
@@ -1316,11 +1333,12 @@ fn build_process_bar_drag_preview(
     }
 
     let view_duration_ns = view_end_ns - view_start_ns;
-    let anchor_frac = ((drag_state.anchor_page_x - drag_state.bar_left_page_x)
+    let anchor_frac = ((drag_state.anchor_client_x - drag_state.bar_left_client_x)
         / drag_state.bar_width_px)
         .clamp(0.0, 1.0);
-    let current_frac =
-        ((current_page_x - drag_state.bar_left_page_x) / drag_state.bar_width_px).clamp(0.0, 1.0);
+    let current_frac = ((current_client_x - drag_state.bar_left_client_x)
+        / drag_state.bar_width_px)
+        .clamp(0.0, 1.0);
 
     let start_frac = anchor_frac.min(current_frac);
     let end_frac = anchor_frac.max(current_frac);

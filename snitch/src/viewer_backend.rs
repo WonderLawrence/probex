@@ -1250,6 +1250,10 @@ mod backend {
         let mut opts = flamegraph::Options::default();
         opts.title = format!("snitch · {event_type}");
         opts.count_name = "samples".to_string();
+        opts.colors = flamegraph::Palette::Basic(flamegraph::color::BasicPalette::Aqua);
+        opts.bgcolors = Some(flamegraph::color::BackgroundColor::Blue);
+        opts.hash = true;
+        opts.deterministic = true;
 
         let input = folded_lines.iter().map(String::as_str);
         let mut svg = Vec::<u8>::new();

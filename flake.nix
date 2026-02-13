@@ -101,7 +101,7 @@
             set -euo pipefail
 
             if [ "$#" -eq 0 ]; then
-              echo "Usage: nix run .#snitch -- <program> [args...]"
+              echo "Usage: nix run .#snitch -- [--view trace.parquet] | <program> [args...]"
               exit 2
             fi
 
@@ -114,14 +114,7 @@
             cp -f "${daisyui-bundle}" vendor/daisyui.mjs
             cp -f "${daisyui-theme-bundle}" vendor/daisyui-theme.mjs
 
-            viewer_bin="target/dx/snitch-viewer/release/web/snitch-viewer"
-            viewer_public_dir="target/dx/snitch-viewer/release/web/public"
-            if [ "''${SNITCH_REBUILD_VIEWER:-0}" = "1" ] || [ ! -x "$viewer_bin" ] || [ ! -f "$viewer_public_dir/index.html" ]; then
-              echo "Building snitch-viewer bundle..."
-              dx bundle --release --platform server --fullstack -p snitch-viewer
-            fi
-
-            echo "Building snitch..."
+            echo "Building snitch (frontend auto-bundled by build.rs)..."
             cargo build --release -p snitch
 
             if [ "''${EUID:-$(id -u)}" -ne 0 ]; then

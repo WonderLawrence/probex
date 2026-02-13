@@ -11,6 +11,10 @@ nix run github:XiangpengHao/snitch -- sleep 1
 
 Other package managers coming soon, contributions welcome!
 
+## What it looks like
+![](doc/screenshots/screenshot.png)
+
+
 #### Frame pointers
 
 `snitch` works best with frame pointers enabled.
@@ -24,10 +28,6 @@ rustflags = ["-C", "force-frame-pointers=yes"]
 ```
 
 C / C++ — compile with `-fno-omit-frame-pointer`.
-
-## What it looks like
-![](doc/screenshots/screenshot.png)
-
 
 ## Contributing
 
