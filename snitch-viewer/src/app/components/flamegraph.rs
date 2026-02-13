@@ -3,18 +3,48 @@ use dioxus::prelude::*;
 use crate::app::formatting::format_duration_short;
 use crate::server::EventFlamegraphResponse;
 
+#[derive(Clone, PartialEq)]
+pub struct FlamegraphCardSelection {
+    pub selected_event_type: Option<String>,
+    pub event_type_options: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct FlamegraphCardScope {
+    pub selected_pid: Option<u32>,
+    pub full_start_ns: u64,
+    pub view_start_ns: u64,
+    pub view_end_ns: u64,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct FlamegraphCardData {
+    pub flamegraph: Option<EventFlamegraphResponse>,
+    pub loading: bool,
+}
+
 #[component]
 pub fn EventFlamegraphCard(
-    selected_event_type: Option<String>,
-    event_type_options: Vec<String>,
-    selected_pid: Option<u32>,
-    full_start_ns: u64,
-    view_start_ns: u64,
-    view_end_ns: u64,
+    selection: FlamegraphCardSelection,
+    scope: FlamegraphCardScope,
+    data: FlamegraphCardData,
     on_select_event_type: EventHandler<Option<String>>,
-    flamegraph: Option<EventFlamegraphResponse>,
-    loading: bool,
 ) -> Element {
+    let FlamegraphCardSelection {
+        selected_event_type,
+        event_type_options,
+    } = selection;
+    let FlamegraphCardScope {
+        selected_pid,
+        full_start_ns,
+        view_start_ns,
+        view_end_ns,
+    } = scope;
+    let FlamegraphCardData {
+        flamegraph,
+        loading,
+    } = data;
+
     let event_type = selected_event_type.unwrap_or_default();
     let flamegraph_data = flamegraph.unwrap_or_default();
     let total = flamegraph_data.total_samples;

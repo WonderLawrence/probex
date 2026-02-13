@@ -1,4 +1,16 @@
-use crate::server::EventTypeCounts;
+use crate::server::{EventTypeCounts, TraceSummary};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewRange {
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+impl ViewRange {
+    pub fn new(start_ns: u64, end_ns: u64) -> Option<Self> {
+        (end_ns >= start_ns).then_some(Self { start_ns, end_ns })
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PidEventSummary {
@@ -46,6 +58,42 @@ pub fn build_pid_event_summary(counts: Option<&EventTypeCounts>) -> PidEventSumm
         munmap_enter,
         brk_enter,
     }
+}
+
+pub fn next_view_range(
+    current_range: Option<ViewRange>,
+    next_start_ns: u64,
+    next_end_ns: u64,
+) -> Option<ViewRange> {
+    let next_range = ViewRange::new(next_start_ns, next_end_ns)?;
+    (current_range != Some(next_range)).then_some(next_range)
+}
+
+pub fn build_flame_event_type_options(
+    summary: Option<&TraceSummary>,
+    selected_pid: Option<u32>,
+    pid_summary: &PidEventSummary,
+    selected_event_type: Option<&str>,
+) -> Vec<String> {
+    let mut options: Vec<String> = if selected_pid.is_some() && !pid_summary.breakdown.is_empty() {
+        pid_summary
+            .breakdown
+            .iter()
+            .map(|(event_type, _)| event_type.clone())
+            .collect()
+    } else {
+        summary.map(|s| s.event_types.clone()).unwrap_or_default()
+    };
+
+    if let Some(event_type) = selected_event_type
+        && !options.iter().any(|candidate| candidate == event_type)
+    {
+        options.push(event_type.to_string());
+    }
+
+    options.sort();
+    options.dedup();
+    options
 }
 
 fn lookup_count(counts: Option<&EventTypeCounts>, event_type: &str) -> usize {

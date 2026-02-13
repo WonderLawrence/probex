@@ -9,9 +9,14 @@ mod view_model;
 
 use std::collections::HashSet;
 
-use components::{ProcessTimeline, ViewerHeader};
+use components::{
+    ProcessTimeline, ProcessTimelineActions, ProcessTimelineData, ProcessTimelineRange,
+    ProcessTimelineSelection, ViewerHeader,
+};
 use dioxus::prelude::*;
-use view_model::build_pid_event_summary;
+use view_model::{
+    ViewRange, build_flame_event_type_options, build_pid_event_summary, next_view_range,
+};
 
 use crate::server::{
     EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
@@ -51,9 +56,7 @@ fn TraceViewer() -> Element {
 
     let mut error_msg = use_signal(|| Option::<String>::None);
 
-    let mut view_start_ns = use_signal(|| 0u64);
-    let mut view_end_ns = use_signal(|| 0u64);
-    let mut is_dragging_range = use_signal(|| false);
+    let mut view_range = use_signal(|| Option::<ViewRange>::None);
 
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
     let mut selected_pid = use_signal(|| Option::<u32>::None);
@@ -62,8 +65,9 @@ fn TraceViewer() -> Element {
     use_resource(move || async move {
         match get_summary().await {
             Ok(s) => {
-                view_start_ns.set(s.min_ts_ns);
-                view_end_ns.set(s.max_ts_ns);
+                if let Some(range) = ViewRange::new(s.min_ts_ns, s.max_ts_ns) {
+                    view_range.set(Some(range));
+                }
                 let mut default_event_types: HashSet<String> =
                     s.event_types.iter().cloned().collect();
                 if default_event_types.len() > 1 {
@@ -93,30 +97,34 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
-        let start = view_start_ns();
-        let end = view_end_ns();
-        if is_dragging_range() || (start == 0 && end == 0) {
+        let Some(range) = view_range() else {
             return;
-        }
+        };
 
-        match get_process_events(start, end, MAX_PROCESS_MARKERS_PER_PID).await {
+        match get_process_events(range.start_ns, range.end_ns, MAX_PROCESS_MARKERS_PER_PID).await {
             Ok(events) => process_events.set(Some(events)),
             Err(e) => log::error!("Process events error: {}", e),
         }
     });
 
     use_resource(move || async move {
-        let start = view_start_ns();
-        let end = view_end_ns();
+        let Some(range) = view_range() else {
+            return;
+        };
         let pid = selected_pid();
         let selected_event_type = selected_flame_event_type();
-        if is_dragging_range() || (start == 0 && end == 0) {
-            return;
-        }
 
         if let (Some(pid), Some(event_type)) = (pid, selected_event_type) {
             flamegraph_loading.set(true);
-            match get_event_flamegraph(start, end, Some(pid), event_type, MAX_FLAME_STACKS).await {
+            match get_event_flamegraph(
+                range.start_ns,
+                range.end_ns,
+                Some(pid),
+                event_type,
+                MAX_FLAME_STACKS,
+            )
+            .await
+            {
                 Ok(data) => event_flamegraph.set(Some(data)),
                 Err(e) => log::error!("Event flamegraph error: {}", e),
             }
@@ -128,19 +136,17 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
-        let start = view_start_ns();
-        let end = view_end_ns();
-        if is_dragging_range() || (start == 0 && end == 0) {
+        let Some(range) = view_range() else {
             return;
-        }
+        };
 
         if let Some(pid) = selected_pid() {
-            match get_pid_event_type_counts(pid, Some(start), Some(end)).await {
+            match get_pid_event_type_counts(pid, Some(range.start_ns), Some(range.end_ns)).await {
                 Ok(counts) => selected_pid_event_counts.set(Some(counts)),
                 Err(e) => log::error!("Selected PID event counts error: {}", e),
             }
         } else {
-            match get_event_type_counts(Some(start), Some(end)).await {
+            match get_event_type_counts(Some(range.start_ns), Some(range.end_ns)).await {
                 Ok(counts) => selected_pid_event_counts.set(Some(counts)),
                 Err(e) => log::error!("Event counts error: {}", e),
             }
@@ -148,13 +154,11 @@ fn TraceViewer() -> Element {
     });
 
     use_resource(move || async move {
-        let start = view_start_ns();
-        let end = view_end_ns();
-        if is_dragging_range() || (start == 0 && end == 0) {
+        let Some(range) = view_range() else {
             return;
-        }
+        };
 
-        match get_syscall_latency_stats(start, end, selected_pid()).await {
+        match get_syscall_latency_stats(range.start_ns, range.end_ns, selected_pid()).await {
             Ok(stats) => syscall_latency_stats.set(Some(stats)),
             Err(e) => log::error!("Syscall latency stats error: {}", e),
         }
@@ -170,30 +174,12 @@ fn TraceViewer() -> Element {
 
     let full_start = summary_data.as_ref().map(|s| s.min_ts_ns).unwrap_or(0);
     let full_end = summary_data.as_ref().map(|s| s.max_ts_ns).unwrap_or(0);
-    let full_duration = full_end.saturating_sub(full_start);
-
-    let mut flame_event_type_options: Vec<String> =
-        if selected_pid_value.is_some() && !pid_summary.breakdown.is_empty() {
-            pid_summary
-                .breakdown
-                .iter()
-                .map(|(event_type, _)| event_type.clone())
-                .collect()
-        } else {
-            summary_data
-                .as_ref()
-                .map(|summary| summary.event_types.clone())
-                .unwrap_or_default()
-        };
-    if let Some(selected_event_type) = &selected_flame_event_type_value
-        && !flame_event_type_options
-            .iter()
-            .any(|event_type| event_type == selected_event_type)
-    {
-        flame_event_type_options.push(selected_event_type.clone());
-    }
-    flame_event_type_options.sort();
-    flame_event_type_options.dedup();
+    let flame_event_type_options = build_flame_event_type_options(
+        summary_data.as_ref(),
+        selected_pid_value,
+        &pid_summary,
+        selected_flame_event_type_value.as_deref(),
+    );
 
     rsx! {
         ViewerHeader { summary: summary_data.clone() }
@@ -203,69 +189,67 @@ fn TraceViewer() -> Element {
                 div { class: "bg-red-50 border border-red-200 text-red-700 px-3 py-2 rounded-lg text-xs", "{err}" }
             }
 
-            if let (Some(summary), Some(lifetimes)) = (summary_data.clone(), process_lifetimes()) {
+            if let (Some(summary), Some(lifetimes), Some(range)) =
+                (summary_data.clone(), process_lifetimes(), view_range())
+            {
                 ProcessTimeline {
-                    processes: lifetimes.processes,
-                    process_events: process_events(),
-                    enabled_event_types: enabled_event_types(),
-                    selected_pid: selected_pid_value,
-                    full_start_ns: summary.min_ts_ns,
-                    full_end_ns: summary.max_ts_ns,
-                    view_start_ns: view_start_ns(),
-                    view_end_ns: view_end_ns(),
-                    histogram: hist_data,
-                    // PID aggregation data
-                    summary: summary_data.clone(),
-                    pid_summary: pid_summary.clone(),
-                    latency_stats: syscall_latency_stats(),
-                    selected_flame_event_type: selected_flame_event_type_value.clone(),
-                    flame_event_type_options,
-                    flamegraph: event_flamegraph(),
-                    flamegraph_loading: flamegraph_loading(),
-                    // Event handlers
-                    on_select_pid: move |pid: u32| {
-                        let next_pid = if selected_pid() == Some(pid) {
-                            None
-                        } else {
-                            Some(pid)
-                        };
-                        selected_pid.set(next_pid);
+                    data: ProcessTimelineData {
+                        processes: lifetimes.processes,
+                        process_events: process_events(),
+                        histogram: hist_data,
+                        summary: summary_data.clone(),
+                        pid_summary: pid_summary.clone(),
+                        latency_stats: syscall_latency_stats(),
+                        selected_flame_event_type: selected_flame_event_type_value.clone(),
+                        flame_event_type_options,
+                        flamegraph: event_flamegraph(),
+                        flamegraph_loading: flamegraph_loading(),
                     },
-                    on_select_pid_option: move |pid: Option<u32>| {
-                        selected_pid.set(pid);
+                    selection: ProcessTimelineSelection {
+                        enabled_event_types: enabled_event_types(),
+                        selected_pid: selected_pid_value,
                     },
-                    on_focus_process: move |(pid, start, end): (u32, u64, u64)| {
-                        selected_pid.set(Some(pid));
-                        view_start_ns.set(start);
-                        view_end_ns.set(end);
+                    range: ProcessTimelineRange {
+                        full_start_ns: summary.min_ts_ns,
+                        full_end_ns: summary.max_ts_ns,
+                        view_start_ns: range.start_ns,
+                        view_end_ns: range.end_ns,
                     },
-                    on_change_range: move |(start, end, commit): (u64, u64, bool)| {
-                        let drag_step_ns = (full_duration / 2000).max(1);
-                        if !commit {
-                            let start_delta = start.abs_diff(view_start_ns());
-                            let end_delta = end.abs_diff(view_end_ns());
-                            if start_delta < drag_step_ns && end_delta < drag_step_ns {
-                                return;
+                    actions: ProcessTimelineActions {
+                        on_select_pid: move |pid: u32| {
+                            let next_pid = if selected_pid() == Some(pid) {
+                                None
+                            } else {
+                                Some(pid)
+                            };
+                            selected_pid.set(next_pid);
+                        },
+                        on_select_pid_option: move |pid: Option<u32>| {
+                            selected_pid.set(pid);
+                        },
+                        on_focus_process: move |(pid, start, end): (u32, u64, u64)| {
+                            selected_pid.set(Some(pid));
+                            if let Some(next_range) = next_view_range(view_range(), start, end) {
+                                view_range.set(Some(next_range));
                             }
-                            is_dragging_range.set(true);
-                        } else {
-                            is_dragging_range.set(false);
-                        }
-
-                        view_start_ns.set(start);
-                        view_end_ns.set(end);
-                    },
-                    on_toggle_event_type: move |event_type: String| {
-                        let mut types = enabled_event_types();
-                        if types.contains(&event_type) {
-                            types.remove(&event_type);
-                        } else {
-                            types.insert(event_type);
-                        }
-                        enabled_event_types.set(types);
-                    },
-                    on_select_flame_event_type: move |event_type: Option<String>| {
-                        selected_flame_event_type.set(event_type);
+                        },
+                        on_change_range: move |(start, end): (u64, u64)| {
+                            if let Some(next_range) = next_view_range(view_range(), start, end) {
+                                view_range.set(Some(next_range));
+                            }
+                        },
+                        on_toggle_event_type: move |event_type: String| {
+                            let mut types = enabled_event_types();
+                            if types.contains(&event_type) {
+                                types.remove(&event_type);
+                            } else {
+                                types.insert(event_type);
+                            }
+                            enabled_event_types.set(types);
+                        },
+                        on_select_flame_event_type: move |event_type: Option<String>| {
+                            selected_flame_event_type.set(event_type);
+                        },
                     },
                 }
             }

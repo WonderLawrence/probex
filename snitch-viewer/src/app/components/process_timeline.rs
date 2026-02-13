@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet};
 
 use dioxus::prelude::*;
 
-use super::flamegraph::EventFlamegraphCard;
+use super::flamegraph::{
+    EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
+};
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
     get_event_marker_color,
@@ -13,122 +15,81 @@ use crate::server::{
     SyscallLatencyStats, TraceSummary,
 };
 
+#[derive(Clone, PartialEq)]
+pub struct ProcessTimelineData {
+    pub processes: Vec<ProcessLifetime>,
+    pub process_events: Option<ProcessEventsResponse>,
+    pub histogram: Option<HistogramResponse>,
+    pub summary: Option<TraceSummary>,
+    pub pid_summary: PidEventSummary,
+    pub latency_stats: Option<SyscallLatencyStats>,
+    pub selected_flame_event_type: Option<String>,
+    pub flame_event_type_options: Vec<String>,
+    pub flamegraph: Option<EventFlamegraphResponse>,
+    pub flamegraph_loading: bool,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ProcessTimelineSelection {
+    pub enabled_event_types: HashSet<String>,
+    pub selected_pid: Option<u32>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct ProcessTimelineRange {
+    pub full_start_ns: u64,
+    pub full_end_ns: u64,
+    pub view_start_ns: u64,
+    pub view_end_ns: u64,
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ProcessTimelineActions {
+    pub on_select_pid: EventHandler<u32>,
+    pub on_select_pid_option: EventHandler<Option<u32>>,
+    pub on_focus_process: EventHandler<(u32, u64, u64)>,
+    pub on_change_range: EventHandler<(u64, u64)>,
+    pub on_toggle_event_type: EventHandler<String>,
+    pub on_select_flame_event_type: EventHandler<Option<String>>,
+}
+
 #[component]
 pub fn ProcessTimeline(
-    processes: Vec<ProcessLifetime>,
-    process_events: Option<ProcessEventsResponse>,
-    enabled_event_types: HashSet<String>,
-    selected_pid: Option<u32>,
-    full_start_ns: u64,
-    full_end_ns: u64,
-    view_start_ns: u64,
-    view_end_ns: u64,
-    histogram: Option<HistogramResponse>,
-    // PID aggregation data
-    summary: Option<TraceSummary>,
-    pid_summary: PidEventSummary,
-    latency_stats: Option<SyscallLatencyStats>,
-    selected_flame_event_type: Option<String>,
-    flame_event_type_options: Vec<String>,
-    flamegraph: Option<EventFlamegraphResponse>,
-    flamegraph_loading: bool,
-    // Event handlers
-    on_select_pid: EventHandler<u32>,
-    on_select_pid_option: EventHandler<Option<u32>>,
-    on_focus_process: EventHandler<(u32, u64, u64)>,
-    on_change_range: EventHandler<(u64, u64, bool)>,
-    on_toggle_event_type: EventHandler<String>,
-    on_select_flame_event_type: EventHandler<Option<String>>,
+    data: ProcessTimelineData,
+    selection: ProcessTimelineSelection,
+    range: ProcessTimelineRange,
+    actions: ProcessTimelineActions,
 ) -> Element {
     let mut collapsed_nodes = use_signal(HashSet::<u32>::new);
     let process_bar_drag_state = use_signal(|| Option::<ProcessBarDragState>::None);
     let process_bar_drag_preview = use_signal(|| Option::<ProcessBarDragPreview>::None);
     let process_bar_width_px = use_signal(|| 0.0f64);
 
-    let full_duration_ns = full_end_ns.saturating_sub(full_start_ns);
+    let full_duration_ns = range.full_end_ns.saturating_sub(range.full_start_ns);
     let full_duration = full_duration_ns as f64;
-    let view_duration_ns = view_end_ns.saturating_sub(view_start_ns);
-    if full_duration == 0.0 || processes.is_empty() {
+    let view_duration_ns = range.view_end_ns.saturating_sub(range.view_start_ns);
+    if full_duration == 0.0 || data.processes.is_empty() {
         return rsx! {};
     }
 
-    let mut sorted_processes = processes.clone();
-    sorted_processes.sort_by_key(|p| p.start_ns);
-
-    let process_by_pid: HashMap<u32, &ProcessLifetime> =
-        sorted_processes.iter().map(|p| (p.pid, p)).collect();
-
-    let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut root_pids: Vec<u32> = Vec::new();
-
-    for proc in &sorted_processes {
-        if let Some(parent_pid) = proc.parent_pid {
-            if process_by_pid.contains_key(&parent_pid) {
-                children_map.entry(parent_pid).or_default().push(proc.pid);
-            } else {
-                root_pids.push(proc.pid);
-            }
-        } else {
-            root_pids.push(proc.pid);
-        }
-    }
-
-    for children in children_map.values_mut() {
-        children.sort_by_key(|pid| process_by_pid.get(pid).map(|p| p.start_ns).unwrap_or(0));
-    }
-    root_pids.sort_by_key(|pid| process_by_pid.get(pid).map(|p| p.start_ns).unwrap_or(0));
-
     let collapsed_set = collapsed_nodes();
-    let mut ordered_pid_rows: Vec<(u32, TreePosition)> = Vec::with_capacity(sorted_processes.len());
-    let root_count = root_pids.len();
-    for (i, root_pid) in root_pids.iter().enumerate() {
-        let is_last_root = i == root_count - 1;
-        append_visible_rows(
-            *root_pid,
-            0,
-            &children_map,
-            &collapsed_set,
-            Vec::new(),
-            is_last_root,
-            &mut ordered_pid_rows,
-        );
+    let tree = build_process_tree(&data.processes, &collapsed_set, range);
+    if tree.visible_process_rows.is_empty() {
+        return rsx! {};
     }
 
-    let all_process_rows: Vec<(&ProcessLifetime, TreePosition)> = ordered_pid_rows
-        .iter()
-        .filter_map(|(pid, tree_pos)| {
-            process_by_pid
-                .get(pid)
-                .map(|proc| (*proc, tree_pos.clone()))
-        })
-        .collect();
-
-    let visible_in_range_count = sorted_processes
-        .iter()
-        .filter(|p| {
-            let p_end = p.end_ns.unwrap_or(full_end_ns);
-            p.start_ns <= view_end_ns && p_end >= view_start_ns
-        })
-        .count();
-
-    let visible_process_rows = all_process_rows.clone();
-    let collapsible_nodes: Vec<u32> = children_map
-        .iter()
-        .filter_map(|(pid, children)| (!children.is_empty()).then_some(*pid))
-        .collect();
-    let has_collapsible_nodes = !collapsible_nodes.is_empty();
-    let all_tree_expanded = collapsible_nodes
+    let has_collapsible_nodes = !tree.collapsible_nodes.is_empty();
+    let all_tree_expanded = tree
+        .collapsible_nodes
         .iter()
         .all(|pid| !collapsed_set.contains(pid));
-    let all_tree_collapsed = collapsible_nodes
+    let all_tree_collapsed = tree
+        .collapsible_nodes
         .iter()
         .all(|pid| collapsed_set.contains(pid));
 
-    if visible_process_rows.is_empty() {
-        return rsx! {};
-    }
-
-    let (events_map, cpu_sample_counts_map, cpu_sample_bucket_count) = process_events
+    let (events_map, cpu_sample_counts_map, cpu_sample_bucket_count) = data
+        .process_events
         .as_ref()
         .map(|pe| {
             (
@@ -138,19 +99,28 @@ pub fn ProcessTimeline(
             )
         })
         .unwrap_or_else(|| (HashMap::new(), HashMap::new(), 0));
-    let sample_frequency_hz = summary.as_ref().and_then(|s| s.cpu_sample_frequency_hz);
-    let stats = latency_stats.unwrap_or_default();
+    let sample_frequency_hz = data
+        .summary
+        .as_ref()
+        .and_then(|s| s.cpu_sample_frequency_hz);
+    let stats = data.latency_stats.clone().unwrap_or_default();
     let has_read_stats = stats.read.count > 0;
     let has_write_stats = stats.write.count > 0;
     let has_mem_stats = stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0;
     let active_process_bar_drag_preview = process_bar_drag_preview();
+    let on_select_pid = actions.on_select_pid;
+    let on_select_pid_option = actions.on_select_pid_option;
+    let on_focus_process = actions.on_focus_process;
+    let on_change_range = actions.on_change_range;
+    let on_toggle_event_type = actions.on_toggle_event_type;
+    let on_select_flame_event_type = actions.on_select_flame_event_type;
 
     rsx! {
         div { class: "bg-white border border-gray-200 rounded-lg p-2.5",
             div { class: "flex items-center justify-between mb-1.5",
                 span { class: "text-sm font-medium text-gray-700", "Process Lifetimes" }
                 div { class: "flex items-center gap-3",
-                    span { class: "text-xs text-gray-400", "{visible_in_range_count} in view · {sorted_processes.len()} total" }
+                    span { class: "text-xs text-gray-400", "{tree.visible_in_range_count} in view · {tree.sorted_processes.len()} total" }
                     if has_collapsible_nodes {
                         button {
                             class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
@@ -162,7 +132,7 @@ pub fn ProcessTimeline(
                             class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
                             disabled: all_tree_collapsed,
                             onclick: {
-                                let collapse_targets = collapsible_nodes.clone();
+                                let collapse_targets = tree.collapsible_nodes.clone();
                                 move |_| {
                                     let mut all_collapsed = HashSet::new();
                                     for pid in &collapse_targets {
@@ -183,12 +153,16 @@ pub fn ProcessTimeline(
                     span { "{format_duration(full_duration_ns)}" }
                 }
                 TimelineOverview {
-                    histogram,
-                    full_start_ns,
-                    full_end_ns,
-                    view_start_ns,
-                    view_end_ns,
-                    enabled_types: enabled_event_types.clone(),
+                    data: TimelineOverviewData {
+                        histogram: data.histogram.clone(),
+                        enabled_types: selection.enabled_event_types.clone(),
+                    },
+                    range: TimelineOverviewRange {
+                        full_start_ns: range.full_start_ns,
+                        full_end_ns: range.full_end_ns,
+                        view_start_ns: range.view_start_ns,
+                        view_end_ns: range.view_end_ns,
+                    },
                     on_change_range,
                 }
             }
@@ -200,13 +174,13 @@ pub fn ProcessTimeline(
                     span { class: "text-xs text-gray-500", "PID" }
                     select {
                         class: "px-1.5 py-0.5 border border-gray-200 rounded text-xs bg-white min-w-[70px]",
-                        value: selected_pid.map(|p| p.to_string()).unwrap_or_default(),
+                        value: selection.selected_pid.map(|p| p.to_string()).unwrap_or_default(),
                         onchange: move |evt| {
                             on_select_pid_option.call(evt.value().parse::<u32>().ok());
                         },
                         option { value: "", "All" }
                         {
-                            summary
+                            data.summary
                                 .as_ref()
                                 .map(|s| {
                                     s.unique_pids.iter().map(|pid| rsx! {
@@ -218,10 +192,10 @@ pub fn ProcessTimeline(
                         }
                     }
                     {
-                        let ev_count = if selected_pid.is_some() {
-                            pid_summary.total
+                        let ev_count = if selection.selected_pid.is_some() {
+                            data.pid_summary.total
                         } else {
-                            summary.as_ref().map(|s| s.total_events).unwrap_or(0)
+                            data.summary.as_ref().map(|s| s.total_events).unwrap_or(0)
                         };
                         rsx! { span { class: "text-xs text-gray-400", "{ev_count} ev" } }
                     }
@@ -231,9 +205,9 @@ pub fn ProcessTimeline(
 
                 // Time range display
                 div { class: "text-xs text-gray-600 shrink-0",
-                    span { class: "font-mono", "{format_duration(view_start_ns - full_start_ns)}" }
+                    span { class: "font-mono", "{format_duration(range.view_start_ns - range.full_start_ns)}" }
                     span { class: "text-gray-400 mx-1", "→" }
-                    span { class: "font-mono", "{format_duration(view_end_ns - full_start_ns)}" }
+                    span { class: "font-mono", "{format_duration(range.view_end_ns - range.full_start_ns)}" }
                     span { class: "text-gray-400 ml-1", "({format_duration(view_duration_ns)})" }
                 }
 
@@ -241,23 +215,35 @@ pub fn ProcessTimeline(
                 div { class: "flex items-center gap-0.5 ml-auto shrink-0",
                     button {
                         class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
-                        disabled: view_start_ns <= full_start_ns,
+                        disabled: range.view_start_ns <= range.full_start_ns,
                         onclick: move |_| {
-                            let shift = view_duration_ns / 4;
-                            let new_start = view_start_ns.saturating_sub(shift).max(full_start_ns);
-                            let new_end = (new_start + view_duration_ns).min(full_end_ns);
-                            on_change_range.call((new_start, new_end, true));
+                            let shift_ns = view_duration_ns / 4;
+                            let (new_start, new_end) = shift_window(
+                                range.full_start_ns,
+                                range.full_end_ns,
+                                range.view_start_ns,
+                                range.view_end_ns,
+                                shift_ns,
+                                true,
+                            );
+                            on_change_range.call((new_start, new_end));
                         },
                         "◀"
                     }
                     button {
                         class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
-                        disabled: view_end_ns >= full_end_ns,
+                        disabled: range.view_end_ns >= range.full_end_ns,
                         onclick: move |_| {
-                            let shift = view_duration_ns / 4;
-                            let new_end = (view_end_ns + shift).min(full_end_ns);
-                            let new_start = new_end.saturating_sub(view_duration_ns).max(full_start_ns);
-                            on_change_range.call((new_start, new_end, true));
+                            let shift_ns = view_duration_ns / 4;
+                            let (new_start, new_end) = shift_window(
+                                range.full_start_ns,
+                                range.full_end_ns,
+                                range.view_start_ns,
+                                range.view_end_ns,
+                                shift_ns,
+                                false,
+                            );
+                            on_change_range.call((new_start, new_end));
                         },
                         "▶"
                     }
@@ -265,11 +251,15 @@ pub fn ProcessTimeline(
                         class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_duration_ns < 1000,
                         onclick: move |_| {
-                            let center = view_start_ns + view_duration_ns / 2;
-                            let new_duration = view_duration_ns / 2;
-                            let new_start = center.saturating_sub(new_duration / 2).max(full_start_ns);
-                            let new_end = (new_start + new_duration).min(full_end_ns);
-                            on_change_range.call((new_start, new_end, true));
+                            let new_duration_ns = view_duration_ns / 2;
+                            let (new_start, new_end) = zoom_window_to_duration(
+                                range.full_start_ns,
+                                range.full_end_ns,
+                                range.view_start_ns,
+                                range.view_end_ns,
+                                new_duration_ns,
+                            );
+                            on_change_range.call((new_start, new_end));
                         },
                         "+"
                     }
@@ -277,18 +267,23 @@ pub fn ProcessTimeline(
                         class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded disabled:opacity-40",
                         disabled: view_duration_ns >= full_duration_ns,
                         onclick: move |_| {
-                            let center = view_start_ns + view_duration_ns / 2;
-                            let new_duration = (view_duration_ns * 2).min(full_duration_ns);
-                            let new_start = center.saturating_sub(new_duration / 2).max(full_start_ns);
-                            let new_end = (new_start + new_duration).min(full_end_ns);
-                            let new_start = new_end.saturating_sub(new_duration).max(full_start_ns);
-                            on_change_range.call((new_start, new_end, true));
+                            let new_duration_ns = (view_duration_ns * 2).min(full_duration_ns);
+                            let (new_start, new_end) = zoom_window_to_duration(
+                                range.full_start_ns,
+                                range.full_end_ns,
+                                range.view_start_ns,
+                                range.view_end_ns,
+                                new_duration_ns,
+                            );
+                            on_change_range.call((new_start, new_end));
                         },
                         "−"
                     }
                     button {
                         class: "px-1.5 py-0.5 text-xs bg-gray-100 hover:bg-gray-200 rounded",
-                        onclick: move |_| on_change_range.call((full_start_ns, full_end_ns, true)),
+                        onclick: move |_| {
+                            on_change_range.call((range.full_start_ns, range.full_end_ns))
+                        },
                         "Reset"
                     }
                 }
@@ -296,9 +291,9 @@ pub fn ProcessTimeline(
 
             // Event type badges row (always rendered to avoid layout flicker)
             div { class: "flex flex-wrap items-center gap-1 mb-1.5 min-h-[1.5rem]",
-                if !pid_summary.breakdown.is_empty() {
-                    {pid_summary.breakdown.iter().map(|(event_type, count)| {
-                        let enabled = enabled_event_types.contains(event_type);
+                if !data.pid_summary.breakdown.is_empty() {
+                    {data.pid_summary.breakdown.iter().map(|(event_type, count)| {
+                        let enabled = selection.enabled_event_types.contains(event_type);
                         let event_type_clone = event_type.clone();
                         let badge_class = event_badge_class(enabled, event_type);
                         rsx! {
@@ -353,25 +348,25 @@ pub fn ProcessTimeline(
             div { class: "flex items-center mb-1",
                 div { class: "w-56 shrink-0" }
                 div { class: "flex-1 flex justify-between text-xs text-gray-400",
-                    span { "{format_duration(view_start_ns - full_start_ns)}" }
-                    span { "{format_duration(view_end_ns - full_start_ns)}" }
+                    span { "{format_duration(range.view_start_ns - range.full_start_ns)}" }
+                    span { "{format_duration(range.view_end_ns - range.full_start_ns)}" }
                 }
                 div { class: "w-20 shrink-0" }
             }
 
-            div { class: if all_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
-                {visible_process_rows.iter().map(|(proc, tree_pos)| {
+            div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto" } else { "space-y-0.5" },
+                {tree.visible_process_rows.iter().map(|(proc, tree_pos)| {
                     let depth = tree_pos.ancestor_is_last.len();
 
-                    let view_duration_ns = view_end_ns.saturating_sub(view_start_ns).max(1);
+                    let view_duration_ns = range.view_end_ns.saturating_sub(range.view_start_ns).max(1);
                     let view_duration = view_duration_ns as f64;
-                    let bar_start = proc.start_ns.max(view_start_ns);
-                    let bar_end = proc.end_ns.unwrap_or(full_end_ns).min(view_end_ns);
+                    let bar_start = proc.start_ns.max(range.view_start_ns);
+                    let bar_end = proc.end_ns.unwrap_or(range.full_end_ns).min(range.view_end_ns);
                     let in_view = bar_start < bar_end;
                     let visible_duration_ns = if in_view { bar_end - bar_start } else { 0 };
 
                     let left_pct = if in_view {
-                        ((bar_start - view_start_ns) as f64 / view_duration * 100.0)
+                        ((bar_start - range.view_start_ns) as f64 / view_duration * 100.0)
                             .clamp(0.0, 100.0)
                     } else {
                         0.0
@@ -399,18 +394,18 @@ pub fn ProcessTimeline(
                     let collapsed_count = tree_pos.descendant_count;
                     let pid = proc.pid;
                     let process_name = proc.process_name.as_deref().unwrap_or("unknown");
-                    let is_selected = selected_pid == Some(proc.pid);
+                    let is_selected = selection.selected_pid == Some(proc.pid);
                     let process_label_class = if is_selected {
                         "cursor-pointer overflow-hidden bg-blue-50 border border-blue-200 rounded px-1 py-0.5 min-w-0"
                     } else {
                         "cursor-pointer hover:bg-gray-50 overflow-hidden px-1 py-0.5 min-w-0"
                     };
                     let process_start_ns = proc.start_ns;
-                    let process_end_ns = proc.end_ns.unwrap_or(full_end_ns);
+                    let process_end_ns = proc.end_ns.unwrap_or(range.full_end_ns);
                     let focus_end_ns = if process_end_ns > process_start_ns {
                         process_end_ns
                     } else {
-                        (process_start_ns + 1).min(full_end_ns)
+                        (process_start_ns + 1).min(range.full_end_ns)
                     };
                     let event_markers: Vec<CanvasEventMarker> = events_map
                         .get(&proc.pid)
@@ -418,12 +413,12 @@ pub fn ProcessTimeline(
                             events
                                 .iter()
                                 .filter(|e| {
-                                    enabled_event_types.contains(&e.event_type)
-                                        && e.ts_ns >= view_start_ns
-                                        && e.ts_ns <= view_end_ns
+                                    selection.enabled_event_types.contains(&e.event_type)
+                                        && e.ts_ns >= range.view_start_ns
+                                        && e.ts_ns <= range.view_end_ns
                                 })
                                 .map(|event| {
-                                    let pct = ((event.ts_ns - view_start_ns) as f64 / view_duration
+                                    let pct = ((event.ts_ns - range.view_start_ns) as f64 / view_duration
                                         * 100.0)
                                         .clamp(0.0, 100.0);
                                     CanvasEventMarker {
@@ -446,8 +441,8 @@ pub fn ProcessTimeline(
                         })
                         .unwrap_or_default();
                     let fork_pct = if proc.was_forked
-                        && proc.start_ns >= view_start_ns
-                        && proc.start_ns <= view_end_ns
+                        && proc.start_ns >= range.view_start_ns
+                        && proc.start_ns <= range.view_end_ns
                     {
                         Some(left_pct)
                     } else {
@@ -455,9 +450,10 @@ pub fn ProcessTimeline(
                     };
                     let exit_marker = if proc.did_exit {
                         if let Some(end) = proc.end_ns {
-                            if end >= view_start_ns && end <= view_end_ns {
+                            if end >= range.view_start_ns && end <= range.view_end_ns {
                                 let exit_pct =
-                                    ((end - view_start_ns) as f64 / view_duration * 100.0).max(0.0);
+                                    ((end - range.view_start_ns) as f64 / view_duration * 100.0)
+                                        .max(0.0);
                                 Some((exit_pct, proc.exit_code == Some(0)))
                             } else {
                                 None
@@ -471,10 +467,10 @@ pub fn ProcessTimeline(
                     // Build tree line prefixes
                     let tree_pos_clone = tree_pos.clone();
                     let row_is_selected = is_selected;
-                    let flame_event_type_options_for_row = flame_event_type_options.clone();
-                    let selected_flame_event_type_for_row = selected_flame_event_type.clone();
-                    let flamegraph_for_row = flamegraph.clone();
-                    let flamegraph_loading_for_row = flamegraph_loading;
+                    let flame_event_type_options_for_row = data.flame_event_type_options.clone();
+                    let selected_flame_event_type_for_row = data.selected_flame_event_type.clone();
+                    let flamegraph_for_row = data.flamegraph.clone();
+                    let flamegraph_loading_for_row = data.flamegraph_loading;
 
                     rsx! {
                         div {
@@ -692,17 +688,23 @@ pub fn ProcessTimeline(
                             if row_is_selected {
                                 div { class: "ml-56 pl-2",
                                     EventFlamegraphCard {
-                                        selected_event_type: selected_flame_event_type_for_row,
-                                        event_type_options: flame_event_type_options_for_row,
-                                        selected_pid: Some(proc.pid),
-                                        full_start_ns,
-                                        view_start_ns,
-                                        view_end_ns,
+                                        selection: FlamegraphCardSelection {
+                                            selected_event_type: selected_flame_event_type_for_row,
+                                            event_type_options: flame_event_type_options_for_row,
+                                        },
+                                        scope: FlamegraphCardScope {
+                                            selected_pid: Some(proc.pid),
+                                            full_start_ns: range.full_start_ns,
+                                            view_start_ns: range.view_start_ns,
+                                            view_end_ns: range.view_end_ns,
+                                        },
+                                        data: FlamegraphCardData {
+                                            flamegraph: flamegraph_for_row,
+                                            loading: flamegraph_loading_for_row,
+                                        },
                                         on_select_event_type: move |event_type| {
                                             on_select_flame_event_type.call(event_type);
                                         },
-                                        flamegraph: flamegraph_for_row,
-                                        loading: flamegraph_loading_for_row,
                                     }
                                 }
                             }
@@ -725,8 +727,8 @@ pub fn ProcessTimeline(
                             if let Some(preview) = build_process_bar_drag_preview(
                                 drag_state,
                                 evt.page_coordinates().x,
-                                view_start_ns,
-                                view_end_ns,
+                                range.view_start_ns,
+                                range.view_end_ns,
                             ) && process_bar_drag_preview() != Some(preview)
                             {
                                 process_bar_drag_preview.set(Some(preview));
@@ -739,7 +741,7 @@ pub fn ProcessTimeline(
                         move |_| {
                             if let Some(preview) = process_bar_drag_preview() {
                                 on_select_pid_option.call(Some(preview.pid));
-                                on_change_range.call((preview.start_ns, preview.end_ns, true));
+                                on_change_range.call((preview.start_ns, preview.end_ns));
                             }
                             process_bar_drag_state.set(None);
                             process_bar_drag_preview.set(None);
@@ -792,16 +794,37 @@ struct ProcessBarDragPreview {
     end_ns: u64,
 }
 
-#[component]
-fn TimelineOverview(
+#[derive(Clone, PartialEq)]
+struct TimelineOverviewData {
     histogram: Option<HistogramResponse>,
+    enabled_types: HashSet<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TimelineOverviewRange {
     full_start_ns: u64,
     full_end_ns: u64,
     view_start_ns: u64,
     view_end_ns: u64,
-    enabled_types: HashSet<String>,
-    on_change_range: EventHandler<(u64, u64, bool)>,
+}
+
+#[component]
+fn TimelineOverview(
+    data: TimelineOverviewData,
+    range: TimelineOverviewRange,
+    on_change_range: EventHandler<(u64, u64)>,
 ) -> Element {
+    let TimelineOverviewData {
+        histogram,
+        enabled_types,
+    } = data;
+    let TimelineOverviewRange {
+        full_start_ns,
+        full_end_ns,
+        view_start_ns,
+        view_end_ns,
+    } = range;
+
     let full_range_ns = full_end_ns.saturating_sub(full_start_ns);
     let full_range = full_range_ns as f64;
     if full_range == 0.0 {
@@ -990,7 +1013,7 @@ fn TimelineOverview(
             onmouseup: move |_| {
                 if drag().is_some() {
                     if let Some((start, end)) = drag_preview_range() {
-                        on_change_range.call((start, end, true));
+                        on_change_range.call((start, end));
                     }
                     drag.set(None);
                     drag_preview_range.set(None);
@@ -1085,7 +1108,7 @@ fn TimelineOverview(
                     onmouseup: move |_| {
                         if drag().is_some() {
                             if let Some((start, end)) = drag_preview_range() {
-                                on_change_range.call((start, end, true));
+                                on_change_range.call((start, end));
                             }
                             drag.set(None);
                             drag_preview_range.set(None);
@@ -1178,6 +1201,66 @@ fn ProcessActivityCanvas(
     }
 }
 
+fn fit_window_to_bounds(
+    full_start_ns: u64,
+    full_end_ns: u64,
+    window_start_ns: u64,
+    window_duration_ns: u64,
+) -> (u64, u64) {
+    let full_duration_ns = full_end_ns.saturating_sub(full_start_ns);
+    if full_duration_ns == 0 {
+        return (full_start_ns, full_end_ns);
+    }
+
+    let duration_ns = window_duration_ns.max(1).min(full_duration_ns);
+    let max_start_ns = full_end_ns.saturating_sub(duration_ns);
+    let start_ns = window_start_ns.clamp(full_start_ns, max_start_ns);
+    (start_ns, start_ns + duration_ns)
+}
+
+fn shift_window(
+    full_start_ns: u64,
+    full_end_ns: u64,
+    view_start_ns: u64,
+    view_end_ns: u64,
+    shift_ns: u64,
+    shift_left: bool,
+) -> (u64, u64) {
+    let window_duration_ns = view_end_ns.saturating_sub(view_start_ns);
+    let shifted_start_ns = if shift_left {
+        view_start_ns.saturating_sub(shift_ns)
+    } else {
+        view_start_ns.saturating_add(shift_ns)
+    };
+
+    fit_window_to_bounds(
+        full_start_ns,
+        full_end_ns,
+        shifted_start_ns,
+        window_duration_ns,
+    )
+}
+
+fn zoom_window_to_duration(
+    full_start_ns: u64,
+    full_end_ns: u64,
+    view_start_ns: u64,
+    view_end_ns: u64,
+    new_duration_ns: u64,
+) -> (u64, u64) {
+    let current_duration_ns = view_end_ns.saturating_sub(view_start_ns);
+    let center_ns = view_start_ns.saturating_add(current_duration_ns / 2);
+    let target_duration_ns = new_duration_ns.max(1);
+    let centered_start_ns = center_ns.saturating_sub(target_duration_ns / 2);
+
+    fit_window_to_bounds(
+        full_start_ns,
+        full_end_ns,
+        centered_start_ns,
+        target_duration_ns,
+    )
+}
+
 fn build_overview_histogram_area_path(
     histogram: &HistogramResponse,
     enabled_types: &HashSet<String>,
@@ -1233,11 +1316,11 @@ fn build_process_bar_drag_preview(
     }
 
     let view_duration_ns = view_end_ns - view_start_ns;
-    let anchor_frac =
-        ((drag_state.anchor_page_x - drag_state.bar_left_page_x) / drag_state.bar_width_px)
-            .clamp(0.0, 1.0);
-    let current_frac = ((current_page_x - drag_state.bar_left_page_x) / drag_state.bar_width_px)
+    let anchor_frac = ((drag_state.anchor_page_x - drag_state.bar_left_page_x)
+        / drag_state.bar_width_px)
         .clamp(0.0, 1.0);
+    let current_frac =
+        ((current_page_x - drag_state.bar_left_page_x) / drag_state.bar_width_px).clamp(0.0, 1.0);
 
     let start_frac = anchor_frac.min(current_frac);
     let end_frac = anchor_frac.max(current_frac);
@@ -1380,6 +1463,88 @@ struct TreePosition {
     descendant_count: usize,
 }
 
+struct ProcessTreeModel {
+    sorted_processes: Vec<ProcessLifetime>,
+    visible_process_rows: Vec<(ProcessLifetime, TreePosition)>,
+    collapsible_nodes: Vec<u32>,
+    visible_in_range_count: usize,
+}
+
+fn build_process_tree(
+    processes: &[ProcessLifetime],
+    collapsed_nodes: &HashSet<u32>,
+    range: ProcessTimelineRange,
+) -> ProcessTreeModel {
+    let mut sorted_processes = processes.to_vec();
+    sorted_processes.sort_by_key(|p| p.start_ns);
+
+    let process_by_pid: HashMap<u32, &ProcessLifetime> =
+        sorted_processes.iter().map(|p| (p.pid, p)).collect();
+
+    let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut root_pids: Vec<u32> = Vec::new();
+
+    for proc in &sorted_processes {
+        if let Some(parent_pid) = proc.parent_pid {
+            if process_by_pid.contains_key(&parent_pid) {
+                children_map.entry(parent_pid).or_default().push(proc.pid);
+            } else {
+                root_pids.push(proc.pid);
+            }
+        } else {
+            root_pids.push(proc.pid);
+        }
+    }
+
+    for children in children_map.values_mut() {
+        children.sort_by_key(|pid| process_by_pid.get(pid).map(|p| p.start_ns).unwrap_or(0));
+    }
+    root_pids.sort_by_key(|pid| process_by_pid.get(pid).map(|p| p.start_ns).unwrap_or(0));
+
+    let mut ordered_pid_rows: Vec<(u32, TreePosition)> = Vec::with_capacity(sorted_processes.len());
+    let root_count = root_pids.len();
+    for (idx, root_pid) in root_pids.iter().enumerate() {
+        let is_last_root = idx == root_count - 1;
+        append_visible_rows(
+            *root_pid,
+            &children_map,
+            collapsed_nodes,
+            Vec::new(),
+            is_last_root,
+            &mut ordered_pid_rows,
+        );
+    }
+
+    let visible_process_rows = ordered_pid_rows
+        .iter()
+        .filter_map(|(pid, tree_pos)| {
+            process_by_pid
+                .get(pid)
+                .map(|proc| ((*proc).clone(), tree_pos.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    let visible_in_range_count = sorted_processes
+        .iter()
+        .filter(|proc| {
+            let process_end = proc.end_ns.unwrap_or(range.full_end_ns);
+            proc.start_ns <= range.view_end_ns && process_end >= range.view_start_ns
+        })
+        .count();
+
+    let collapsible_nodes = children_map
+        .iter()
+        .filter_map(|(pid, children)| (!children.is_empty()).then_some(*pid))
+        .collect();
+
+    ProcessTreeModel {
+        sorted_processes,
+        visible_process_rows,
+        collapsible_nodes,
+        visible_in_range_count,
+    }
+}
+
 fn count_descendants(pid: u32, children_map: &HashMap<u32, Vec<u32>>) -> usize {
     let mut count = 0;
     if let Some(children) = children_map.get(&pid) {
@@ -1393,7 +1558,6 @@ fn count_descendants(pid: u32, children_map: &HashMap<u32, Vec<u32>>) -> usize {
 
 fn append_visible_rows(
     pid: u32,
-    depth: usize,
     children_map: &HashMap<u32, Vec<u32>>,
     collapsed_nodes: &HashSet<u32>,
     ancestor_is_last: Vec<bool>,
@@ -1431,7 +1595,6 @@ fn append_visible_rows(
             child_ancestor_is_last.push(is_last_child);
             append_visible_rows(
                 *child,
-                depth + 1,
                 children_map,
                 collapsed_nodes,
                 child_ancestor_is_last,
