@@ -14,6 +14,7 @@ dioxus = { workspace = true, features = [
     "web",
     "launch",
     "asset",
+    "mounted",
     "macro",
     "hooks",
     "signals",

@@ -93,6 +93,11 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .with_context(|| format!("failed to bind {bind_addr}"))?;
 
     axum::serve(listener, app.into_make_service())
+        .with_graceful_shutdown(async {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                log::info!("Received Ctrl-C, shutting down viewer server");
+            }
+        })
         .await
         .with_context(|| "viewer server exited unexpectedly")?;
 

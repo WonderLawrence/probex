@@ -174,12 +174,16 @@ struct Args {
     #[arg(long)]
     no_viewer: bool,
 
+    /// View an existing parquet trace file without tracing a new command
+    #[arg(long, value_name = "PARQUET")]
+    view: Option<String>,
+
     /// Perf-style CPU clock sampling frequency (Hz)
     #[arg(long, value_name = "HZ", default_value_t = 999)]
     sample_freq: u64,
 
     /// Command to run
-    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
 }
 
@@ -1334,8 +1338,22 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    if let Some(parquet_file) = args.view.as_deref() {
+        if args.no_viewer {
+            warn!("Ignoring --no-viewer in --view mode");
+        }
+        if !args.command.is_empty() {
+            return Err(anyhow!(
+                "--view cannot be combined with a command; use one mode at a time"
+            ));
+        }
+        return viewer_server::launch(parquet_file, args.port).await;
+    }
+
     if args.command.is_empty() {
-        return Err(anyhow!("No command specified"));
+        return Err(anyhow!(
+            "No command specified. Pass a command to trace, or use --view <trace.parquet>."
+        ));
     }
 
     // Bump the memlock rlimit

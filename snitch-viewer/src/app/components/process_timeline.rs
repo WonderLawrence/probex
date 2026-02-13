@@ -595,9 +595,9 @@ pub fn ProcessTimeline(
                                             if drag_state.pid != pid {
                                                 return;
                                             }
-                                            let moved_px =
-                                                (evt.page_coordinates().x - drag_state.anchor_page_x)
-                                                    .abs();
+                                            let moved_px = (evt.page_coordinates().x
+                                                - drag_state.anchor_page_x)
+                                                .abs();
                                             if moved_px < PROCESS_BAR_SELECTION_THRESHOLD_PX {
                                                 return;
                                             }
