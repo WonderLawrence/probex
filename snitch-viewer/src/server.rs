@@ -162,7 +162,7 @@ mod backend {
     use datafusion::prelude::*;
     use inferno::flamegraph;
     use parquet::file::reader::{FileReader, SerializedFileReader};
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::HashSet;
     use std::fs::File;
     use std::io::{Error as IoError, ErrorKind};
     use std::path::{Path, PathBuf};
