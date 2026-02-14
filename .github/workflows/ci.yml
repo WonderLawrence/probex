@@ -24,24 +24,24 @@ jobs:
       - name: Install nightly rust-src for eBPF build script
         run: rustup toolchain install nightly --component rust-src
 
-      - name: Install bpf-linker
-        run: cargo install --locked bpf-linker
-
-      - name: Install dx and wasm tooling
-        run: |
-          cargo install --locked dioxus-cli --version 0.7.3
-          cargo install --locked wasm-bindgen-cli
-
-      - name: Install wasm-opt (binaryen)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
-
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> ${{ env.CARGO_TARGET_DIR }}
+
+      - name: Install cargo-binstall
+        uses: taiki-e/install-action@cargo-binstall
+
+      - name: Install bpf-linker, dx, and wasm tooling
+        run: cargo binstall --no-confirm bpf-linker dioxus-cli@0.7.3 wasm-bindgen-cli
+
+      - name: Install wasm-opt (binaryen)
+        run: |
+          if ! command -v wasm-opt >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y binaryen
+          fi
 
       - name: Check formatting
         run: cargo fmt --all -- --check
