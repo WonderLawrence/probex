@@ -1,10 +1,24 @@
 use dioxus::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::api::{ProbeSchema, ProbeSchemaKind, get_probe_schema_detail, get_probe_schemas_page};
 
 const PAGE_SIZE: usize = 400;
 const DEFAULT_KIND_FILTERS: &[&str] = &["tracepoint", "fentry", "fexit"];
+
+#[derive(Clone, Default)]
+struct MockFilterRule {
+    field_key: String,
+    operator: String,
+    value: String,
+}
+
+#[derive(Clone, Default)]
+struct MockProbeConfig {
+    record_fields: Vec<String>,
+    record_stack_trace: bool,
+    filters: Vec<MockFilterRule>,
+}
 
 #[component]
 pub fn ProbeCatalog() -> Element {
@@ -17,6 +31,9 @@ pub fn ProbeCatalog() -> Element {
     });
 
     let mut selected_probes = use_signal(Vec::<String>::new);
+    let mut selected_probe_schemas = use_signal(HashMap::<String, ProbeSchema>::new);
+    let mut active_editor_probe = use_signal(|| Option::<String>::None);
+    let mut probe_configs = use_signal(HashMap::<String, MockProbeConfig>::new);
     let mut expanded_probes = use_signal(HashSet::<String>::new);
     let mut detail_loading = use_signal(HashSet::<String>::new);
 
@@ -98,8 +115,8 @@ pub fn ProbeCatalog() -> Element {
         details { class: "rounded border border-gray-200 bg-gray-50 px-2 py-1",
             summary { class: "cursor-pointer text-xs text-gray-700 select-none", "Probe Schemas" }
 
-            div { class: "mt-1 grid grid-cols-1 lg:grid-cols-3 gap-2",
-                div { class: "lg:col-span-2 rounded border border-gray-200 bg-white p-2 space-y-2",
+            div { class: "mt-1 grid grid-cols-1 lg:grid-cols-5 gap-2",
+                div { class: "lg:col-span-2 xl:col-span-2 rounded border border-gray-200 bg-white p-2 space-y-2",
                     div { class: "flex items-center justify-between gap-2 flex-wrap",
                         span { class: "text-xs font-medium text-gray-700", "All Probes" }
                         div { class: "flex items-center gap-2",
@@ -171,7 +188,7 @@ pub fn ProbeCatalog() -> Element {
                     }
 
                     div {
-                        class: "max-h-64 overflow-y-auto space-y-1 pr-1",
+                        class: "max-h-[70vh] overflow-y-auto space-y-1 pr-1",
                         onscroll: move |evt: Event<dioxus::html::ScrollData>| {
                             if !has_more_pages() || probes_loading() || page_request_in_flight() {
                                 return;
@@ -241,9 +258,14 @@ pub fn ProbeCatalog() -> Element {
                                                                         Ok(detail) => {
                                                                             let mut items = probes();
                                                                             if let Some(slot) = items.iter_mut().find(|p| p.display_name == detail_id) {
-                                                                                *slot = detail;
+                                                                                *slot = detail.clone();
                                                                             }
                                                                             probes.set(items);
+                                                                            let mut schemas = selected_probe_schemas();
+                                                                            if schemas.contains_key(&detail_id) {
+                                                                                schemas.insert(detail_id.clone(), detail.clone());
+                                                                                selected_probe_schemas.set(schemas);
+                                                                            }
                                                                         }
                                                                         Err(error) => probe_error.set(Some(error)),
                                                                     }
@@ -262,12 +284,28 @@ pub fn ProbeCatalog() -> Element {
                                                 },
                                                 onclick: {
                                                     let id = probe.display_name.clone();
+                                                    let probe_clone = probe.clone();
                                                     move |_| {
                                                         let mut selected = selected_probes();
                                                         if selected.iter().any(|item| item == &id) {
                                                             selected.retain(|item| item != &id);
+                                                            let mut schemas = selected_probe_schemas();
+                                                            schemas.remove(&id);
+                                                            selected_probe_schemas.set(schemas);
+                                                            let mut configs = probe_configs();
+                                                            configs.remove(&id);
+                                                            probe_configs.set(configs);
+                                                            if active_editor_probe().as_deref() == Some(id.as_str()) {
+                                                                active_editor_probe.set(None);
+                                                            }
                                                         } else {
                                                             selected.push(id.clone());
+                                                            let mut schemas = selected_probe_schemas();
+                                                            schemas.insert(id.clone(), probe_clone.clone());
+                                                            selected_probe_schemas.set(schemas);
+                                                            if active_editor_probe().is_none() {
+                                                                active_editor_probe.set(Some(id.clone()));
+                                                            }
                                                         }
                                                         selected_probes.set(selected);
                                                     }
@@ -325,37 +363,338 @@ pub fn ProbeCatalog() -> Element {
                     }
                 }
 
-                div { class: "rounded border border-gray-200 bg-white p-2 space-y-2",
+                div { class: "lg:col-span-3 xl:col-span-3 rounded border border-gray-200 bg-white p-2 space-y-2",
                     div { class: "flex items-center justify-between",
                         span { class: "text-xs font-medium text-gray-700", "Selected Probes" }
                         span { class: "text-[11px] text-gray-500", "{selected_probes_snapshot.len()}" }
                     }
                     if selected_probes_snapshot.is_empty() {
-                        div { class: "text-[11px] text-gray-500", "Click + Add on any probe to build a mock selection list." }
+                        div { class: "text-[11px] text-gray-500", "Click + Add on any probe, then click a selected probe to edit." }
                     } else {
-                        div { class: "max-h-64 overflow-y-auto space-y-1 pr-1",
-                            {selected_probes_snapshot.iter().map(|id| rsx! {
-                                div { key: "{id}", class: "flex items-center justify-between gap-2 rounded border border-gray-200 bg-gray-50 px-1.5 py-1",
-                                    span { class: "font-mono text-[10px] text-gray-700 truncate", "{id}" }
-                                    button {
-                                        class: "px-1.5 py-0.5 text-[10px] rounded border border-gray-200 bg-white text-gray-600 shrink-0",
-                                        onclick: {
-                                            let id = id.clone();
-                                            move |_| {
-                                                let mut selected = selected_probes();
-                                                selected.retain(|item| item != &id);
-                                                selected_probes.set(selected);
+                        div { class: "max-h-[40vh] overflow-y-auto space-y-1 pr-1",
+                            {selected_probes_snapshot.iter().map(|id| {
+                                let is_active = active_editor_probe().as_deref() == Some(id.as_str());
+                                let cfg = probe_configs().get(id).cloned().unwrap_or_default();
+                                let options = selected_probe_schemas()
+                                    .get(id)
+                                    .map(mock_filter_field_options)
+                                    .unwrap_or_default();
+                                rsx! {
+                                    div { key: "{id}", class: if is_active {
+                                        "flex items-center justify-between gap-2 rounded border border-indigo-300 bg-indigo-50 px-1.5 py-1"
+                                    } else {
+                                        "flex items-center justify-between gap-2 rounded border border-gray-200 bg-gray-50 px-1.5 py-1"
+                                    },
+                                        div { class: "min-w-0 flex-1 space-y-0.5",
+                                            button {
+                                                class: if is_active {
+                                                    "font-mono text-[10px] text-indigo-800 truncate text-left cursor-pointer"
+                                                } else {
+                                                    "font-mono text-[10px] text-gray-700 truncate text-left cursor-pointer"
+                                                },
+                                                onclick: {
+                                                    let id = id.clone();
+                                                    move |_| {
+                                                        active_editor_probe.set(Some(id.clone()));
+                                                        if let Some(found) = probes().iter().find(|p| p.display_name == id) {
+                                                            let mut schemas = selected_probe_schemas();
+                                                            schemas.insert(id.clone(), found.clone());
+                                                            selected_probe_schemas.set(schemas);
+                                                        }
+                                                        let needs_detail = selected_probe_schemas()
+                                                            .get(&id)
+                                                            .map(|p| p.kind == ProbeSchemaKind::Tracepoint && p.fields.is_empty())
+                                                            .unwrap_or(true);
+                                                        if needs_detail {
+                                                            let detail_id = id.clone();
+                                                            spawn(async move {
+                                                                match get_probe_schema_detail(detail_id.clone()).await {
+                                                                    Ok(detail) => {
+                                                                        let mut items = probes();
+                                                                        if let Some(slot) = items.iter_mut().find(|p| p.display_name == detail_id) {
+                                                                            *slot = detail.clone();
+                                                                        }
+                                                                        probes.set(items);
+                                                                        let mut schemas = selected_probe_schemas();
+                                                                        schemas.insert(detail_id, detail);
+                                                                        selected_probe_schemas.set(schemas);
+                                                                    }
+                                                                    Err(error) => probe_error.set(Some(error)),
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                },
+                                                "{id}"
                                             }
-                                        },
-                                        "Remove"
+                                            div { class: "flex items-center gap-1 flex-wrap",
+                                                if cfg.record_stack_trace {
+                                                    span { class: "px-1 py-0.5 rounded bg-slate-100 text-slate-700 text-[9px]", "stack" }
+                                                }
+                                                {cfg.record_fields.iter().map(|field_key| rsx! {
+                                                    span { key: "{id}:rec:{field_key}", class: "px-1 py-0.5 rounded bg-emerald-100 text-emerald-700 text-[9px] max-w-[12rem] truncate",
+                                                        "{field_key_display(&options, field_key)}"
+                                                    }
+                                                })}
+                                                {cfg.filters.iter().enumerate().map(|(idx, rule)| rsx! {
+                                                    span { key: "{id}:filt:{idx}", class: "px-1 py-0.5 rounded bg-amber-100 text-amber-700 text-[9px] max-w-[14rem] truncate",
+                                                        "{format_filter_preview(&options, rule)}"
+                                                    }
+                                                })}
+                                            }
+                                        }
+                                        button {
+                                            class: "px-1.5 py-0.5 text-[10px] rounded border border-gray-200 bg-white text-gray-600 shrink-0 cursor-pointer",
+                                            onclick: {
+                                                let id = id.clone();
+                                                move |_| {
+                                                    let mut selected = selected_probes();
+                                                    selected.retain(|item| item != &id);
+                                                    selected_probes.set(selected);
+                                                    let mut schemas = selected_probe_schemas();
+                                                    schemas.remove(&id);
+                                                    selected_probe_schemas.set(schemas);
+                                                    let mut configs = probe_configs();
+                                                    configs.remove(&id);
+                                                    probe_configs.set(configs);
+                                                    if active_editor_probe().as_deref() == Some(id.as_str()) {
+                                                        active_editor_probe.set(None);
+                                                    }
+                                                }
+                                            },
+                                            "Remove"
+                                        }
                                     }
                                 }
                             })}
                         }
                         button {
-                            class: "px-2 py-0.5 text-[11px] rounded border border-gray-200 bg-white text-gray-600",
-                            onclick: move |_| selected_probes.set(Vec::new()),
+                            class: "px-2 py-0.5 text-[11px] rounded border border-gray-200 bg-white text-gray-600 cursor-pointer",
+                            onclick: move |_| {
+                                selected_probes.set(Vec::new());
+                                selected_probe_schemas.set(HashMap::new());
+                                probe_configs.set(HashMap::new());
+                                active_editor_probe.set(None);
+                            },
                             "Clear all"
+                        }
+                    }
+
+                    div { class: "border-t border-gray-200 pt-2 space-y-2",
+                        span { class: "text-xs font-medium text-gray-700", "Probe Editor (Mock)" }
+                        if let Some(active_id) = active_editor_probe() {
+                            if let Some(schema) = selected_probe_schemas().get(&active_id).cloned() {
+                                {
+                                    let options = mock_filter_field_options(&schema);
+                                    let config = probe_configs().get(&active_id).cloned().unwrap_or_default();
+                                    rsx! {
+                                        div { class: "text-[11px] text-gray-600",
+                                            span { class: "font-mono text-gray-700", "{active_id}" }
+                                        }
+
+                                        div { class: "space-y-1",
+                                            div { class: "flex items-center justify-between",
+                                                span { class: "text-[11px] font-medium text-gray-700", "What To Record" }
+                                                span { class: "text-[10px] text-gray-500", "{config.record_fields.len()}" }
+                                            }
+                                            label { class: "flex items-center gap-2 text-[11px] text-gray-700 cursor-pointer",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    checked: config.record_stack_trace,
+                                                    oninput: {
+                                                        let active_id = active_id.clone();
+                                                        move |evt| {
+                                                            let mut all = probe_configs();
+                                                            let cfg = all.entry(active_id.clone()).or_default();
+                                                            cfg.record_stack_trace = evt.checked();
+                                                            probe_configs.set(all);
+                                                        }
+                                                    },
+                                                }
+                                                span { "Stack trace" }
+                                            }
+                                            if options.is_empty() {
+                                                div { class: "text-[11px] text-gray-500", "No fields available for this probe." }
+                                            } else {
+                                                div { class: "space-y-1",
+                                                    {options.iter().map(|opt| {
+                                                        let checked = config.record_fields.iter().any(|key| key == &opt.key);
+                                                        rsx! {
+                                                            label { key: "{active_id}:record:{opt.key}", class: "flex items-center gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-700 cursor-pointer",
+                                                                input {
+                                                                    r#type: "checkbox",
+                                                                    checked,
+                                                                    onclick: {
+                                                                        let active_id = active_id.clone();
+                                                                        let key = opt.key.clone();
+                                                                        move |_| {
+                                                                            let mut all = probe_configs();
+                                                                            let cfg = all.entry(active_id.clone()).or_default();
+                                                                            if cfg.record_fields.iter().any(|item| item == &key) {
+                                                                                cfg.record_fields.retain(|item| item != &key);
+                                                                            } else {
+                                                                                cfg.record_fields.push(key.clone());
+                                                                            }
+                                                                            probe_configs.set(all);
+                                                                        }
+                                                                    },
+                                                                }
+                                                                span { class: "font-mono truncate", "{opt.label} [{opt.field_type}]" }
+                                                            }
+                                                        }
+                                                    })}
+                                                }
+                                            }
+                                        }
+
+                                        div { class: "space-y-1",
+                                            div { class: "flex items-center justify-between",
+                                                span { class: "text-[11px] font-medium text-gray-700", "Filters" }
+                                                span { class: "text-[10px] text-gray-500", "{config.filters.len()}" }
+                                            }
+                                            if config.filters.is_empty() {
+                                                div { class: "text-[11px] text-gray-500", "No filters configured." }
+                                            } else {
+                                                div { class: "space-y-1",
+                                                    {config.filters.iter().enumerate().map(|(idx, rule)| {
+                                                        let selected_ty = options
+                                                            .iter()
+                                                            .find(|opt| opt.key == rule.field_key)
+                                                            .map(|opt| opt.field_type.clone())
+                                                            .unwrap_or_default();
+                                                        let kind = infer_filter_kind(&selected_ty);
+                                                        let operators = filter_operators(kind);
+                                                        let active_op = if operators.iter().any(|op| *op == rule.operator.as_str()) {
+                                                            rule.operator.clone()
+                                                        } else {
+                                                            operators[0].to_string()
+                                                        };
+                                                        let needs_value = operator_needs_value(&active_op);
+                                                        rsx! {
+                                                            div { key: "{active_id}:filter:{idx}", class: "rounded border border-gray-200 bg-gray-50 p-1 space-y-1",
+                                                                div { class: "grid grid-cols-1 gap-1",
+                                                                    select {
+                                                                        class: "px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                                                                        value: "{rule.field_key}",
+                                                                        oninput: {
+                                                                            let active_id = active_id.clone();
+                                                                            let options = options.clone();
+                                                                            move |evt| {
+                                                                                let next_key = evt.value();
+                                                                                let mut all = probe_configs();
+                                                                                if let Some(cfg) = all.get_mut(&active_id)
+                                                                                    && let Some(filter) = cfg.filters.get_mut(idx)
+                                                                                {
+                                                                                    filter.field_key = next_key.clone();
+                                                                                    let next_kind = options
+                                                                                        .iter()
+                                                                                        .find(|opt| opt.key == next_key)
+                                                                                        .map(|opt| infer_filter_kind(&opt.field_type))
+                                                                                        .unwrap_or(MockFilterKind::Integer);
+                                                                                    filter.operator = filter_operators(next_kind)[0].to_string();
+                                                                                }
+                                                                                probe_configs.set(all);
+                                                                            }
+                                                                        },
+                                                                        {options.iter().map(|opt| rsx! {
+                                                                            option { key: "{active_id}:filter-opt:{idx}:{opt.key}", value: "{opt.key}", "{opt.label} [{opt.field_type}]" }
+                                                                        })}
+                                                                    }
+                                                                    div { class: "flex items-center gap-1",
+                                                                        select {
+                                                                            class: "flex-1 px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                                                                            value: "{active_op}",
+                                                                            oninput: {
+                                                                                let active_id = active_id.clone();
+                                                                                move |evt| {
+                                                                                    let mut all = probe_configs();
+                                                                                    if let Some(cfg) = all.get_mut(&active_id)
+                                                                                        && let Some(filter) = cfg.filters.get_mut(idx)
+                                                                                    {
+                                                                                        filter.operator = evt.value();
+                                                                                    }
+                                                                                    probe_configs.set(all);
+                                                                                }
+                                                                            },
+                                                                            {operators.iter().map(|op| rsx! {
+                                                                                option { key: "{active_id}:filter-op:{idx}:{op}", value: "{op}", "{op}" }
+                                                                            })}
+                                                                        }
+                                                                        button {
+                                                                            class: "px-1.5 py-1 text-[10px] rounded border border-gray-200 bg-white text-gray-600 cursor-pointer",
+                                                                            onclick: {
+                                                                                let active_id = active_id.clone();
+                                                                                move |_| {
+                                                                                    let mut all = probe_configs();
+                                                                                    if let Some(cfg) = all.get_mut(&active_id)
+                                                                                        && idx < cfg.filters.len()
+                                                                                    {
+                                                                                        cfg.filters.remove(idx);
+                                                                                    }
+                                                                                    probe_configs.set(all);
+                                                                                }
+                                                                            },
+                                                                            "Remove"
+                                                                        }
+                                                                    }
+                                                                    if needs_value {
+                                                                        input {
+                                                                            class: "px-2 py-1 border border-gray-200 rounded text-xs bg-white",
+                                                                            r#type: "text",
+                                                                            value: "{rule.value}",
+                                                                            placeholder: filter_value_placeholder(kind),
+                                                                            oninput: {
+                                                                                let active_id = active_id.clone();
+                                                                                move |evt| {
+                                                                                    let mut all = probe_configs();
+                                                                                    if let Some(cfg) = all.get_mut(&active_id)
+                                                                                        && let Some(filter) = cfg.filters.get_mut(idx)
+                                                                                    {
+                                                                                        filter.value = evt.value();
+                                                                                    }
+                                                                                    probe_configs.set(all);
+                                                                                }
+                                                                            },
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    })}
+                                                }
+                                            }
+                                            button {
+                                                class: "px-2 py-1 text-[11px] rounded border border-gray-200 bg-white text-gray-700 cursor-pointer",
+                                                disabled: options.is_empty(),
+                                                onclick: {
+                                                    let active_id = active_id.clone();
+                                                    let options = options.clone();
+                                                    move |_| {
+                                                        if options.is_empty() {
+                                                            return;
+                                                        }
+                                                        let first = options[0].clone();
+                                                        let kind = infer_filter_kind(&first.field_type);
+                                                        let mut all = probe_configs();
+                                                        let cfg = all.entry(active_id.clone()).or_default();
+                                                        cfg.filters.push(MockFilterRule {
+                                                            field_key: first.key,
+                                                            operator: filter_operators(kind)[0].to_string(),
+                                                            value: String::new(),
+                                                        });
+                                                        probe_configs.set(all);
+                                                    }
+                                                },
+                                                "Add Filter"
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                div { class: "text-[11px] text-gray-500", "Selected probe schema is not loaded. Click the probe row again to load details." }
+                            }
+                        } else {
+                            div { class: "text-[11px] text-gray-500", "Click a selected probe to edit its recording fields and filters." }
                         }
                     }
                 }
@@ -422,5 +761,110 @@ fn kind_badge_class(kind: &ProbeSchemaKind) -> &'static str {
         ProbeSchemaKind::Fexit => {
             "inline-flex items-center px-1.5 py-0.5 rounded bg-cyan-100 text-cyan-700"
         }
+    }
+}
+
+#[derive(Clone)]
+struct MockFieldOption {
+    key: String,
+    label: String,
+    field_type: String,
+}
+
+#[derive(Clone, Copy)]
+enum MockFilterKind {
+    Integer,
+    Boolean,
+    StringLike,
+    Address,
+}
+
+fn mock_filter_field_options(probe: &ProbeSchema) -> Vec<MockFieldOption> {
+    let mut options = Vec::new();
+    for field in &probe.fields {
+        options.push(MockFieldOption {
+            key: format!("field:{}", field.name),
+            label: format!("field {}", field.name),
+            field_type: field.field_type.clone(),
+        });
+    }
+    for arg in &probe.args {
+        options.push(MockFieldOption {
+            key: format!("arg:{}", arg.name),
+            label: format!("arg {}", arg.name),
+            field_type: arg.arg_type.clone(),
+        });
+    }
+    if let Some(ret) = &probe.return_type {
+        options.push(MockFieldOption {
+            key: "ret".to_string(),
+            label: "ret".to_string(),
+            field_type: ret.clone(),
+        });
+    }
+    options
+}
+
+fn infer_filter_kind(ty: &str) -> MockFilterKind {
+    let lowered = ty.to_ascii_lowercase();
+    if lowered.contains("bool") {
+        return MockFilterKind::Boolean;
+    }
+    if lowered.contains("char") && lowered.contains('*') {
+        return MockFilterKind::StringLike;
+    }
+    if lowered.contains("string") {
+        return MockFilterKind::StringLike;
+    }
+    if lowered.contains('*')
+        || lowered.contains("ptr")
+        || lowered.contains("addr")
+        || lowered.contains("void *")
+    {
+        return MockFilterKind::Address;
+    }
+    MockFilterKind::Integer
+}
+
+fn filter_operators(kind: MockFilterKind) -> &'static [&'static str] {
+    match kind {
+        MockFilterKind::Integer => &["==", "!=", ">", ">=", "<", "<="],
+        MockFilterKind::Boolean => &["==", "!="],
+        MockFilterKind::StringLike => &["==", "!=", "contains", "starts_with", "ends_with"],
+        MockFilterKind::Address => &["==", "!=", "is_null", "is_not_null"],
+    }
+}
+
+fn operator_needs_value(operator: &str) -> bool {
+    !matches!(operator, "is_null" | "is_not_null")
+}
+
+fn filter_value_placeholder(kind: MockFilterKind) -> &'static str {
+    match kind {
+        MockFilterKind::Integer => "e.g. 42",
+        MockFilterKind::Boolean => "true or false",
+        MockFilterKind::StringLike => "text",
+        MockFilterKind::Address => "e.g. 0x0",
+    }
+}
+
+fn field_key_display(options: &[MockFieldOption], key: &str) -> String {
+    options
+        .iter()
+        .find(|opt| opt.key == key)
+        .map(|opt| opt.label.clone())
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn format_filter_preview(options: &[MockFieldOption], rule: &MockFilterRule) -> String {
+    let field = field_key_display(options, &rule.field_key);
+    if operator_needs_value(&rule.operator) {
+        if rule.value.is_empty() {
+            format!("{field} {} ?", rule.operator)
+        } else {
+            format!("{field} {} {}", rule.operator, rule.value)
+        }
+    } else {
+        format!("{field} {}", rule.operator)
     }
 }
