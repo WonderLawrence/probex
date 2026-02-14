@@ -25,14 +25,15 @@ jobs:
             set -euo pipefail
 
             cargo fmt --all -- --check
-            cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
-            cargo check -p probex -p probex-common
-            cargo check -p probex-viewer --target wasm32-unknown-unknown
 
             dx bundle --release --platform web -p probex-viewer
             rm -rf probex/assets/viewer
             mkdir -p probex/assets/viewer
             cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
-            cargo build --release -p probex
-            cargo package -p probex --allow-dirty --no-verify --list | grep "^assets/viewer/index.html$"
+
+            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo clippy -p probex -p probex-common -p probex-viewer --all-targets
+            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo check -p probex -p probex-common
+            cargo check -p probex-viewer --target wasm32-unknown-unknown
+            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo build --release -p probex
+            PROBEX_SKIP_FRONTEND_BUNDLE=1 cargo package -p probex --allow-dirty --no-verify --list | grep "^assets/viewer/index.html$"
           '

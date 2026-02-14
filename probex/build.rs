@@ -1,10 +1,12 @@
 use anyhow::{Context as _, anyhow};
-use aya_build::Toolchain;
 use std::{ffi::OsString, fs, path::Path, path::PathBuf, process::Command};
 
 fn main() -> anyhow::Result<()> {
     ensure_frontend_bundle()?;
+    build_ebpf()
+}
 
+fn build_ebpf() -> anyhow::Result<()> {
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .exec()
         .context("MetadataCommand::exec")?;
@@ -13,19 +15,77 @@ fn main() -> anyhow::Result<()> {
         .find(|cargo_metadata::Package { name, .. }| name.as_str() == "probex-ebpf")
         .ok_or_else(|| anyhow!("probex-ebpf package not found"))?;
     let cargo_metadata::Package {
-        name,
         manifest_path,
         ..
     } = ebpf_package;
-    let ebpf_package = aya_build::Package {
-        name: name.as_str(),
-        root_dir: manifest_path
-            .parent()
-            .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
-            .as_str(),
-        ..Default::default()
+    let root_dir = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
+        .as_std_path();
+    println!("cargo:rerun-if-changed={}", root_dir.display());
+
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| anyhow!("OUT_DIR not set"))?);
+    let target_dir = out_dir.join("probex-ebpf");
+    let target = bpf_target_triple()?;
+    let bpf_target_arch = bpf_target_arch()?;
+    let mut rustflags = OsString::from("--cfg=bpf_target_arch=\"");
+    rustflags.push(&bpf_target_arch);
+    rustflags.push("\"\x1f-Cdebuginfo=2\x1f-Clink-arg=--btf");
+
+    let cargo_bin = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut cmd = Command::new(&cargo_bin);
+    cmd.current_dir(root_dir)
+        .env("CARGO_ENCODED_RUSTFLAGS", rustflags)
+        .args([
+            "build",
+            "--package",
+            "probex-ebpf",
+            "-Z",
+            "build-std=core",
+            "--bins",
+            "--release",
+            "--target",
+            target.as_str(),
+            "--target-dir",
+        ])
+        .arg(&target_dir);
+
+    let status = cmd.status().with_context(|| format!("failed to run {cmd:?}"))?;
+    if !status.success() {
+        return Err(anyhow!("{cmd:?} failed: {status:?}"));
+    }
+
+    let built_binary = target_dir.join(&target).join("release").join("probex");
+    let output_binary = out_dir.join("probex");
+    let _ = fs::copy(&built_binary, &output_binary).with_context(|| {
+        format!(
+            "failed to copy eBPF binary {} -> {}",
+            built_binary.display(),
+            output_binary.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn bpf_target_triple() -> anyhow::Result<String> {
+    let endian = std::env::var("CARGO_CFG_TARGET_ENDIAN")
+        .context("CARGO_CFG_TARGET_ENDIAN not set for eBPF build")?;
+    let prefix = match endian.as_str() {
+        "big" => "bpfeb",
+        "little" => "bpfel",
+        _ => return Err(anyhow!("unsupported CARGO_CFG_TARGET_ENDIAN: {endian}")),
     };
-    aya_build::build_ebpf([ebpf_package], Toolchain::default())
+    Ok(format!("{prefix}-unknown-none"))
+}
+
+fn bpf_target_arch() -> anyhow::Result<String> {
+    let arch =
+        std::env::var("CARGO_CFG_TARGET_ARCH").context("CARGO_CFG_TARGET_ARCH not set for eBPF build")?;
+    if arch.starts_with("riscv64") {
+        Ok("riscv64".to_string())
+    } else {
+        Ok(arch)
+    }
 }
 
 fn ensure_frontend_bundle() -> anyhow::Result<()> {

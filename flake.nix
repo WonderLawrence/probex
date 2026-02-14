@@ -170,7 +170,6 @@
               rustToolchain
               bpf-linker-crane
               bpftools
-              rustup
             ];
             shellHook = ''
               # Setup daisyUI vendor files
