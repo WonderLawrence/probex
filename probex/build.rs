@@ -14,17 +14,15 @@ fn build_ebpf() -> anyhow::Result<()> {
         .into_iter()
         .find(|cargo_metadata::Package { name, .. }| name.as_str() == "probex-ebpf")
         .ok_or_else(|| anyhow!("probex-ebpf package not found"))?;
-    let cargo_metadata::Package {
-        manifest_path,
-        ..
-    } = ebpf_package;
+    let cargo_metadata::Package { manifest_path, .. } = ebpf_package;
     let root_dir = manifest_path
         .parent()
         .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
         .as_std_path();
     println!("cargo:rerun-if-changed={}", root_dir.display());
 
-    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| anyhow!("OUT_DIR not set"))?);
+    let out_dir =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| anyhow!("OUT_DIR not set"))?);
     let target_dir = out_dir.join("probex-ebpf");
     let target = bpf_target_triple()?;
     let bpf_target_arch = bpf_target_arch()?;
@@ -50,7 +48,9 @@ fn build_ebpf() -> anyhow::Result<()> {
         ])
         .arg(&target_dir);
 
-    let status = cmd.status().with_context(|| format!("failed to run {cmd:?}"))?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to run {cmd:?}"))?;
     if !status.success() {
         return Err(anyhow!("{cmd:?} failed: {status:?}"));
     }
@@ -79,8 +79,8 @@ fn bpf_target_triple() -> anyhow::Result<String> {
 }
 
 fn bpf_target_arch() -> anyhow::Result<String> {
-    let arch =
-        std::env::var("CARGO_CFG_TARGET_ARCH").context("CARGO_CFG_TARGET_ARCH not set for eBPF build")?;
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH")
+        .context("CARGO_CFG_TARGET_ARCH not set for eBPF build")?;
     if arch.starts_with("riscv64") {
         Ok("riscv64".to_string())
     } else {
