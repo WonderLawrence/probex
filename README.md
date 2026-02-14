@@ -17,7 +17,7 @@ Other package managers coming soon, contributions welcome!
 
 #### Frame pointers
 
-`probex` works best with frame pointers enabled.
+`probex` works best with frame pointers enabled on the target binary.
 Without them, stack traces may be shallow or incomplete.
 [Why you should enable them](https://www.brendangregg.com/blog/2024-03-17/the-return-of-the-frame-pointers.html).
 

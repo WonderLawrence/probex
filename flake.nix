@@ -1,5 +1,5 @@
 {
-  description = "Related Work Flake Configuration";
+  description = "Probex Flake Configuration";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
