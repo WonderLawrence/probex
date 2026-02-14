@@ -2,103 +2,12 @@
 //!
 //! Uses DataFusion to query parquet trace files.
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+pub use probex_common::viewer_api::{
+    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
+    LatencySummary, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
+    SyscallLatencyStats, TraceSummary,
+};
 use std::error::Error;
-
-/// Histogram bucket for density visualization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HistogramBucket {
-    pub bucket_start_ns: u64,
-    pub bucket_end_ns: u64,
-    pub count: usize,
-    pub counts_by_type: HashMap<String, usize>,
-}
-
-/// Response for histogram data.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct HistogramResponse {
-    pub buckets: Vec<HistogramBucket>,
-    pub total_in_range: usize,
-}
-
-/// Event counts by type for filter badges.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct EventTypeCounts {
-    pub counts: HashMap<String, usize>,
-}
-
-/// Latency summary statistics in nanoseconds.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct LatencySummary {
-    pub count: usize,
-    pub avg_ns: u64,
-    pub p50_ns: u64,
-    pub p95_ns: u64,
-    pub max_ns: u64,
-}
-
-/// Read/write syscall latency summaries.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct SyscallLatencyStats {
-    pub read: LatencySummary,
-    pub write: LatencySummary,
-    pub mmap_alloc_bytes: u64,
-    pub munmap_free_bytes: u64,
-}
-
-/// Summary statistics about the trace.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct TraceSummary {
-    pub total_events: usize,
-    pub event_types: Vec<String>,
-    pub unique_pids: Vec<u32>,
-    pub min_ts_ns: u64,
-    pub max_ts_ns: u64,
-    pub cpu_sample_frequency_hz: u64,
-}
-
-/// Process lifetime information for timeline visualization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProcessLifetime {
-    pub pid: u32,
-    pub process_name: Option<String>,
-    pub parent_pid: Option<u32>,
-    pub start_ns: u64,
-    pub end_ns: Option<u64>,
-    pub exit_code: Option<i32>,
-    pub was_forked: bool,
-    pub did_exit: bool,
-}
-
-/// Response containing process lifetimes.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProcessLifetimesResponse {
-    pub processes: Vec<ProcessLifetime>,
-}
-
-/// Sparse event marker for timeline visualization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct EventMarker {
-    pub ts_ns: u64,
-    pub event_type: String,
-}
-
-/// Events grouped by PID for timeline visualization.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProcessEventsResponse {
-    pub events_by_pid: HashMap<u32, Vec<EventMarker>>,
-    pub cpu_sample_counts_by_pid: HashMap<u32, Vec<u16>>,
-    pub cpu_sample_bucket_count: usize,
-}
-
-/// Aggregated flamegraph response for one event type in a range.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-pub struct EventFlamegraphResponse {
-    pub event_type: String,
-    pub total_samples: usize,
-    pub svg: Option<String>,
-}
 
 mod backend {
     use super::*;

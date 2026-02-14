@@ -13,6 +13,7 @@ name = "probex-viewer"
 path = "src/main.rs"
 
 [dependencies]
+probex-common = { path = "../probex-common", features = ["viewer-api"] }
 dioxus = { workspace = true, features = [
     "web",
     "launch",

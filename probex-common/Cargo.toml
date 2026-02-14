@@ -10,7 +10,9 @@ description = "Shared event types for probex user and eBPF components"
 
 [features]
 default = []
-user = ["aya", "serde"]
+std = []
+viewer-api = ["serde", "std"]
+user = ["aya", "viewer-api"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
