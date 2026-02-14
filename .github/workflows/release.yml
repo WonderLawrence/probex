@@ -141,7 +141,7 @@ jobs:
           nix develop --accept-flake-config -c bash -lc '
             set -euo pipefail
             for crate in probex-common probex-ebpf probex; do
-              if cargo info "$crate@$RELEASE_VERSION" >/dev/null 2>&1; then
+              if cargo info --registry crates-io "$crate@$RELEASE_VERSION" >/dev/null 2>&1; then
                 echo "$crate@$RELEASE_VERSION is already published on crates.io"
                 exit 1
               fi
