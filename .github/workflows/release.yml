@@ -155,7 +155,7 @@ jobs:
             dx bundle --release --platform web -p probex-viewer
             rm -rf probex/assets/viewer
             mkdir -p probex/assets/viewer
-            cp -a target/dx/probex-viewer/release/web/public/. probex/assets/viewer/
+            cp -a "$CARGO_TARGET_DIR/dx/probex-viewer/release/web/public/." probex/assets/viewer/
           '
 
       - name: Validate package contents
