@@ -573,12 +573,12 @@ pub fn ProcessTimeline(
                                         }
                                     },
                                     onmousedown: {
-                                        let mut process_bar_drag_state = process_bar_drag_state;
-                                        let mut process_bar_drag_preview = process_bar_drag_preview;
-                                        let process_bar_width_px = process_bar_width_px;
+                                        let mut drag_state_sig = process_bar_drag_state;
+                                        let mut drag_preview_sig = process_bar_drag_preview;
+                                        let bar_width_sig = process_bar_width_px;
                                         move |evt: MouseEvent| {
                                             evt.prevent_default();
-                                            let bar_width = process_bar_width_px();
+                                            let bar_width = bar_width_sig();
                                             if bar_width <= 0.0 {
                                                 return;
                                             }
@@ -586,20 +586,20 @@ pub fn ProcessTimeline(
                                             let client_x = evt.client_coordinates().x;
                                             let bar_left_client_x = client_x - evt.element_coordinates().x;
 
-                                            process_bar_drag_state.set(Some(ProcessBarDragState {
+                                            drag_state_sig.set(Some(ProcessBarDragState {
                                                 pid,
                                                 bar_left_client_x,
                                                 bar_width_px: bar_width,
                                                 anchor_client_x: client_x,
                                             }));
-                                            process_bar_drag_preview.set(None);
+                                            drag_preview_sig.set(None);
                                         }
                                     },
                                     onmousemove: {
-                                        let process_bar_drag_state = process_bar_drag_state;
-                                        let mut process_bar_drag_preview = process_bar_drag_preview;
+                                        let drag_state_sig = process_bar_drag_state;
+                                        let mut drag_preview_sig = process_bar_drag_preview;
                                         move |evt: MouseEvent| {
-                                            let Some(drag_state) = process_bar_drag_state() else {
+                                            let Some(drag_state) = drag_state_sig() else {
                                                 return;
                                             };
                                             if drag_state.pid != pid {
@@ -616,20 +616,20 @@ pub fn ProcessTimeline(
                                                 evt.client_coordinates().x,
                                                 range.view_start_ns,
                                                 range.view_end_ns,
-                                            ) && process_bar_drag_preview() != Some(preview)
+                                            ) && drag_preview_sig() != Some(preview)
                                             {
-                                                process_bar_drag_preview.set(Some(preview));
+                                                drag_preview_sig.set(Some(preview));
                                             }
                                         }
                                     },
                                     onmouseleave: {
-                                        let mut process_bar_drag_state = process_bar_drag_state;
-                                        let process_bar_drag_preview = process_bar_drag_preview;
+                                        let mut drag_state_sig = process_bar_drag_state;
+                                        let drag_preview_sig = process_bar_drag_preview;
                                         move |_| {
-                                            if process_bar_drag_preview().is_none()
-                                                && process_bar_drag_state().map(|s| s.pid) == Some(pid)
+                                            if drag_preview_sig().is_none()
+                                                && drag_state_sig().map(|s| s.pid) == Some(pid)
                                             {
-                                                process_bar_drag_state.set(None);
+                                                drag_state_sig.set(None);
                                             }
                                         }
                                     },
@@ -728,10 +728,10 @@ pub fn ProcessTimeline(
                 div {
                     class: "fixed inset-0 z-50 cursor-ew-resize",
                     onmousemove: {
-                        let process_bar_drag_state = process_bar_drag_state;
-                        let mut process_bar_drag_preview = process_bar_drag_preview;
+                        let drag_state_sig = process_bar_drag_state;
+                        let mut drag_preview_sig = process_bar_drag_preview;
                         move |evt: MouseEvent| {
-                            let Some(drag_state) = process_bar_drag_state() else {
+                            let Some(drag_state) = drag_state_sig() else {
                                 return;
                             };
                             if let Some(preview) = build_process_bar_drag_preview(
@@ -739,9 +739,9 @@ pub fn ProcessTimeline(
                                 evt.client_coordinates().x,
                                 range.view_start_ns,
                                 range.view_end_ns,
-                            ) && process_bar_drag_preview() != Some(preview)
+                            ) && drag_preview_sig() != Some(preview)
                             {
-                                process_bar_drag_preview.set(Some(preview));
+                                drag_preview_sig.set(Some(preview));
                             }
                         }
                     },
@@ -1076,10 +1076,9 @@ fn TimelineOverview(
                 class: "absolute top-0 bottom-0 pointer-events-none z-20 flex items-center justify-center",
                 style: "left: {view_left_pct}%; width: {handle_width_px}px;",
                 div {
-                    class: if is_dragging && drag_kind == Some(DragKind::LeftEdge) {
-                        "w-full h-full rounded-l-md bg-blue-600 flex items-center justify-center"
-                    } else {
-                        "w-full h-full rounded-l-md bg-blue-500 hover:bg-blue-600 flex items-center justify-center"
+                    class: match is_dragging && drag_kind == Some(DragKind::LeftEdge) {
+                        true => "w-full h-full rounded-l-md bg-blue-600 flex items-center justify-center",
+                        false => "w-full h-full rounded-l-md bg-blue-500 hover:bg-blue-600 flex items-center justify-center",
                     },
                     // Grip dots
                     div { class: "flex flex-col gap-[3px] items-center",
@@ -1095,10 +1094,9 @@ fn TimelineOverview(
                 class: "absolute top-0 bottom-0 pointer-events-none z-20 flex items-center justify-center",
                 style: "left: calc({(view_left_pct + view_width_pct).min(100.0)}% - {handle_width_px}px); width: {handle_width_px}px;",
                 div {
-                    class: if is_dragging && drag_kind == Some(DragKind::RightEdge) {
-                        "w-full h-full rounded-r-md bg-blue-600 flex items-center justify-center"
-                    } else {
-                        "w-full h-full rounded-r-md bg-blue-500 hover:bg-blue-600 flex items-center justify-center"
+                    class: match is_dragging && drag_kind == Some(DragKind::RightEdge) {
+                        true => "w-full h-full rounded-r-md bg-blue-600 flex items-center justify-center",
+                        false => "w-full h-full rounded-r-md bg-blue-500 hover:bg-blue-600 flex items-center justify-center",
                     },
                     // Grip dots
                     div { class: "flex flex-col gap-[3px] items-center",
