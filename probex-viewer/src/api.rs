@@ -1,6 +1,7 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
+    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse,
+    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats,
+    TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;

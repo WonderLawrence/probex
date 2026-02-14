@@ -1,6 +1,13 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
 
 use dioxus::prelude::*;
+
+use crate::api::EventMarker;
+
+// Static empty maps to avoid allocations when process_events is None
+static EMPTY_EVENTS_MAP: LazyLock<HashMap<u32, Vec<EventMarker>>> = LazyLock::new(HashMap::new);
+static EMPTY_CPU_COUNTS_MAP: LazyLock<HashMap<u32, Vec<u16>>> = LazyLock::new(HashMap::new);
 
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
@@ -88,17 +95,18 @@ pub fn ProcessTimeline(
         .iter()
         .all(|pid| collapsed_set.contains(pid));
 
+    // Extract process events data - use references where possible
     let (events_map, cpu_sample_counts_map, cpu_sample_bucket_count) = data
         .process_events
         .as_ref()
         .map(|pe| {
             (
-                pe.events_by_pid.clone(),
-                pe.cpu_sample_counts_by_pid.clone(),
+                &pe.events_by_pid,
+                &pe.cpu_sample_counts_by_pid,
                 pe.cpu_sample_bucket_count,
             )
         })
-        .unwrap_or_else(|| (HashMap::new(), HashMap::new(), 0));
+        .unwrap_or((&EMPTY_EVENTS_MAP, &EMPTY_CPU_COUNTS_MAP, 0));
     let sample_frequency_hz = data.summary.cpu_sample_frequency_hz;
     let stats = data.latency_stats.clone().unwrap_or_default();
     let has_read_stats = stats.read.count > 0;
