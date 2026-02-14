@@ -144,10 +144,10 @@ use parquet::{
     file::{metadata::KeyValue, properties::WriterProperties},
 };
 use probex_common::{
-    CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STATS_LEN,
-    CpuSampleEvent, EventHeader, EventType, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent,
-    ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER,
-    SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_RINGBUF_DROPPED, CPU_SAMPLE_STATS_LEN, CpuSampleEvent,
+    EventHeader, EventType, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent,
+    ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
@@ -950,7 +950,10 @@ fn parse_stack_frames_hex(stack_frames: &str) -> Result<Vec<u64>> {
     Ok(frames)
 }
 
-fn find_segment_for_ip(segments: &[ProcMapInlineSegment], ip: u64) -> Option<&ProcMapInlineSegment> {
+fn find_segment_for_ip(
+    segments: &[ProcMapInlineSegment],
+    ip: u64,
+) -> Option<&ProcMapInlineSegment> {
     segments
         .iter()
         .find(|segment| ip >= segment.start_addr && ip < segment.end_addr)
@@ -1039,7 +1042,11 @@ impl ExportUserSymbolizer {
 
         self.ensure_symbol_map_loaded(path).await;
 
-        let Some(symbol_map) = self.symbol_map_cache.get(&path_key).and_then(|m| m.as_ref()) else {
+        let Some(symbol_map) = self
+            .symbol_map_cache
+            .get(&path_key)
+            .and_then(|m| m.as_ref())
+        else {
             for addr in unresolved {
                 self.symbol_cache.insert((path_key.clone(), addr), None);
             }
@@ -1242,7 +1249,11 @@ async fn symbolize_stack_traces_into_events_parquet(
                 (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
                     let frames = parse_stack_frames_hex(frames_hex)?;
                     if frames.is_empty() {
-                        labels_to_stack_trace(current_stack_trace.map(parse_stack_trace_labels).unwrap_or_default())
+                        labels_to_stack_trace(
+                            current_stack_trace
+                                .map(parse_stack_trace_labels)
+                                .unwrap_or_default(),
+                        )
                     } else {
                         let snapshot = if tgid == 0 {
                             None
@@ -1261,7 +1272,11 @@ async fn symbolize_stack_traces_into_events_parquet(
                 (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
                     let frames = parse_stack_frames_hex(frames_hex)?;
                     if frames.is_empty() {
-                        labels_to_stack_trace(current_stack_trace.map(parse_stack_trace_labels).unwrap_or_default())
+                        labels_to_stack_trace(
+                            current_stack_trace
+                                .map(parse_stack_trace_labels)
+                                .unwrap_or_default(),
+                        )
                     } else {
                         let snapshot = if tgid == 0 {
                             None
@@ -1280,7 +1295,11 @@ async fn symbolize_stack_traces_into_events_parquet(
                         labels_to_stack_trace(labels)
                     }
                 }
-                _ => labels_to_stack_trace(current_stack_trace.map(parse_stack_trace_labels).unwrap_or_default()),
+                _ => labels_to_stack_trace(
+                    current_stack_trace
+                        .map(parse_stack_trace_labels)
+                        .unwrap_or_default(),
+                ),
             };
             if let Some(rewritten_stack_trace) = rewritten_stack_trace {
                 let labels = parse_stack_trace_labels(&rewritten_stack_trace);

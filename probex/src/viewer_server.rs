@@ -266,4 +266,3 @@ fn detect_hostname() -> Option<String> {
 
     None
 }
-

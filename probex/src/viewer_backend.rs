@@ -107,12 +107,9 @@ mod backend {
                     format!("failed to resolve stack_trace field: {error}"),
                 )
             })?;
-        let expected_stack_trace_type =
-            DataType::List(Arc::new(datafusion::arrow::datatypes::Field::new(
-                "item",
-                DataType::Utf8View,
-                true,
-            )));
+        let expected_stack_trace_type = DataType::List(Arc::new(
+            datafusion::arrow::datatypes::Field::new("item", DataType::Utf8View, true),
+        ));
         if stack_trace_field.data_type() != &expected_stack_trace_type {
             return Err(IoError::new(
                 ErrorKind::InvalidData,
@@ -143,7 +140,9 @@ mod backend {
         Ok(())
     }
 
-    fn read_trace_file_metadata(parquet_file: &std::path::Path) -> BackendResult<TraceFileMetadata> {
+    fn read_trace_file_metadata(
+        parquet_file: &std::path::Path,
+    ) -> BackendResult<TraceFileMetadata> {
         let file = File::open(parquet_file)?;
         let reader = SerializedFileReader::new(file)?;
 
@@ -282,9 +281,9 @@ mod backend {
         batch: &datafusion::arrow::record_batch::RecordBatch,
         row: usize,
     ) -> BackendResult<Option<Vec<String>>> {
-        let column = batch.column_by_name("stack_trace").ok_or_else(|| {
-            IoError::new(ErrorKind::InvalidData, "missing column 'stack_trace'")
-        })?;
+        let column = batch
+            .column_by_name("stack_trace")
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "missing column 'stack_trace'"))?;
         let list_array = column.as_any().downcast_ref::<ListArray>().ok_or_else(|| {
             IoError::new(
                 ErrorKind::InvalidData,
@@ -1001,9 +1000,7 @@ mod backend {
             ((expected_samples_total / CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET).floor() as usize)
                 .max(1);
         let cpu_sample_bucket_count = max_buckets_by_density.min(CPU_SAMPLE_BUCKETS_MAX);
-        let bucket_size_ns = range_ns
-            .div_ceil(cpu_sample_bucket_count as u64)
-            .max(1);
+        let bucket_size_ns = range_ns.div_ceil(cpu_sample_bucket_count as u64).max(1);
 
         let mut rng_state = {
             use std::collections::hash_map::DefaultHasher;
@@ -1165,7 +1162,8 @@ mod backend {
 
         for batch in &batches {
             for row in 0..batch.num_rows() {
-                let Some(stack_trace_labels) = extract_option_stack_trace_labels(batch, row)? else {
+                let Some(stack_trace_labels) = extract_option_stack_trace_labels(batch, row)?
+                else {
                     continue;
                 };
                 if stack_trace_labels.is_empty() {
