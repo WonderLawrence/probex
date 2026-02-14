@@ -62,6 +62,23 @@ struct EventFlamegraphQuery {
     max_stacks: usize,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProbeSchemasPageQuery {
+    search: Option<String>,
+    category: Option<String>,
+    provider: Option<String>,
+    kinds: Option<String>,
+    source: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    include_fields: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProbeSchemaDetailQuery {
+    display_name: String,
+}
+
 pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
     let parquet_path = Path::new(parquet_file)
         .canonicalize()
@@ -91,6 +108,9 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
 
     let api_router = Router::new()
         .route("/api/summary", get(get_summary))
+        .route("/api/probe_schemas", get(get_probe_schemas))
+        .route("/api/probe_schemas_page", get(get_probe_schemas_page))
+        .route("/api/probe_schema_detail", get(get_probe_schema_detail))
         .route("/api/histogram", get(get_histogram))
         .route("/api/event_type_counts", get(get_event_type_counts))
         .route("/api/pid_event_type_counts", get(get_pid_event_type_counts))
@@ -121,6 +141,76 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
 
 async fn get_summary() -> Response {
     into_json_response(viewer_backend::query_summary().await)
+}
+
+async fn get_probe_schemas() -> Response {
+    into_json_response(viewer_backend::query_probe_schemas().await)
+}
+
+async fn get_probe_schemas_page(Query(query): Query<ProbeSchemasPageQuery>) -> Response {
+    let kinds = match query.kinds {
+        Some(value) => {
+            let mut parsed = Vec::new();
+            for raw in value.split(',') {
+                let raw = raw.trim();
+                if raw.is_empty() {
+                    continue;
+                }
+                match parse_probe_kind(raw) {
+                    Ok(kind) => parsed.push(kind),
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                }
+            }
+            if parsed.is_empty() {
+                None
+            } else {
+                Some(parsed)
+            }
+        }
+        None => None,
+    };
+    let source = match query.source {
+        Some(value) => match parse_probe_source(&value) {
+            Ok(source) => Some(source),
+            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+        },
+        None => None,
+    };
+
+    into_json_response(
+        viewer_backend::query_probe_schemas_page(viewer_backend::ProbeSchemasQuery {
+            search: query.search,
+            category: query.category,
+            provider: query.provider,
+            kinds,
+            source,
+            offset: query.offset.unwrap_or(0),
+            limit: query.limit.unwrap_or(100),
+            include_fields: query.include_fields.unwrap_or(false),
+        })
+        .await,
+    )
+}
+
+async fn get_probe_schema_detail(Query(query): Query<ProbeSchemaDetailQuery>) -> Response {
+    into_json_response(viewer_backend::query_probe_schema_detail(query.display_name).await)
+}
+
+fn parse_probe_kind(value: &str) -> Result<viewer_backend::ProbeSchemaKind, String> {
+    match value {
+        "tracepoint" => Ok(viewer_backend::ProbeSchemaKind::Tracepoint),
+        "fentry" => Ok(viewer_backend::ProbeSchemaKind::Fentry),
+        "fexit" => Ok(viewer_backend::ProbeSchemaKind::Fexit),
+        _ => Err(format!("invalid kind '{}'", value)),
+    }
+}
+
+fn parse_probe_source(value: &str) -> Result<viewer_backend::ProbeSchemaSource, String> {
+    match value {
+        "tracefs" => Ok(viewer_backend::ProbeSchemaSource::TraceFsFormat),
+        "btf" => Ok(viewer_backend::ProbeSchemaSource::KernelBtf),
+        _ => Err(format!("invalid source '{}'", value)),
+    }
 }
 
 async fn get_histogram(Query(query): Query<HistogramQuery>) -> Response {

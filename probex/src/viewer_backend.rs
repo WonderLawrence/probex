@@ -4,13 +4,15 @@
 
 pub use probex_common::viewer_api::{
     EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramBucket, HistogramResponse,
-    LatencySummary, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
+    LatencySummary, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource, ProbeSchemasPageResponse,
+    ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
     SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
 mod backend {
     use super::*;
+    use crate::viewer_probe_catalog;
     use datafusion::arrow::array::{
         Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, StructArray,
         UInt32Array, UInt64Array,
@@ -97,6 +99,8 @@ mod backend {
             )
         })?;
 
+        viewer_probe_catalog::initialize_probe_index_loading();
+
         log::info!("Loaded {count} events from {:?}", parquet_file);
         Ok(())
     }
@@ -148,6 +152,20 @@ mod backend {
         Ok(TraceFileMetadata {
             cpu_sample_frequency_hz,
         })
+    }
+
+    pub async fn query_probe_schemas_page(
+        query: viewer_probe_catalog::ProbeSchemasQuery,
+    ) -> BackendResult<ProbeSchemasPageResponse> {
+        viewer_probe_catalog::query_probe_schemas_page(query).await
+    }
+
+    pub async fn query_probe_schema_detail(display_name: String) -> BackendResult<ProbeSchema> {
+        viewer_probe_catalog::query_probe_schema_detail(display_name).await
+    }
+
+    pub async fn query_probe_schemas() -> BackendResult<ProbeSchemasResponse> {
+        viewer_probe_catalog::query_probe_schemas().await
     }
 
     fn extract_string(
@@ -1491,6 +1509,8 @@ mod backend {
     }
 }
 
+pub use crate::viewer_probe_catalog::ProbeSchemasQuery;
+
 pub async fn initialize(
     parquet_file: std::path::PathBuf,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1553,4 +1573,21 @@ pub async fn query_event_flamegraph(
     max_stacks: usize,
 ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks).await
+}
+
+pub async fn query_probe_schemas()
+-> Result<ProbeSchemasResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_probe_schemas().await
+}
+
+pub async fn query_probe_schemas_page(
+    query: ProbeSchemasQuery,
+) -> Result<ProbeSchemasPageResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_probe_schemas_page(query).await
+}
+
+pub async fn query_probe_schema_detail(
+    display_name: String,
+) -> Result<ProbeSchema, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_probe_schema_detail(display_name).await
 }

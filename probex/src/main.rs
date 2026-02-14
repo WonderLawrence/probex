@@ -151,6 +151,7 @@ use probex_common::{
 use tokio::{io::unix::AsyncFd, signal};
 
 mod viewer_backend;
+mod viewer_probe_catalog;
 mod viewer_server;
 
 /// Batch size for Parquet writes (10,000 events per batch)

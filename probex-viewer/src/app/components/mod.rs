@@ -1,5 +1,6 @@
 mod flamegraph;
 mod header;
+mod probe_catalog;
 mod process_timeline;
 
 pub use header::ViewerHeader;

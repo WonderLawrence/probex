@@ -1,6 +1,7 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats, TraceSummary,
+    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProbeSchema, ProbeSchemaKind,
+    ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
+    SyscallLatencyStats, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
@@ -20,7 +21,7 @@ where
             }
             url.push_str(key);
             url.push('=');
-            url.push_str(value);
+            url.push_str(&percent_encode_component(value));
         }
     }
 
@@ -44,8 +45,54 @@ where
         .map_err(|error| error.to_string())
 }
 
+fn percent_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(char::from(b));
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+
 pub async fn get_summary() -> ApiResult<TraceSummary> {
     get_json("/api/summary", &[]).await
+}
+
+pub async fn get_probe_schemas_page(
+    search: Option<String>,
+    category: Option<String>,
+    kinds: Option<String>,
+    source: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> ApiResult<ProbeSchemasPageResponse> {
+    let mut query = vec![("offset", offset.to_string()), ("limit", limit.to_string())];
+    if let Some(search) = search {
+        query.push(("search", search));
+    }
+    if let Some(category) = category {
+        query.push(("category", category));
+    }
+    if let Some(kinds) = kinds {
+        query.push(("kinds", kinds));
+    }
+    if let Some(source) = source {
+        query.push(("source", source));
+    }
+    get_json("/api/probe_schemas_page", &query).await
+}
+
+pub async fn get_probe_schema_detail(display_name: String) -> ApiResult<ProbeSchema> {
+    get_json(
+        "/api/probe_schema_detail",
+        &[("display_name", display_name)],
+    )
+    .await
 }
 
 pub async fn get_histogram(

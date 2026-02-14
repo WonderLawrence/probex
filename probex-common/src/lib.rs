@@ -261,4 +261,63 @@ pub mod viewer_api {
         pub total_samples: usize,
         pub svg: Option<String>,
     }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum ProbeSchemaSource {
+        TraceFsFormat,
+        KernelBtf,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum ProbeSchemaKind {
+        Tracepoint,
+        Fentry,
+        Fexit,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ProbeSchemaArg {
+        pub name: String,
+        pub arg_type: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ProbeSchemaField {
+        pub declaration: String,
+        pub name: String,
+        pub field_type: String,
+        pub offset: u32,
+        pub size: u32,
+        pub is_signed: bool,
+        pub is_common: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct ProbeSchema {
+        pub display_name: String,
+        pub provider: String,
+        pub target: String,
+        pub probe: String,
+        pub symbol: Option<String>,
+        pub kind: ProbeSchemaKind,
+        pub source: ProbeSchemaSource,
+        pub return_type: Option<String>,
+        pub args: Vec<ProbeSchemaArg>,
+        pub fields: Vec<ProbeSchemaField>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct ProbeSchemasResponse {
+        pub probes: Vec<ProbeSchema>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+    pub struct ProbeSchemasPageResponse {
+        pub probes: Vec<ProbeSchema>,
+        pub total: usize,
+        pub offset: usize,
+        pub limit: usize,
+        pub has_more: bool,
+        pub is_loading: bool,
+    }
 }
