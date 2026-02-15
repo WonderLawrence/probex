@@ -44,6 +44,8 @@ pub fn ProbeCatalog() -> Element {
     let mut has_more_pages = use_signal(|| false);
     let mut page_offset = use_signal(|| 0usize);
     let mut page_request_in_flight = use_signal(|| false);
+    let mut scroll_load_armed = use_signal(|| true);
+    let mut last_scroll_top = use_signal(|| 0.0f64);
     let mut probe_error = use_signal(|| Option::<String>::None);
     let mut refresh_nonce = use_signal(|| 0u64);
 
@@ -57,6 +59,8 @@ pub fn ProbeCatalog() -> Element {
             probes_total.set(0);
             has_more_pages.set(false);
             backend_loading.set(false);
+            scroll_load_armed.set(true);
+            last_scroll_top.set(0.0);
         }
 
         let query = if search_query().trim().is_empty() {
@@ -71,6 +75,8 @@ pub fn ProbeCatalog() -> Element {
             probes_total.set(0);
             has_more_pages.set(false);
             backend_loading.set(false);
+            scroll_load_armed.set(true);
+            last_scroll_top.set(0.0);
             probes_loading.set(false);
             page_request_in_flight.set(false);
             return;
@@ -97,7 +103,7 @@ pub fn ProbeCatalog() -> Element {
         if offset == 0 {
             probes.set(page.probes);
         } else if !page.probes.is_empty() {
-            let mut merged = probes();
+            let mut merged = probes.peek().clone();
             merged.extend(page.probes);
             probes.set(merged);
         }
@@ -193,10 +199,26 @@ pub fn ProbeCatalog() -> Element {
                             if !has_more_pages() || probes_loading() || page_request_in_flight() {
                                 return;
                             }
-                            let remaining_px = evt.data().scroll_height() as f64
-                                - (evt.data().scroll_top() + evt.data().client_height() as f64);
+                            let data = evt.data();
+                            let scroll_top = data.scroll_top();
+                            if scroll_top + 4.0 < last_scroll_top() && !scroll_load_armed() {
+                                // Rearm only on explicit upward scroll movement.
+                                scroll_load_armed.set(true);
+                            }
+                            last_scroll_top.set(scroll_top);
+
+                            let remaining_px = data.scroll_height() as f64
+                                - (scroll_top + data.client_height() as f64);
                             if remaining_px <= 180.0 {
-                                page_offset.set(page_offset().saturating_add(PAGE_SIZE));
+                                if !scroll_load_armed() {
+                                    return;
+                                }
+                                let next_offset = probes().len();
+                                if next_offset > page_offset() {
+                                    page_request_in_flight.set(true);
+                                    page_offset.set(next_offset);
+                                    scroll_load_armed.set(false);
+                                }
                             }
                         },
                         if probes_snapshot.is_empty() && !probes_loading() {
