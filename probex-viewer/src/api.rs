@@ -1,7 +1,8 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProbeSchema, ProbeSchemaKind,
-    ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
-    StartTraceRequest, SyscallLatencyStats, TraceRunStatus, TraceRunStatusResponse, TraceSummary,
+    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse,
+    ProbeSchema, ProbeSchemaKind, ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime,
+    ProcessLifetimesResponse, StartTraceRequest, SyscallLatencyStats, TraceRunStatus,
+    TraceRunStatusResponse, TraceSummary,
 };
 
 pub type ApiResult<T> = Result<T, String>;
