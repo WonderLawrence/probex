@@ -19,11 +19,12 @@ use view_model::{
 };
 
 use crate::api::{
-    EventFlamegraphResponse, EventTypeCounts, HistogramResponse, ProcessEventsResponse,
-    ProcessLifetimesResponse, StartTraceRequest, TraceRunStatus, TraceSummary,
-    get_event_flamegraph, get_event_type_counts, get_histogram, get_pid_event_type_counts,
-    get_process_events, get_process_lifetimes, get_summary, get_syscall_latency_stats,
-    get_trace_run_status, load_trace_file, start_trace_run, stop_trace_run,
+    CustomProbeSpec, EventFlamegraphResponse, EventTypeCounts, HistogramResponse,
+    ProcessEventsResponse, ProcessLifetimesResponse, StartTraceRequest, TraceRunStatus,
+    TraceSummary, get_event_flamegraph, get_event_type_counts, get_histogram,
+    get_pid_event_type_counts, get_process_events, get_process_lifetimes, get_summary,
+    get_syscall_latency_stats, get_trace_run_status, load_trace_file, start_trace_run,
+    stop_trace_run,
 };
 
 const FAVICON: Asset = asset!("/assets/favicon.ico");
@@ -68,6 +69,7 @@ fn TraceViewer() -> Element {
     let mut trace_args = use_signal(String::new);
     let mut trace_output = use_signal(|| "trace.parquet".to_string());
     let mut trace_sample_freq = use_signal(|| "999".to_string());
+    let custom_probes = use_signal(Vec::<CustomProbeSpec>::new);
     let mut trace_run_status = use_signal(|| TraceRunStatus::Idle);
     let mut trace_status_sequence = use_signal(|| 0u64);
     let trace_last_loaded_run_id = use_signal(|| Option::<u64>::None);
@@ -263,6 +265,7 @@ fn TraceViewer() -> Element {
     rsx! {
         ViewerHeader {
             summary: summary_data.clone(),
+            custom_probes,
         }
 
         div { class: "w-full px-3 sm:px-4 lg:px-6 py-3 space-y-2",
@@ -339,6 +342,7 @@ fn TraceViewer() -> Element {
                                 .split_whitespace()
                                 .map(str::to_string)
                                 .collect::<Vec<_>>();
+                            let selected_custom_probes = custom_probes();
                             trace_error.set(None);
                             spawn(async move {
                                 match start_trace_run(StartTraceRequest {
@@ -346,6 +350,7 @@ fn TraceViewer() -> Element {
                                     args,
                                     output_parquet,
                                     sample_freq_hz: parsed_sample,
+                                    custom_probes: selected_custom_probes,
                                 }).await {
                                     Ok(response) => {
                                         trace_status_sequence.set(response.sequence);

@@ -1,6 +1,7 @@
 pub use probex_common::viewer_api::{
-    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse,
-    ProbeSchema, ProbeSchemaKind, ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime,
+    CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp, CustomProbeSpec,
+    EventFlamegraphResponse, EventMarker, EventTypeCounts, HistogramResponse, ProbeSchema,
+    ProbeSchemaKind, ProbeSchemasPageResponse, ProcessEventsResponse, ProcessLifetime,
     ProcessLifetimesResponse, StartTraceRequest, SyscallLatencyStats, TraceRunStatus,
     TraceRunStatusResponse, TraceSummary,
 };

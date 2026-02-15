@@ -306,6 +306,43 @@ pub mod viewer_api {
         pub fields: Vec<ProbeSchemaField>,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CustomProbeFieldRef {
+        Field { name: String },
+        Arg { name: String },
+        Return,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum CustomProbeFilterOp {
+        Eq,
+        Ne,
+        Gt,
+        Ge,
+        Lt,
+        Le,
+        Contains,
+        StartsWith,
+        EndsWith,
+        IsNull,
+        IsNotNull,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomProbeFilter {
+        pub field: CustomProbeFieldRef,
+        pub op: CustomProbeFilterOp,
+        pub value: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct CustomProbeSpec {
+        pub probe_display_name: String,
+        pub record_fields: Vec<CustomProbeFieldRef>,
+        pub record_stack_trace: bool,
+        pub filters: Vec<CustomProbeFilter>,
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
     pub struct ProbeSchemasResponse {
         pub probes: Vec<ProbeSchema>,
@@ -327,6 +364,7 @@ pub mod viewer_api {
         pub args: Vec<String>,
         pub output_parquet: String,
         pub sample_freq_hz: u64,
+        pub custom_probes: Vec<CustomProbeSpec>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

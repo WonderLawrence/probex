@@ -1,11 +1,14 @@
 use dioxus::prelude::*;
 
 use super::probe_catalog::ProbeCatalog;
-use crate::api::TraceSummary;
+use crate::api::{CustomProbeSpec, TraceSummary};
 use crate::app::formatting::format_duration;
 
 #[component]
-pub fn ViewerHeader(summary: Option<TraceSummary>) -> Element {
+pub fn ViewerHeader(
+    summary: Option<TraceSummary>,
+    custom_probes: Signal<Vec<CustomProbeSpec>>,
+) -> Element {
     let duration = summary
         .as_ref()
         .map(|s| s.max_ts_ns.saturating_sub(s.min_ts_ns))
@@ -24,7 +27,7 @@ pub fn ViewerHeader(summary: Option<TraceSummary>) -> Element {
                     }
                 }
             }
-            ProbeCatalog {}
+            ProbeCatalog { custom_probes }
         }
     }
 }

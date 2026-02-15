@@ -1,7 +1,10 @@
 use dioxus::prelude::*;
 use std::collections::{HashMap, HashSet};
 
-use crate::api::{ProbeSchema, ProbeSchemaKind, get_probe_schema_detail, get_probe_schemas_page};
+use crate::api::{
+    CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp, CustomProbeSpec, ProbeSchema,
+    ProbeSchemaKind, get_probe_schema_detail, get_probe_schemas_page,
+};
 
 const PAGE_SIZE: usize = 400;
 const DEFAULT_KIND_FILTERS: &[&str] = &["tracepoint", "fentry", "fexit"];
@@ -21,7 +24,7 @@ struct MockProbeConfig {
 }
 
 #[component]
-pub fn ProbeCatalog() -> Element {
+pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
     let mut search_query = use_signal(String::new);
     let mut selected_kinds = use_signal(|| {
         DEFAULT_KIND_FILTERS
@@ -116,6 +119,13 @@ pub fn ProbeCatalog() -> Element {
     let selected_probe_set: HashSet<String> = selected_probes().iter().cloned().collect();
     let probes_snapshot = probes();
     let selected_probes_snapshot = selected_probes();
+
+    use_effect(move || {
+        let selected = selected_probes();
+        let schemas = selected_probe_schemas();
+        let configs = probe_configs();
+        custom_probes.set(build_custom_probe_specs(&selected, &schemas, &configs));
+    });
 
     rsx! {
         details { class: "rounded border border-gray-200 bg-gray-50 px-2 py-1",
@@ -503,7 +513,7 @@ pub fn ProbeCatalog() -> Element {
                     }
 
                     div { class: "border-t border-gray-200 pt-2 space-y-2",
-                        span { class: "text-xs font-medium text-gray-700", "Probe Editor (Mock)" }
+                        span { class: "text-xs font-medium text-gray-700", "Probe Editor" }
                         if let Some(active_id) = active_editor_probe() {
                             if let Some(schema) = selected_probe_schemas().get(&active_id).cloned() {
                                 {
@@ -540,16 +550,29 @@ pub fn ProbeCatalog() -> Element {
                                             } else {
                                                 div { class: "space-y-1",
                                                     {options.iter().map(|opt| {
-                                                        let checked = config.record_fields.iter().any(|key| key == &opt.key);
+                                                        let disabled = is_fentry_ret_option(&schema, &opt.key);
+                                                        let checked = !disabled
+                                                            && config.record_fields.iter().any(|key| key == &opt.key);
                                                         rsx! {
-                                                            label { key: "{active_id}:record:{opt.key}", class: "flex items-center gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-700 cursor-pointer",
+                                                            label {
+                                                                key: "{active_id}:record:{opt.key}",
+                                                                class: if disabled {
+                                                                    "flex items-center gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-400 cursor-not-allowed line-through"
+                                                                } else {
+                                                                    "flex items-center gap-2 rounded border border-gray-200 bg-gray-50 px-2 py-1 text-[10px] text-gray-700 cursor-pointer"
+                                                                },
                                                                 input {
                                                                     r#type: "checkbox",
                                                                     checked,
+                                                                    disabled,
                                                                     onclick: {
                                                                         let active_id = active_id.clone();
                                                                         let key = opt.key.clone();
+                                                                        let disabled = disabled;
                                                                         move |_| {
+                                                                            if disabled {
+                                                                                return;
+                                                                            }
                                                                             let mut all = probe_configs();
                                                                             let cfg = all.entry(active_id.clone()).or_default();
                                                                             if cfg.record_fields.iter().any(|item| item == &key) {
@@ -827,6 +850,10 @@ fn mock_filter_field_options(probe: &ProbeSchema) -> Vec<MockFieldOption> {
     options
 }
 
+fn is_fentry_ret_option(schema: &ProbeSchema, key: &str) -> bool {
+    schema.kind == ProbeSchemaKind::Fentry && key == "ret"
+}
+
 fn infer_filter_kind(ty: &str) -> MockFilterKind {
     let lowered = ty.to_ascii_lowercase();
     if lowered.contains("bool") {
@@ -888,5 +915,90 @@ fn format_filter_preview(options: &[MockFieldOption], rule: &MockFilterRule) -> 
         }
     } else {
         format!("{field} {}", rule.operator)
+    }
+}
+
+fn build_custom_probe_specs(
+    selected: &[String],
+    schemas: &HashMap<String, ProbeSchema>,
+    configs: &HashMap<String, MockProbeConfig>,
+) -> Vec<CustomProbeSpec> {
+    let mut specs = Vec::with_capacity(selected.len());
+    for probe_display_name in selected {
+        let Some(schema) = schemas.get(probe_display_name) else {
+            continue;
+        };
+        let cfg = configs.get(probe_display_name).cloned().unwrap_or_default();
+
+        let mut record_fields = Vec::new();
+        for key in &cfg.record_fields {
+            if is_fentry_ret_option(schema, key) {
+                continue;
+            }
+            if let Some(field_ref) = parse_field_ref(key) {
+                record_fields.push(field_ref);
+            }
+        }
+
+        let mut filters = Vec::new();
+        for rule in &cfg.filters {
+            if is_fentry_ret_option(schema, &rule.field_key) {
+                continue;
+            }
+            let Some(field) = parse_field_ref(&rule.field_key) else {
+                continue;
+            };
+            let Some(op) = parse_filter_op(&rule.operator) else {
+                continue;
+            };
+            let value = if operator_needs_value(&rule.operator) {
+                Some(rule.value.clone())
+            } else {
+                None
+            };
+            filters.push(CustomProbeFilter { field, op, value });
+        }
+
+        specs.push(CustomProbeSpec {
+            probe_display_name: probe_display_name.clone(),
+            record_fields,
+            record_stack_trace: cfg.record_stack_trace,
+            filters,
+        });
+    }
+    specs
+}
+
+fn parse_field_ref(key: &str) -> Option<CustomProbeFieldRef> {
+    if let Some(name) = key.strip_prefix("field:") {
+        return Some(CustomProbeFieldRef::Field {
+            name: name.to_string(),
+        });
+    }
+    if let Some(name) = key.strip_prefix("arg:") {
+        return Some(CustomProbeFieldRef::Arg {
+            name: name.to_string(),
+        });
+    }
+    if key == "ret" {
+        return Some(CustomProbeFieldRef::Return);
+    }
+    None
+}
+
+fn parse_filter_op(value: &str) -> Option<CustomProbeFilterOp> {
+    match value {
+        "==" => Some(CustomProbeFilterOp::Eq),
+        "!=" => Some(CustomProbeFilterOp::Ne),
+        ">" => Some(CustomProbeFilterOp::Gt),
+        ">=" => Some(CustomProbeFilterOp::Ge),
+        "<" => Some(CustomProbeFilterOp::Lt),
+        "<=" => Some(CustomProbeFilterOp::Le),
+        "contains" => Some(CustomProbeFilterOp::Contains),
+        "starts_with" => Some(CustomProbeFilterOp::StartsWith),
+        "ends_with" => Some(CustomProbeFilterOp::EndsWith),
+        "is_null" => Some(CustomProbeFilterOp::IsNull),
+        "is_not_null" => Some(CustomProbeFilterOp::IsNotNull),
+        _ => None,
     }
 }

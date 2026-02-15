@@ -1697,6 +1697,7 @@ pub(crate) struct TraceCommandConfig {
     pub sample_freq_hz: u64,
     pub program: String,
     pub args: Vec<String>,
+    pub custom_probes: Vec<probex_common::viewer_api::CustomProbeSpec>,
 }
 
 #[derive(Clone, Debug)]
@@ -1710,6 +1711,12 @@ pub(crate) async fn run_trace_command(
     mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
     allow_ctrl_c: bool,
 ) -> Result<TraceCommandOutcome> {
+    if !config.custom_probes.is_empty() {
+        info!(
+            "Received {} custom probe spec(s); runtime attachment is not wired yet and these specs are currently metadata-only",
+            config.custom_probes.len()
+        );
+    }
     let privilege_drop_target = resolve_privilege_drop_target()?;
     // Bump the memlock rlimit
     let rlim = libc::rlimit {
@@ -2059,6 +2066,7 @@ async fn main() -> Result<()> {
             sample_freq_hz: args.sample_freq,
             program: program.clone(),
             args: program_args.to_vec(),
+            custom_probes: Vec::new(),
         },
         None,
         true,

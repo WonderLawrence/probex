@@ -1,5 +1,9 @@
 use crate::{TraceCommandConfig, run_trace_command, viewer_backend};
-use probex_common::viewer_api::{StartTraceRequest, TraceRunStatus, TraceRunStatusResponse};
+use probex_common::viewer_api::{
+    CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp, CustomProbeSpec, ProbeSchema,
+    ProbeSchemaKind, StartTraceRequest, TraceRunStatus, TraceRunStatusResponse,
+};
+use std::collections::HashSet;
 use std::io::{Error as IoError, ErrorKind};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -88,6 +92,237 @@ fn to_status_response(state: &TraceRuntimeState) -> TraceRunStatusResponse {
 
 fn mark_state_changed(state: &mut TraceRuntimeState) {
     state.sequence = state.sequence.saturating_add(1);
+}
+
+#[derive(Clone, Copy)]
+enum FilterValueKind {
+    Integer,
+    Boolean,
+    StringLike,
+    Address,
+}
+
+fn infer_filter_kind(ty: &str) -> FilterValueKind {
+    let lowered = ty.to_ascii_lowercase();
+    if lowered.contains("bool") {
+        return FilterValueKind::Boolean;
+    }
+    if lowered.contains("char") && lowered.contains('*') {
+        return FilterValueKind::StringLike;
+    }
+    if lowered.contains("string") {
+        return FilterValueKind::StringLike;
+    }
+    if lowered.contains('*')
+        || lowered.contains("ptr")
+        || lowered.contains("addr")
+        || lowered.contains("void *")
+    {
+        return FilterValueKind::Address;
+    }
+    FilterValueKind::Integer
+}
+
+fn filter_op_requires_value(op: &CustomProbeFilterOp) -> bool {
+    !matches!(
+        op,
+        CustomProbeFilterOp::IsNull | CustomProbeFilterOp::IsNotNull
+    )
+}
+
+fn validate_filter_op_for_kind(op: &CustomProbeFilterOp, kind: FilterValueKind) -> bool {
+    match kind {
+        FilterValueKind::Integer => matches!(
+            op,
+            CustomProbeFilterOp::Eq
+                | CustomProbeFilterOp::Ne
+                | CustomProbeFilterOp::Gt
+                | CustomProbeFilterOp::Ge
+                | CustomProbeFilterOp::Lt
+                | CustomProbeFilterOp::Le
+        ),
+        FilterValueKind::Boolean => matches!(op, CustomProbeFilterOp::Eq | CustomProbeFilterOp::Ne),
+        FilterValueKind::StringLike => matches!(
+            op,
+            CustomProbeFilterOp::Eq
+                | CustomProbeFilterOp::Ne
+                | CustomProbeFilterOp::Contains
+                | CustomProbeFilterOp::StartsWith
+                | CustomProbeFilterOp::EndsWith
+        ),
+        FilterValueKind::Address => matches!(
+            op,
+            CustomProbeFilterOp::Eq
+                | CustomProbeFilterOp::Ne
+                | CustomProbeFilterOp::IsNull
+                | CustomProbeFilterOp::IsNotNull
+        ),
+    }
+}
+
+fn resolve_field_type<'a>(
+    schema: &'a ProbeSchema,
+    field_ref: &CustomProbeFieldRef,
+) -> Option<&'a str> {
+    match field_ref {
+        CustomProbeFieldRef::Field { name } => schema
+            .fields
+            .iter()
+            .find(|field| &field.name == name)
+            .map(|field| field.field_type.as_str()),
+        CustomProbeFieldRef::Arg { name } => schema
+            .args
+            .iter()
+            .find(|arg| &arg.name == name)
+            .map(|arg| arg.arg_type.as_str()),
+        CustomProbeFieldRef::Return => schema.return_type.as_deref(),
+    }
+}
+
+fn describe_field_ref(field_ref: &CustomProbeFieldRef) -> String {
+    match field_ref {
+        CustomProbeFieldRef::Field { name } => format!("field:{name}"),
+        CustomProbeFieldRef::Arg { name } => format!("arg:{name}"),
+        CustomProbeFieldRef::Return => "ret".to_string(),
+    }
+}
+
+fn validate_filter(
+    schema: &ProbeSchema,
+    probe_display_name: &str,
+    filter: &CustomProbeFilter,
+) -> RuntimeResult<()> {
+    let ty = resolve_field_type(schema, &filter.field).ok_or_else(|| {
+        IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "custom probe '{probe_display_name}' references unknown filter field '{}'",
+                describe_field_ref(&filter.field)
+            ),
+        )
+    })?;
+    let kind = infer_filter_kind(ty);
+    if !validate_filter_op_for_kind(&filter.op, kind) {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "custom probe '{probe_display_name}' uses incompatible operator '{:?}' for filter field '{}'",
+                filter.op,
+                describe_field_ref(&filter.field)
+            ),
+        )
+        .into());
+    }
+    if filter_op_requires_value(&filter.op) {
+        let value = filter.value.as_deref().ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "custom probe '{probe_display_name}' filter '{}' requires a value",
+                    describe_field_ref(&filter.field)
+                ),
+            )
+        })?;
+        if value.trim().is_empty() {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "custom probe '{probe_display_name}' filter '{}' requires a non-empty value",
+                    describe_field_ref(&filter.field)
+                ),
+            )
+            .into());
+        }
+    } else if filter.value.is_some() {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "custom probe '{probe_display_name}' filter '{}' must not set a value for operator '{:?}'",
+                describe_field_ref(&filter.field),
+                filter.op
+            ),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn validate_custom_probes(specs: &[CustomProbeSpec]) -> RuntimeResult<()> {
+    let mut seen_display_names = HashSet::new();
+    for spec in specs {
+        if spec.probe_display_name.trim().is_empty() {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                "custom probe display_name must not be empty",
+            )
+            .into());
+        }
+        if !seen_display_names.insert(spec.probe_display_name.clone()) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "duplicate custom probe in trace request: '{}'",
+                    spec.probe_display_name
+                ),
+            )
+            .into());
+        }
+
+        let schema = viewer_backend::query_probe_schema_detail(spec.probe_display_name.clone())
+            .await
+            .map_err(|error| {
+                IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "failed to resolve custom probe '{}': {error}",
+                        spec.probe_display_name
+                    ),
+                )
+            })?;
+
+        for field_ref in &spec.record_fields {
+            if schema.kind == ProbeSchemaKind::Fentry
+                && matches!(field_ref, CustomProbeFieldRef::Return)
+            {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "custom probe '{}' cannot record 'ret' for fentry probes",
+                        spec.probe_display_name
+                    ),
+                )
+                .into());
+            }
+            if resolve_field_type(&schema, field_ref).is_none() {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "custom probe '{}' references unknown record field '{}'",
+                        spec.probe_display_name,
+                        describe_field_ref(field_ref)
+                    ),
+                )
+                .into());
+            }
+        }
+
+        for filter in &spec.filters {
+            if schema.kind == ProbeSchemaKind::Fentry
+                && matches!(filter.field, CustomProbeFieldRef::Return)
+            {
+                return Err(IoError::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "custom probe '{}' cannot filter on 'ret' for fentry probes",
+                        spec.probe_display_name
+                    ),
+                )
+                .into());
+            }
+            validate_filter(&schema, &spec.probe_display_name, filter)?;
+        }
+    }
+    Ok(())
 }
 
 async fn refresh_active_run(state: &mut TraceRuntimeState) -> RuntimeResult<()> {
@@ -183,6 +418,7 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
     if request.sample_freq_hz == 0 {
         return Err(IoError::new(ErrorKind::InvalidInput, "sample_freq_hz must be > 0").into());
     }
+    validate_custom_probes(&request.custom_probes).await?;
 
     let mut state = state().lock().await;
     refresh_active_run(&mut state).await?;
@@ -208,6 +444,7 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
         sample_freq_hz: request.sample_freq_hz,
         program: request.program,
         args: request.args,
+        custom_probes: request.custom_probes,
     };
     let task = tokio::spawn(async move { run_trace_command(config, Some(stop_rx), false).await });
 
