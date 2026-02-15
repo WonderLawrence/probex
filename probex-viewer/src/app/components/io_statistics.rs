@@ -1,7 +1,31 @@
+use charming::Chart;
+use charming::component::{Axis, DataZoom, DataZoomType, Grid, Legend};
+use charming::element::{
+    AxisLabel, AxisType, Formatter, ItemStyle, JsFunction, LineStyle, TextStyle, Tooltip, Trigger,
+};
+use charming::series::{Bar, Line};
 use dioxus::prelude::*;
 
-use crate::api::{CumulativeMemoryPoint, IoStatistics, IoTypeStats, MemoryStatistics, SizeBucket};
-use crate::app::formatting::{format_bytes, format_count, format_duration};
+use super::echart::EChart;
+use crate::api::{IoStatistics, IoTypeStats, MemoryStatistics};
+use crate::app::formatting::{format_bytes, format_count, format_duration, format_duration_short};
+
+const OP_COLORS: &[&str] = &[
+    "#60a5fa", // blue
+    "#f97316", // orange
+    "#a78bfa", // purple
+    "#34d399", // green
+    "#f472b6", // pink
+    "#facc15", // yellow
+];
+
+fn percentile_value(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
 
 #[derive(Clone, PartialEq)]
 pub struct IoMemoryCardData {
@@ -14,7 +38,10 @@ pub struct IoMemoryCardData {
 #[component]
 pub fn IoMemoryCard(data: IoMemoryCardData) -> Element {
     let has_io = data.io_stats.as_ref().is_some_and(|s| s.total_ops > 0);
-    let has_mem = data.mem_stats.as_ref().is_some_and(|s| s.total_alloc_ops + s.total_free_ops > 0);
+    let has_mem = data
+        .mem_stats
+        .as_ref()
+        .is_some_and(|s| s.total_alloc_ops + s.total_free_ops > 0);
     let io_loading = data.io_loading;
     let mem_loading = data.mem_loading;
 
@@ -51,7 +78,7 @@ pub fn IoMemoryCard(data: IoMemoryCardData) -> Element {
     }
 }
 
-// ---------- IO section (preserved from original) ----------
+// ---------- IO section ----------
 
 #[component]
 fn IoSection(stats: Option<IoStatistics>, loading: bool) -> Element {
@@ -77,42 +104,14 @@ fn IoSection(stats: Option<IoStatistics>, loading: bool) -> Element {
             LoadingIndicator { label: "Updating..." }
         }
 
-        div { class: "text-[11px] text-gray-500 font-medium", "IO" }
-        div { class: "text-[11px] text-gray-500",
-            "{format_count(stats.total_ops)} ops · {format_bytes(stats.total_bytes)} total"
+        div { class: "text-[11px] text-gray-500 flex gap-1",
+            span { class: "font-medium", "IO" }
+            span { "{format_count(stats.total_ops)} ops · {format_bytes(stats.total_bytes)} total" }
         }
 
         IoSummaryTable { operations: stats.by_operation.clone() }
-
-        {
-            let latency_ops: Vec<_> = stats.by_operation.iter()
-                .filter(|op| !op.latency_histogram.is_empty() && op.total_ops > 0)
-                .collect();
-            rsx! {
-                if !latency_ops.is_empty() {
-                    div { class: "grid grid-cols-2 gap-2",
-                        for op in latency_ops.iter() {
-                            LatencyHistogram { stats: (*op).clone() }
-                        }
-                    }
-                }
-            }
-        }
-
-        {
-            let size_ops: Vec<_> = stats.by_operation.iter()
-                .filter(|op| !op.size_histogram.is_empty() && op.total_bytes > 0)
-                .collect();
-            rsx! {
-                if !size_ops.is_empty() {
-                    div { class: "grid grid-cols-2 gap-2",
-                        for op in size_ops.iter() {
-                            SizeDistribution { operation: op.operation.clone(), buckets: op.size_histogram.clone() }
-                        }
-                    }
-                }
-            }
-        }
+        LatencyCdfChart { operations: stats.by_operation.clone() }
+        SizeCdfChart { operations: stats.by_operation.clone() }
     }
 }
 
@@ -144,148 +143,435 @@ fn MemorySection(stats: Option<MemoryStatistics>, loading: bool) -> Element {
             LoadingIndicator { label: "Updating..." }
         }
 
-        div { class: "text-[11px] text-gray-500 font-medium", "Memory" }
-
-        // Summary: alloc / free / net
-        div { class: "text-[11px] text-gray-500",
-            "alloc {format_count(stats.total_alloc_ops)} ops · {format_bytes(stats.total_alloc_bytes)} — \
-             free {format_count(stats.total_free_ops)} ops · {format_bytes(stats.total_free_bytes)} — \
-             net {net_label}"
+        div { class: "text-[11px] text-gray-500 flex gap-1 flex-wrap",
+            span { class: "font-medium", "Memory" }
+            span {
+                "alloc {format_count(stats.total_alloc_ops)} ops · {format_bytes(stats.total_alloc_bytes)} — \
+                 free {format_count(stats.total_free_ops)} ops · {format_bytes(stats.total_free_bytes)} — \
+                 net {net_label}"
+            }
         }
 
-        // Per-operation table (mmap / munmap / brk)
         IoSummaryTable { operations: stats.by_operation.clone() }
+        LatencyCdfChart { operations: stats.by_operation.clone() }
+        SizeCdfChart { operations: stats.by_operation.clone() }
+    }
+}
 
-        // Latency histograms for memory ops
-        {
-            let latency_ops: Vec<_> = stats.by_operation.iter()
-                .filter(|op| !op.latency_histogram.is_empty() && op.total_ops > 0)
-                .collect();
-            rsx! {
-                if !latency_ops.is_empty() {
-                    div { class: "grid grid-cols-2 gap-2",
-                        for op in latency_ops.iter() {
-                            LatencyHistogram { stats: (*op).clone() }
-                        }
-                    }
-                }
+// ---------- Latency CDF + histogram ----------
+
+#[component]
+fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
+    let ops: Vec<&IoTypeStats> = operations
+        .iter()
+        .filter(|op| !op.latencies_ns.is_empty())
+        .collect();
+
+    if ops.is_empty() {
+        return rsx! {};
+    }
+
+    // Find reference operation for histogram bins (priority: io_uring > read > write)
+    let priority = ["io_uring", "read", "write"];
+    let ref_op = priority
+        .iter()
+        .find_map(|name| ops.iter().find(|op| op.operation == *name))
+        .copied()
+        .unwrap_or(ops[0]);
+
+    let global_p95 = percentile_value(&ref_op.latencies_ns, 0.95);
+    let global_max = ops
+        .iter()
+        .filter_map(|op| op.latencies_ns.last())
+        .max()
+        .copied()
+        .unwrap_or(1) as f64;
+
+    // Build CDF points per operation
+    let mut series_data: Vec<(String, &str, Vec<Vec<f64>>)> = Vec::new();
+
+    for (i, op) in ops.iter().enumerate() {
+        let n = op.latencies_ns.len();
+        let step = (n / 2000).max(1);
+        let mut points: Vec<Vec<f64>> = Vec::with_capacity(n / step + 2);
+
+        for (j, &lat) in op.latencies_ns.iter().enumerate() {
+            if j % step == 0 || j == n - 1 {
+                points.push(vec![lat as f64, (j + 1) as f64 / n as f64]);
             }
         }
 
-        // Size distribution
-        {
-            let size_ops: Vec<_> = stats.by_operation.iter()
-                .filter(|op| !op.size_histogram.is_empty() && op.total_bytes > 0)
-                .collect();
-            rsx! {
-                if !size_ops.is_empty() {
-                    div { class: "grid grid-cols-2 gap-2",
-                        for op in size_ops.iter() {
-                            SizeDistribution { operation: op.operation.clone(), buckets: op.size_histogram.clone() }
-                        }
-                    }
+        let color = OP_COLORS[i % OP_COLORS.len()];
+        series_data.push((op.operation.clone(), color, points));
+    }
+
+    let end_pct = if global_max > 1.0 {
+        ((global_p95 as f64).max(1.0).ln() / global_max.ln() * 100.0).clamp(10.0, 100.0)
+    } else {
+        100.0
+    };
+
+    // JS formatters for nanoseconds
+    let label_fmt = JsFunction::new_with_args(
+        "v",
+        "if(v>=1e9)return(v/1e9).toFixed(1)+'s';\
+         if(v>=1e6)return(v/1e6).toFixed(1)+'ms';\
+         if(v>=1e3)return(v/1e3).toFixed(0)+'\u{00b5}s';\
+         return v+'ns';",
+    );
+
+    let tooltip_fmt = JsFunction::new_with_args(
+        "ps",
+        "var f=function(v){if(v>=1e9)return(v/1e9).toFixed(2)+'s';\
+         if(v>=1e6)return(v/1e6).toFixed(2)+'ms';\
+         if(v>=1e3)return(v/1e3).toFixed(1)+'\u{00b5}s';\
+         return v+'ns';};\
+         var s='';\
+         for(var i=0;i<ps.length;i++){\
+         var p=ps[i];\
+         s+=p.marker+' '+p.seriesName+': '+f(p.data[0])+' = '+(p.data[1]*100).toFixed(1)+'%<br/>';}\
+         return s;",
+    );
+
+    // --- CDF chart ---
+    let mut cdf_chart = Chart::new()
+        .legend(
+            Legend::new()
+                .top("0")
+                .left("center")
+                .text_style(TextStyle::new().font_size(10.0)),
+        )
+        .grid(
+            Grid::new()
+                .left("40")
+                .right("12")
+                .top("28")
+                .bottom("34")
+                .contain_label(true),
+        )
+        .x_axis(
+            Axis::new().type_(AxisType::Log).axis_label(
+                AxisLabel::new()
+                    .formatter(Formatter::Function(label_fmt))
+                    .font_size(10.0),
+            ),
+        )
+        .y_axis(
+            Axis::new().type_(AxisType::Value).min(0).max(1).axis_label(
+                AxisLabel::new()
+                    .formatter(Formatter::String("{value}".into()))
+                    .font_size(10.0),
+            ),
+        )
+        .tooltip(
+            Tooltip::new()
+                .trigger(Trigger::Axis)
+                .formatter(Formatter::Function(tooltip_fmt)),
+        )
+        .data_zoom(
+            DataZoom::new()
+                .type_(DataZoomType::Slider)
+                .x_axis_index(0)
+                .start(0)
+                .end(end_pct)
+                .bottom("2"),
+        )
+        .data_zoom(DataZoom::new().type_(DataZoomType::Inside).x_axis_index(0))
+        .animation(false);
+
+    for (name, color, points) in &series_data {
+        let line = Line::new()
+            .name(name.clone())
+            .show_symbol(false)
+            .item_style(ItemStyle::new().color(*color))
+            .line_style(LineStyle::new().color(*color).width(2.0))
+            .data(points.clone());
+
+        cdf_chart = cdf_chart.series(line);
+    }
+
+    // --- Histogram ---
+    // 9 equal-width bins spanning [0, P95], plus a 10th bucket for P95+
+    let p95_val = percentile_value(&ref_op.latencies_ns, 0.95);
+    let bin_width = (p95_val as f64 / 9.0).ceil() as u64;
+    let boundaries: Vec<u64> = if bin_width == 0 {
+        vec![1; 9]
+    } else {
+        (1..=9).map(|i| bin_width * i).collect()
+    };
+
+    let bin_labels: Vec<String> = {
+        let mut labels = Vec::with_capacity(10);
+        let mut prev = 0u64;
+        for &b in &boundaries {
+            labels.push(format!(
+                "{}-{}",
+                format_duration_short(prev),
+                format_duration_short(b)
+            ));
+            prev = b;
+        }
+        labels.push(format!("{}+", format_duration_short(prev)));
+        labels
+    };
+
+    let mut hist_chart = Chart::new()
+        .legend(
+            Legend::new()
+                .top("0")
+                .left("center")
+                .text_style(TextStyle::new().font_size(10.0)),
+        )
+        .grid(
+            Grid::new()
+                .left("40")
+                .right("8")
+                .top("28")
+                .bottom("24")
+                .contain_label(true),
+        )
+        .x_axis(
+            Axis::new()
+                .type_(AxisType::Category)
+                .data(bin_labels)
+                .axis_label(AxisLabel::new().font_size(9.0).rotate(45)),
+        )
+        .y_axis(
+            Axis::new()
+                .type_(AxisType::Value)
+                .axis_label(AxisLabel::new().font_size(10.0)),
+        )
+        .tooltip(Tooltip::new().trigger(Trigger::Axis))
+        .animation(false);
+
+    for (i, op) in ops.iter().enumerate() {
+        let counts = count_in_bins(&op.latencies_ns, &boundaries);
+        let color = OP_COLORS[i % OP_COLORS.len()];
+        hist_chart = hist_chart.series(
+            Bar::new()
+                .name(op.operation.clone())
+                .item_style(ItemStyle::new().color(color))
+                .data(counts),
+        );
+    }
+
+    rsx! {
+        div { class: "space-y-0.5",
+            div { class: "text-[11px] text-gray-500 font-medium", "Latency CDF" }
+            div { class: "flex gap-1",
+                div { class: "flex-[2] min-w-0",
+                    EChart { chart: cdf_chart, height: "220px" }
+                }
+                div { class: "flex-1 min-w-0",
+                    EChart { chart: hist_chart, height: "220px" }
                 }
             }
-        }
-
-        // Cumulative memory usage chart
-        if !stats.cumulative_usage.is_empty() {
-            CumulativeMemoryChart { points: stats.cumulative_usage.clone(), time_range_ns: stats.time_range_ns }
         }
     }
 }
 
-// ---------- Cumulative memory usage SVG chart ----------
+// ---------- Size CDF + histogram ----------
 
 #[component]
-fn CumulativeMemoryChart(points: Vec<CumulativeMemoryPoint>, time_range_ns: (u64, u64)) -> Element {
-    let (t0, t1) = time_range_ns;
-    if t1 <= t0 || points.is_empty() {
+fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
+    let ops: Vec<&IoTypeStats> = operations
+        .iter()
+        .filter(|op| !op.sizes_bytes.is_empty())
+        .collect();
+
+    if ops.is_empty() {
         return rsx! {};
     }
 
-    let width: f64 = 400.0;
-    let height: f64 = 80.0;
-    let pad_y: f64 = 4.0;
+    // Find reference operation for histogram bins (priority: io_uring > read > write)
+    let priority = ["io_uring", "read", "write"];
+    let ref_op = priority
+        .iter()
+        .find_map(|name| ops.iter().find(|op| op.operation == *name))
+        .copied()
+        .unwrap_or(ops[0]);
 
-    let min_bytes = points.iter().map(|p| p.cumulative_bytes).min().unwrap_or(0);
-    let max_bytes = points.iter().map(|p| p.cumulative_bytes).max().unwrap_or(0);
-    let byte_range = (max_bytes - min_bytes).max(1) as f64;
+    let global_p95 = percentile_value(&ref_op.sizes_bytes, 0.95);
+    let global_max = ops
+        .iter()
+        .filter_map(|op| op.sizes_bytes.last())
+        .max()
+        .copied()
+        .unwrap_or(1) as f64;
 
-    let time_to_x = |ts: u64| -> f64 {
-        (ts.saturating_sub(t0) as f64 / (t1 - t0) as f64) * width
-    };
-    let bytes_to_y = |b: i64| -> f64 {
-        let frac = (b - min_bytes) as f64 / byte_range;
-        height - pad_y - frac * (height - 2.0 * pad_y)
-    };
+    // Build CDF points per operation
+    let mut series_data: Vec<(String, &str, Vec<Vec<f64>>)> = Vec::new();
 
-    // Build SVG path: area fill + line
-    let mut line_path = String::new();
-    let mut area_path = String::new();
-    let baseline_y = bytes_to_y(0_i64.max(min_bytes));
+    for (i, op) in ops.iter().enumerate() {
+        let n = op.sizes_bytes.len();
+        let step = (n / 2000).max(1);
+        let mut points: Vec<Vec<f64>> = Vec::with_capacity(n / step + 2);
 
-    for (i, p) in points.iter().enumerate() {
-        let x = time_to_x(p.ts_ns);
-        let y = bytes_to_y(p.cumulative_bytes);
-        if i == 0 {
-            area_path.push_str(&format!("M{x:.1},{baseline_y:.1} L{x:.1},{y:.1}"));
-            line_path.push_str(&format!("M{x:.1},{y:.1}"));
-        } else {
-            area_path.push_str(&format!(" L{x:.1},{y:.1}"));
-            line_path.push_str(&format!(" L{x:.1},{y:.1}"));
+        for (j, &sz) in op.sizes_bytes.iter().enumerate() {
+            if j % step == 0 || j == n - 1 {
+                points.push(vec![sz as f64, (j + 1) as f64 / n as f64]);
+            }
         }
+
+        let color = OP_COLORS[i % OP_COLORS.len()];
+        series_data.push((op.operation.clone(), color, points));
     }
 
-    // Close area path
-    if let Some(last) = points.last() {
-        let last_x = time_to_x(last.ts_ns);
-        area_path.push_str(&format!(" L{last_x:.1},{baseline_y:.1} Z"));
+    let end_pct = if global_max > 1.0 {
+        ((global_p95 as f64).max(1.0).ln() / global_max.ln() * 100.0).clamp(10.0, 100.0)
+    } else {
+        100.0
+    };
+
+    // JS formatters for bytes
+    let label_fmt = JsFunction::new_with_args(
+        "v",
+        "if(v>=1073741824)return(v/1073741824).toFixed(1)+'GiB';\
+         if(v>=1048576)return(v/1048576).toFixed(1)+'MiB';\
+         if(v>=1024)return(v/1024).toFixed(0)+'KiB';\
+         return v+'B';",
+    );
+
+    let tooltip_fmt = JsFunction::new_with_args(
+        "ps",
+        "var f=function(v){if(v>=1073741824)return(v/1073741824).toFixed(2)+'GiB';\
+         if(v>=1048576)return(v/1048576).toFixed(2)+'MiB';\
+         if(v>=1024)return(v/1024).toFixed(1)+'KiB';\
+         return v+'B';};\
+         var s='';\
+         for(var i=0;i<ps.length;i++){\
+         var p=ps[i];\
+         s+=p.marker+' '+p.seriesName+': '+f(p.data[0])+' = '+(p.data[1]*100).toFixed(1)+'%<br/>';}\
+         return s;",
+    );
+
+    // --- CDF chart ---
+    let mut cdf_chart = Chart::new()
+        .legend(
+            Legend::new()
+                .top("0")
+                .left("center")
+                .text_style(TextStyle::new().font_size(10.0)),
+        )
+        .grid(
+            Grid::new()
+                .left("40")
+                .right("12")
+                .top("28")
+                .bottom("34")
+                .contain_label(true),
+        )
+        .x_axis(
+            Axis::new().type_(AxisType::Log).axis_label(
+                AxisLabel::new()
+                    .formatter(Formatter::Function(label_fmt))
+                    .font_size(10.0),
+            ),
+        )
+        .y_axis(
+            Axis::new().type_(AxisType::Value).min(0).max(1).axis_label(
+                AxisLabel::new()
+                    .formatter(Formatter::String("{value}".into()))
+                    .font_size(10.0),
+            ),
+        )
+        .tooltip(
+            Tooltip::new()
+                .trigger(Trigger::Axis)
+                .formatter(Formatter::Function(tooltip_fmt)),
+        )
+        .data_zoom(
+            DataZoom::new()
+                .type_(DataZoomType::Slider)
+                .x_axis_index(0)
+                .start(0)
+                .end(end_pct)
+                .bottom("2"),
+        )
+        .data_zoom(DataZoom::new().type_(DataZoomType::Inside).x_axis_index(0))
+        .animation(false);
+
+    for (name, color, points) in &series_data {
+        let line = Line::new()
+            .name(name.clone())
+            .show_symbol(false)
+            .item_style(ItemStyle::new().color(*color))
+            .line_style(LineStyle::new().color(*color).width(2.0))
+            .data(points.clone());
+
+        cdf_chart = cdf_chart.series(line);
     }
 
-    // Y-axis labels
-    let max_label = format_signed_bytes(max_bytes);
-    let min_label = format_signed_bytes(min_bytes);
+    // --- Histogram ---
+    // 9 equal-width bins spanning [0, P95], plus a 10th bucket for P95+
+    let p95_val = percentile_value(&ref_op.sizes_bytes, 0.95);
+    let bin_width = (p95_val as f64 / 9.0).ceil() as u64;
+    let boundaries: Vec<u64> = if bin_width == 0 {
+        vec![1; 9]
+    } else {
+        (1..=9).map(|i| bin_width * i).collect()
+    };
+
+    let bin_labels: Vec<String> = {
+        let mut labels = Vec::with_capacity(10);
+        let mut prev = 0u64;
+        for &b in &boundaries {
+            labels.push(format!("{}-{}", format_bytes(prev), format_bytes(b)));
+            prev = b;
+        }
+        labels.push(format!("{}+", format_bytes(prev)));
+        labels
+    };
+
+    let mut hist_chart = Chart::new()
+        .legend(
+            Legend::new()
+                .top("0")
+                .left("center")
+                .text_style(TextStyle::new().font_size(10.0)),
+        )
+        .grid(
+            Grid::new()
+                .left("40")
+                .right("8")
+                .top("28")
+                .bottom("24")
+                .contain_label(true),
+        )
+        .x_axis(
+            Axis::new()
+                .type_(AxisType::Category)
+                .data(bin_labels)
+                .axis_label(AxisLabel::new().font_size(9.0).rotate(45)),
+        )
+        .y_axis(
+            Axis::new()
+                .type_(AxisType::Value)
+                .axis_label(AxisLabel::new().font_size(10.0)),
+        )
+        .tooltip(Tooltip::new().trigger(Trigger::Axis))
+        .animation(false);
+
+    for (i, op) in ops.iter().enumerate() {
+        let counts = count_in_bins(&op.sizes_bytes, &boundaries);
+        let color = OP_COLORS[i % OP_COLORS.len()];
+        hist_chart = hist_chart.series(
+            Bar::new()
+                .name(op.operation.clone())
+                .item_style(ItemStyle::new().color(color))
+                .data(counts),
+        );
+    }
 
     rsx! {
         div { class: "space-y-0.5",
-            div { class: "text-[11px] text-gray-500 font-medium", "Cumulative memory" }
-            div { class: "relative",
-                svg {
-                    width: "{width}",
-                    height: "{height}",
-                    view_box: "0 0 {width} {height}",
-                    class: "w-full",
-                    // Zero line
-                    line {
-                        x1: "0",
-                        y1: "{baseline_y:.1}",
-                        x2: "{width}",
-                        y2: "{baseline_y:.1}",
-                        stroke: "#e5e7eb",
-                        stroke_width: "1",
-                        stroke_dasharray: "3,2",
-                    }
-                    // Area fill
-                    path {
-                        d: "{area_path}",
-                        fill: "#818cf8",
-                        fill_opacity: "0.15",
-                    }
-                    // Line
-                    path {
-                        d: "{line_path}",
-                        fill: "none",
-                        stroke: "#6366f1",
-                        stroke_width: "1.5",
-                    }
+            div { class: "text-[11px] text-gray-500 font-medium", "Size CDF" }
+            div { class: "flex gap-1",
+                div { class: "flex-[2] min-w-0",
+                    EChart { chart: cdf_chart, height: "220px" }
                 }
-                // Y-axis labels overlay
-                div { class: "absolute top-0 left-0 text-[9px] text-gray-400 font-mono leading-none pl-0.5",
-                    "{max_label}"
-                }
-                div { class: "absolute bottom-0 left-0 text-[9px] text-gray-400 font-mono leading-none pl-0.5",
-                    "{min_label}"
+                div { class: "flex-1 min-w-0",
+                    EChart { chart: hist_chart, height: "220px" }
                 }
             }
         }
@@ -331,72 +617,6 @@ fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
 }
 
 #[component]
-fn LatencyHistogram(stats: IoTypeStats) -> Element {
-    let max_count = stats
-        .latency_histogram
-        .iter()
-        .map(|b| b.count)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-
-    rsx! {
-        div { class: "space-y-0.5",
-            div { class: "text-[11px] text-gray-500 font-medium", "{stats.operation} latency" }
-            for bucket in stats.latency_histogram.iter() {
-                if bucket.count > 0 {
-                    BarRow {
-                        label: bucket.label.clone(),
-                        count: bucket.count,
-                        max_count,
-                        color: "bg-blue-400",
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn SizeDistribution(operation: String, buckets: Vec<SizeBucket>) -> Element {
-    let max_count = buckets.iter().map(|b| b.count).max().unwrap_or(1).max(1);
-
-    rsx! {
-        div { class: "space-y-0.5",
-            div { class: "text-[11px] text-gray-500 font-medium", "{operation} size" }
-            for bucket in buckets.iter() {
-                if bucket.count > 0 {
-                    BarRow {
-                        label: bucket.label.clone(),
-                        count: bucket.count,
-                        max_count,
-                        color: "bg-emerald-400",
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn BarRow(label: String, count: u64, max_count: u64, color: &'static str) -> Element {
-    let width_pct = (count as f64 / max_count as f64 * 100.0).max(0.5);
-
-    rsx! {
-        div { class: "flex items-center gap-1 h-4",
-            span { class: "text-[10px] text-gray-500 w-16 text-right shrink-0 font-mono", "{label}" }
-            div { class: "flex-1 h-3 bg-gray-100 rounded-sm overflow-hidden",
-                div {
-                    class: "h-full {color} rounded-sm",
-                    style: "width: {width_pct}%;",
-                }
-            }
-            span { class: "text-[10px] text-gray-500 w-10 text-right shrink-0 font-mono", "{format_count(count)}" }
-        }
-    }
-}
-
-#[component]
 fn LoadingIndicator(label: &'static str) -> Element {
     rsx! {
         div { class: "text-[11px] text-gray-400 flex items-center gap-1",
@@ -408,20 +628,20 @@ fn LoadingIndicator(label: &'static str) -> Element {
 
 // ---------- Helpers ----------
 
+/// Count values from `sorted` into 10 bins defined by the given 9 percentile boundaries.
+fn count_in_bins(sorted: &[u64], boundaries: &[u64]) -> Vec<f64> {
+    let mut counts = vec![0u64; 10];
+    for &v in sorted {
+        let bin = boundaries.iter().position(|&b| v <= b).unwrap_or(9);
+        counts[bin] += 1;
+    }
+    counts.into_iter().map(|c| c as f64).collect()
+}
+
 fn format_net_bytes(allocated: u64, freed: u64) -> String {
     if allocated >= freed {
         format!("+{}", format_bytes(allocated - freed))
     } else {
         format!("-{}", format_bytes(freed - allocated))
-    }
-}
-
-fn format_signed_bytes(bytes: i64) -> String {
-    let abs = bytes.unsigned_abs();
-    let formatted = format_bytes(abs);
-    if bytes >= 0 {
-        format!("+{formatted}")
-    } else {
-        format!("-{formatted}")
     }
 }

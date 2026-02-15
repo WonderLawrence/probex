@@ -25,6 +25,7 @@ dioxus = { workspace = true, features = [
     "html",
     "document",
 ] }
+charming = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 log.workspace = true
 gloo-net = "0.6"

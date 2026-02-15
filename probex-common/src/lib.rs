@@ -293,22 +293,6 @@ pub mod viewer_api {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct LatencyBucket {
-        pub min_ns: u64,
-        pub max_ns: u64,
-        pub count: u64,
-        pub label: String,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    pub struct SizeBucket {
-        pub min_bytes: u64,
-        pub max_bytes: u64,
-        pub count: u64,
-        pub label: String,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct IoTypeStats {
         pub operation: String,
         pub total_ops: u64,
@@ -318,14 +302,15 @@ pub mod viewer_api {
         pub p95_ns: u64,
         pub p99_ns: u64,
         pub max_ns: u64,
-        pub latency_histogram: Vec<LatencyBucket>,
-        pub size_histogram: Vec<SizeBucket>,
+        /// Sorted raw latency values in nanoseconds.
+        pub latencies_ns: Vec<u64>,
+        /// Sorted raw size values in bytes.
+        pub sizes_bytes: Vec<u64>,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct IoStatistics {
         pub by_operation: Vec<IoTypeStats>,
-        pub size_histogram: Vec<SizeBucket>,
         pub total_ops: u64,
         pub total_bytes: u64,
         pub time_range_ns: (u64, u64),
@@ -340,7 +325,6 @@ pub mod viewer_api {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct MemoryStatistics {
         pub by_operation: Vec<IoTypeStats>,
-        pub size_histogram: Vec<SizeBucket>,
         pub total_alloc_ops: u64,
         pub total_alloc_bytes: u64,
         pub total_free_ops: u64,

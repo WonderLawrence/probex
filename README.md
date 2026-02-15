@@ -35,7 +35,8 @@ sudo ./probex -- sleep 1
 ```
 
 ## What it looks like
-![](doc/screenshots/screenshot.png)
+![](doc/screenshots/screenshot-0.png)
+![](doc/screenshots/screenshot-1.png)
 
 
 #### Frame pointers

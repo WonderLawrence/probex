@@ -1,3 +1,4 @@
+pub mod echart;
 pub mod event_list;
 mod flamegraph;
 mod header;

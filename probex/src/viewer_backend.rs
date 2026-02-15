@@ -4,9 +4,9 @@
 
 pub use probex_common::viewer_api::{
     CumulativeMemoryPoint, EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker,
-    EventTypeCounts, HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencyBucket,
-    LatencySummary, MemoryStatistics, ProcessEventsResponse, ProcessLifetime,
-    ProcessLifetimesResponse, SizeBucket, SyscallLatencyStats, TraceSummary,
+    EventTypeCounts, HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencySummary,
+    MemoryStatistics, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
+    SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -1235,12 +1235,10 @@ mod backend {
             }
         }
 
-        let mut all_sizes: Vec<u64> = Vec::new();
         let mut total_ops: u64 = 0;
         let mut total_bytes: u64 = 0;
         for data in ops_data.values() {
             for &(_, actual) in data {
-                all_sizes.push(actual);
                 total_ops += 1;
                 total_bytes = total_bytes.saturating_add(actual);
             }
@@ -1254,7 +1252,6 @@ mod backend {
 
         Ok(IoStatistics {
             by_operation,
-            size_histogram: compute_size_histogram(&all_sizes),
             total_ops,
             total_bytes,
             time_range_ns: (start_ns, end_ns),
@@ -1278,21 +1275,10 @@ mod backend {
         let p99_ns = percentile_latency(&data, 99);
         let max_ns = data.last().map(|(l, _)| *l).unwrap_or(0);
 
-        let latency_histogram = latency_bucket_ranges()
-            .into_iter()
-            .map(|(min, max, label)| {
-                let count = data.iter().filter(|(l, _)| *l >= min && *l < max).count() as u64;
-                LatencyBucket {
-                    min_ns: min,
-                    max_ns: max,
-                    count,
-                    label: label.to_string(),
-                }
-            })
-            .collect();
+        let latencies_ns: Vec<u64> = data.iter().map(|(l, _)| *l).collect();
 
-        let sizes: Vec<u64> = data.iter().map(|(_, b)| *b).collect();
-        let size_histogram = compute_size_histogram(&sizes);
+        let mut sizes_bytes: Vec<u64> = data.iter().map(|(_, b)| *b).collect();
+        sizes_bytes.sort_unstable();
 
         IoTypeStats {
             operation,
@@ -1303,8 +1289,8 @@ mod backend {
             p95_ns,
             p99_ns,
             max_ns,
-            latency_histogram,
-            size_histogram,
+            latencies_ns,
+            sizes_bytes,
         }
     }
 
@@ -1314,43 +1300,6 @@ mod backend {
         }
         let idx = (sorted_data.len() * pct / 100).min(sorted_data.len() - 1);
         sorted_data[idx].0
-    }
-
-    fn latency_bucket_ranges() -> Vec<(u64, u64, &'static str)> {
-        vec![
-            (0, 1_000, "<1us"),
-            (1_000, 10_000, "1-10us"),
-            (10_000, 100_000, "10-100us"),
-            (100_000, 1_000_000, "100us-1ms"),
-            (1_000_000, 10_000_000, "1-10ms"),
-            (10_000_000, 100_000_000, "10-100ms"),
-            (100_000_000, 1_000_000_000, "100ms-1s"),
-            (1_000_000_000, u64::MAX, ">1s"),
-        ]
-    }
-
-    fn compute_size_histogram(sizes: &[u64]) -> Vec<SizeBucket> {
-        let ranges: Vec<(u64, u64, &str)> = vec![
-            (0, 64, "<64B"),
-            (64, 512, "64-512B"),
-            (512, 4_096, "512B-4KB"),
-            (4_096, 65_536, "4-64KB"),
-            (65_536, 1_048_576, "64KB-1MB"),
-            (1_048_576, 16_777_216, "1-16MB"),
-            (16_777_216, u64::MAX, ">16MB"),
-        ];
-        ranges
-            .into_iter()
-            .map(|(min, max, label)| {
-                let count = sizes.iter().filter(|&&s| s >= min && s < max).count() as u64;
-                SizeBucket {
-                    min_bytes: min,
-                    max_bytes: max,
-                    count,
-                    label: label.to_string(),
-                }
-            })
-            .collect()
     }
 
     pub async fn query_memory_statistics(
@@ -1440,7 +1389,10 @@ mod backend {
                     }
                     "syscall_munmap_enter" => {
                         let count = extract_option_u64(batch, "count", row)?.unwrap_or(0);
-                        pending_munmap.entry(pid).or_default().push_back((ts, count));
+                        pending_munmap
+                            .entry(pid)
+                            .or_default()
+                            .push_back((ts, count));
                     }
                     "syscall_munmap_exit" => {
                         if let Some(queue) = pending_munmap.get_mut(&pid)
@@ -1504,13 +1456,6 @@ mod backend {
             ops_data.insert("brk", brk_data);
         }
 
-        let mut all_sizes: Vec<u64> = Vec::new();
-        for data in ops_data.values() {
-            for &(_, bytes) in data {
-                all_sizes.push(bytes);
-            }
-        }
-
         let mut by_operation: Vec<IoTypeStats> = ops_data
             .into_iter()
             .map(|(op, data)| compute_io_type_stats(op.to_string(), data))
@@ -1521,14 +1466,10 @@ mod backend {
         let mmap_stats = by_operation.iter().find(|s| s.operation == "mmap");
         let munmap_stats = by_operation.iter().find(|s| s.operation == "munmap");
 
-        let total_alloc_ops =
-            mmap_stats.map_or(0, |s| s.total_ops) + brk_grow_ops;
-        let total_alloc_bytes =
-            mmap_stats.map_or(0, |s| s.total_bytes) + brk_grow_bytes;
-        let total_free_ops =
-            munmap_stats.map_or(0, |s| s.total_ops) + brk_shrink_ops;
-        let total_free_bytes =
-            munmap_stats.map_or(0, |s| s.total_bytes) + brk_shrink_bytes;
+        let total_alloc_ops = mmap_stats.map_or(0, |s| s.total_ops) + brk_grow_ops;
+        let total_alloc_bytes = mmap_stats.map_or(0, |s| s.total_bytes) + brk_grow_bytes;
+        let total_free_ops = munmap_stats.map_or(0, |s| s.total_ops) + brk_shrink_ops;
+        let total_free_bytes = munmap_stats.map_or(0, |s| s.total_bytes) + brk_shrink_bytes;
 
         // Build cumulative memory usage timeline
         cumulative_events.sort_by_key(|(ts, _)| *ts);
@@ -1545,7 +1486,6 @@ mod backend {
 
         Ok(MemoryStatistics {
             by_operation,
-            size_histogram: compute_size_histogram(&all_sizes),
             total_alloc_ops,
             total_alloc_bytes,
             total_free_ops,
