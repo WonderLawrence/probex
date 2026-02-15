@@ -647,13 +647,13 @@ mod backend {
         }
 
         let sql = format!(
-            "SELECT pid, ts_ns, event_type, count
+            "SELECT pid, ts_ns, event_type, count, submit_ts_ns, io_uring_res
              FROM events
              WHERE {}
                AND event_type IN (
                  'syscall_read_enter', 'syscall_read_exit',
                  'syscall_write_enter', 'syscall_write_exit',
-                 'syscall_io_uring_enter_enter', 'syscall_io_uring_enter_exit',
+                 'io_uring_complete',
                  'syscall_mmap_enter', 'syscall_munmap_enter'
                )
              ORDER BY pid, ts_ns",
@@ -667,11 +667,9 @@ mod backend {
             std::collections::HashMap::new();
         let mut pending_write: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
             std::collections::HashMap::new();
-        let mut pending_io_uring: std::collections::HashMap<u32, std::collections::VecDeque<u64>> =
-            std::collections::HashMap::new();
         let mut read_latencies: Vec<u64> = Vec::new();
         let mut write_latencies: Vec<u64> = Vec::new();
-        let mut io_uring_enter_latencies: Vec<u64> = Vec::new();
+        let mut io_uring_latencies: Vec<u64> = Vec::new();
         let mut mmap_alloc_bytes: u64 = 0;
         let mut munmap_free_bytes: u64 = 0;
 
@@ -699,15 +697,11 @@ mod backend {
                             write_latencies.push(ts - start_ts);
                         }
                     }
-                    "syscall_io_uring_enter_enter" => {
-                        pending_io_uring.entry(pid).or_default().push_back(ts)
-                    }
-                    "syscall_io_uring_enter_exit" => {
-                        if let Some(queue) = pending_io_uring.get_mut(&pid)
-                            && let Some(start_ts) = queue.pop_front()
-                            && ts >= start_ts
-                        {
-                            io_uring_enter_latencies.push(ts - start_ts);
+                    "io_uring_complete" => {
+                        let submit_ts =
+                            extract_option_u64(batch, "submit_ts_ns", row)?.unwrap_or(0);
+                        if submit_ts > 0 && ts >= submit_ts {
+                            io_uring_latencies.push(ts - submit_ts);
                         }
                     }
                     "syscall_mmap_enter" => {
@@ -733,16 +727,10 @@ mod backend {
             }
         }
 
-        // io_uring_enter can represent read or write style I/O submissions.
-        // Without SQE opcode tracing, attribute these latencies to both aggregates.
-        if !io_uring_enter_latencies.is_empty() {
-            read_latencies.extend(io_uring_enter_latencies.iter().copied());
-            write_latencies.extend(io_uring_enter_latencies.iter().copied());
-        }
-
         Ok(SyscallLatencyStats {
             read: summarize_latencies(&read_latencies),
             write: summarize_latencies(&write_latencies),
+            io_uring: summarize_latencies(&io_uring_latencies),
             mmap_alloc_bytes,
             munmap_free_bytes,
         })
@@ -1124,14 +1112,15 @@ mod backend {
         }
 
         let sql = format!(
-            "SELECT pid, ts_ns, event_type, count, ret
+            "SELECT pid, ts_ns, event_type, count, ret, submit_ts_ns, io_uring_res
              FROM events
              WHERE {}
                AND event_type IN (
                  'syscall_read_enter', 'syscall_read_exit',
                  'syscall_write_enter', 'syscall_write_exit',
                  'syscall_fsync_enter', 'syscall_fsync_exit',
-                 'syscall_fdatasync_enter', 'syscall_fdatasync_exit'
+                 'syscall_fdatasync_enter', 'syscall_fdatasync_exit',
+                 'io_uring_complete'
                )
              ORDER BY pid, ts_ns",
             conditions.join(" AND ")
@@ -1227,6 +1216,18 @@ mod backend {
                                 .entry("fdatasync")
                                 .or_default()
                                 .push((ts - enter_ts, 0));
+                        }
+                    }
+                    "io_uring_complete" => {
+                        let submit_ts =
+                            extract_option_u64(batch, "submit_ts_ns", row)?.unwrap_or(0);
+                        let res = extract_option_i32(batch, "io_uring_res", row)?.unwrap_or(0);
+                        if submit_ts > 0 && ts >= submit_ts {
+                            let actual_bytes = res.max(0) as u64;
+                            ops_data
+                                .entry("io_uring")
+                                .or_default()
+                                .push((ts - submit_ts, actual_bytes));
                         }
                     }
                     _ => {}

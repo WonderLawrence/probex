@@ -151,8 +151,9 @@ use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
     CPU_SAMPLE_STAT_KERNEL_STACK, CPU_SAMPLE_STAT_NO_STACK, CPU_SAMPLE_STAT_RINGBUF_DROPPED,
     CPU_SAMPLE_STAT_USER_STACK, CPU_SAMPLE_STATS_LEN, CpuSampleEvent, EventHeader, EventType,
-    MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent, ProcessForkEvent, STACK_KIND_BOTH,
-    STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent, SyscallEnterEvent, SyscallExitEvent,
+    IoUringCompleteEvent, MAX_CPU_SAMPLE_FRAMES, PageFaultEvent, ProcessExitEvent,
+    ProcessForkEvent, STACK_KIND_BOTH, STACK_KIND_KERNEL, STACK_KIND_USER, SchedSwitchEvent,
+    SyscallEnterEvent, SyscallExitEvent,
 };
 use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
@@ -238,6 +239,10 @@ struct Event {
     fd: Option<i64>,
     count: Option<u64>,
     ret: Option<i64>,
+    // io_uring completion fields
+    submit_ts_ns: Option<u64>,
+    io_uring_opcode: Option<u8>,
+    io_uring_res: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -278,6 +283,10 @@ fn create_intermediate_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
+        // io_uring completion fields (nullable)
+        Field::new("submit_ts_ns", DataType::UInt64, true),
+        Field::new("io_uring_opcode", DataType::UInt8, true),
+        Field::new("io_uring_res", DataType::Int32, true),
     ])
 }
 
@@ -314,6 +323,10 @@ fn create_final_schema() -> Schema {
         Field::new("fd", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
         Field::new("ret", DataType::Int64, true),
+        // io_uring completion fields (nullable)
+        Field::new("submit_ts_ns", DataType::UInt64, true),
+        Field::new("io_uring_opcode", DataType::UInt8, true),
+        Field::new("io_uring_res", DataType::Int32, true),
     ])
 }
 
@@ -393,6 +406,9 @@ impl ParquetBatchWriter {
         let mut fd_builder = Int64Builder::with_capacity(batch_len);
         let mut count_builder = UInt64Builder::with_capacity(batch_len);
         let mut ret_builder = Int64Builder::with_capacity(batch_len);
+        let mut submit_ts_ns_builder = UInt64Builder::with_capacity(batch_len);
+        let mut io_uring_opcode_builder = UInt8Builder::with_capacity(batch_len);
+        let mut io_uring_res_builder = Int32Builder::with_capacity(batch_len);
 
         for event in self.batch.drain(..) {
             event_type_builder.append_value(event.event_type);
@@ -417,6 +433,9 @@ impl ParquetBatchWriter {
             fd_builder.append_option(event.fd);
             count_builder.append_option(event.count);
             ret_builder.append_option(event.ret);
+            submit_ts_ns_builder.append_option(event.submit_ts_ns);
+            io_uring_opcode_builder.append_option(event.io_uring_opcode);
+            io_uring_res_builder.append_option(event.io_uring_res);
         }
 
         let columns: Vec<ArrayRef> = vec![
@@ -442,6 +461,9 @@ impl ParquetBatchWriter {
             Arc::new(fd_builder.finish()),
             Arc::new(count_builder.finish()),
             Arc::new(ret_builder.finish()),
+            Arc::new(submit_ts_ns_builder.finish()),
+            Arc::new(io_uring_opcode_builder.finish()),
+            Arc::new(io_uring_res_builder.finish()),
         ];
 
         let record_batch = RecordBatch::try_new(self.schema.clone(), columns)
@@ -731,6 +753,16 @@ fn parse_event(data: &[u8]) -> Result<Event> {
             Ok(Event {
                 ret: Some(event.ret),
                 ..event_base("syscall_fdatasync_exit", event.header)
+            })
+        }
+        EventType::IoUringComplete => {
+            let event = read_unaligned_from_bytes::<IoUringCompleteEvent>(data)
+                .ok_or_else(|| anyhow!("payload too short for IoUringCompleteEvent"))?;
+            Ok(Event {
+                submit_ts_ns: Some(event.submit_ts_ns),
+                io_uring_opcode: Some(event.opcode),
+                io_uring_res: Some(event.res),
+                ..event_base("io_uring_complete", event.header)
             })
         }
     }
@@ -1866,6 +1898,18 @@ async fn main() -> Result<()> {
         "sys_exit_fdatasync",
         "syscalls",
         "sys_exit_fdatasync",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "io_uring_submit_req",
+        "io_uring",
+        "io_uring_submit_req",
+    )?;
+    attach_tracepoint(
+        &mut ebpf,
+        "io_uring_complete",
+        "io_uring",
+        "io_uring_complete",
     )?;
     let target_pid = u32::try_from(child_pid.as_raw())
         .context("child pid is negative and cannot be used for perf scope")?;

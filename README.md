@@ -1,7 +1,7 @@
 # probex
 
-`probex` is a low-friction Linux profiler.
-It runs a command, collects everything you need, and visualizes it.
+`probex` is the missing Linux profiler you've been waiting for.
+It is low-friction, easy to use, and works out of the box.
 
 ## Usage
 

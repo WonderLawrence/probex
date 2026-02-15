@@ -136,6 +136,7 @@ pub fn ProcessTimeline(
     let stats = data.latency_stats.clone().unwrap_or_default();
     let has_read_stats = stats.read.count > 0;
     let has_write_stats = stats.write.count > 0;
+    let has_io_uring_stats = stats.io_uring.count > 0;
     let has_mem_stats = stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0;
     let active_process_bar_drag_preview = process_bar_drag_preview();
     let on_select_pid = actions.on_select_pid;
@@ -356,6 +357,16 @@ pub fn ProcessTimeline(
                         span { class: "text-gray-400", "{stats.write.count}× " }
                         span { class: "text-gray-400", "avg/p50/p95/max " }
                         "{format_duration(stats.write.avg_ns)}/{format_duration(stats.write.p50_ns)}/{format_duration(stats.write.p95_ns)}/{format_duration(stats.write.max_ns)}"
+                    } else {
+                        span { class: "text-gray-400", "—" }
+                    }
+                }
+                span { class: "whitespace-nowrap",
+                    span { class: "text-gray-400", "io_uring " }
+                    if has_io_uring_stats {
+                        span { class: "text-gray-400", "{stats.io_uring.count}× " }
+                        span { class: "text-gray-400", "avg/p50/p95/max " }
+                        "{format_duration(stats.io_uring.avg_ns)}/{format_duration(stats.io_uring.p50_ns)}/{format_duration(stats.io_uring.p95_ns)}/{format_duration(stats.io_uring.max_ns)}"
                     } else {
                         span { class: "text-gray-400", "—" }
                     }
