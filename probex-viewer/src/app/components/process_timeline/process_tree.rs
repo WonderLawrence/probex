@@ -112,7 +112,7 @@ pub(super) fn build_process_tree(
     let visible_in_range_count = sorted_processes
         .iter()
         .filter(|proc| {
-            let process_end = proc.end_ns.unwrap_or(range.full_end_ns);
+            let process_end = proc.end_ns;
             proc.start_ns <= range.view_end_ns && process_end >= range.view_start_ns
         })
         .count();

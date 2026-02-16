@@ -918,10 +918,10 @@ mod backend {
                     (None, *first_seen, false)
                 };
 
-            let (end_ns, exit_code, did_exit) = if let Some((code, exit_ts)) = exit_info.get(pid) {
-                (Some(*exit_ts), Some(*code), true)
+            let (end_ns, exit) = if let Some((code, exit_ts)) = exit_info.get(pid) {
+                (*exit_ts, Some(*code))
             } else {
-                (Some(*last_seen), None, false)
+                (*last_seen, None)
             };
 
             processes.push(ProcessLifetime {
@@ -930,9 +930,8 @@ mod backend {
                 parent_pid,
                 start_ns,
                 end_ns,
-                exit_code,
+                exit,
                 was_forked,
-                did_exit,
             });
         }
 

@@ -261,10 +261,9 @@ pub mod viewer_api {
         pub process_name: Option<String>,
         pub parent_pid: Option<u32>,
         pub start_ns: u64,
-        pub end_ns: Option<u64>,
-        pub exit_code: Option<i32>,
+        pub end_ns: u64,
+        pub exit: Option<i32>,
         pub was_forked: bool,
-        pub did_exit: bool,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

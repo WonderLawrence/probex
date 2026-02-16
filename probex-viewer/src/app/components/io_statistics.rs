@@ -1,9 +1,9 @@
+use charming::Chart;
 use charming::component::{Axis, DataZoom, DataZoomType, Grid, Legend};
 use charming::element::{
     AxisLabel, AxisType, Formatter, ItemStyle, JsFunction, LineStyle, TextStyle, Tooltip, Trigger,
 };
 use charming::series::{Bar, Line};
-use charming::Chart;
 use dioxus::prelude::*;
 
 use super::echart::EChart;

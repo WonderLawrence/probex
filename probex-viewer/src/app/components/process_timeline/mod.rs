@@ -220,14 +220,10 @@ pub fn ProcessTimeline(
     let selected_flame_event_type_value = selected_flame_event_type();
 
     let flame_event_type_options = build_flame_event_type_options(
-        Some(&summary),
+        &summary,
         selected_pid_value,
         &pid_summary,
-        if selected_flame_event_type_value.is_empty() {
-            None
-        } else {
-            Some(selected_flame_event_type_value.as_str())
-        },
+        &selected_flame_event_type_value,
     );
 
     // ── Range values ─────────────────────────────────────────────────────────
@@ -603,7 +599,7 @@ pub fn ProcessTimeline(
                     let view_duration_ns = range.view_end_ns.saturating_sub(range.view_start_ns).max(1);
                     let view_duration = view_duration_ns as f64;
                     let bar_start = proc.start_ns.max(range.view_start_ns);
-                    let bar_end = proc.end_ns.unwrap_or(range.full_end_ns).min(range.view_end_ns);
+                    let bar_end = proc.end_ns.min(range.view_end_ns);
                     let in_view = bar_start < bar_end;
                     let visible_duration_ns = if in_view { bar_end - bar_start } else { 0 };
 
@@ -621,14 +617,10 @@ pub fn ProcessTimeline(
                         0.0
                     };
 
-                    let bar_color = if proc.did_exit {
-                        if proc.exit_code == Some(0) {
-                            "bg-emerald-50"
-                        } else {
-                            "bg-rose-50"
-                        }
-                    } else {
-                        "bg-slate-100"
+                    let bar_color = match proc.exit {
+                        Some(0) => "bg-emerald-50",
+                        Some(_) => "bg-rose-50",
+                        None => "bg-slate-100",
                     };
 
                     let has_children = tree_pos.has_children;
@@ -645,7 +637,7 @@ pub fn ProcessTimeline(
                     let process_label_class =
                         "cursor-pointer overflow-hidden px-1 py-0.5 min-w-0";
                     let process_start_ns = proc.start_ns;
-                    let process_end_ns = proc.end_ns.unwrap_or(range.full_end_ns);
+                    let process_end_ns = proc.end_ns;
                     let focus_end_ns = if process_end_ns > process_start_ns {
                         process_end_ns
                     } else {
@@ -692,16 +684,13 @@ pub fn ProcessTimeline(
                     } else {
                         None
                     };
-                    let exit_marker = if proc.did_exit {
-                        if let Some(end) = proc.end_ns {
-                            if end >= range.view_start_ns && end <= range.view_end_ns {
-                                let exit_pct =
-                                    ((end - range.view_start_ns) as f64 / view_duration * 100.0)
-                                        .max(0.0);
-                                Some((exit_pct, proc.exit_code == Some(0)))
-                            } else {
-                                None
-                            }
+                    let exit_marker = if let Some(exit_code) = proc.exit {
+                        let end = proc.end_ns;
+                        if end >= range.view_start_ns && end <= range.view_end_ns {
+                            let exit_pct =
+                                ((end - range.view_start_ns) as f64 / view_duration * 100.0)
+                                    .max(0.0);
+                            Some((exit_pct, exit_code == 0))
                         } else {
                             None
                         }
@@ -928,8 +917,8 @@ pub fn ProcessTimeline(
                                 div { class: "w-20 text-xs text-gray-400 shrink-0 truncate",
                                     if !in_view {
                                         "\u{2014}"
-                                    } else if proc.did_exit {
-                                        if proc.exit_code == Some(0) {
+                                    } else if let Some(exit_code) = proc.exit {
+                                        if exit_code == 0 {
                                             "\u{2713} {format_duration_short(visible_duration_ns)}"
                                         } else {
                                             "\u{2717} {format_duration_short(visible_duration_ns)}"
@@ -970,7 +959,7 @@ pub fn ProcessTimeline(
                                                     event_type_options: flame_event_type_options_for_row,
                                                 },
                                                 scope: FlamegraphCardScope {
-                                                    selected_pid: Some(proc.pid),
+                                                    selected_pid: proc.pid,
                                                     full_start_ns: range.full_start_ns,
                                                     view_start_ns: range.view_start_ns,
                                                     view_end_ns: range.view_end_ns,
