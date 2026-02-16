@@ -1,4 +1,4 @@
-# probex
+# probex 
 
 `probex` is the missing Linux profiler you've been waiting for.
 It is low-friction, easy to use, and works out of the box.

@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
 documentation = "https://docs.rs/probex-viewer"
-description = "Web-based visualization for probex trace files"
+description = "Web-based trace viewer for probex"
 
 [[bin]]
 name = "probex-viewer"

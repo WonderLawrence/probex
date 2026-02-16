@@ -5,8 +5,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "../README.md"
 documentation = "https://docs.rs/probex"
-description = "Low-friction Linux eBPF profiler with integrated web viewer"
+description = "The missing Linux profiler — low-friction, easy to use, works out of the box"
 include = [
     "Cargo.toml",
     "build.rs",
