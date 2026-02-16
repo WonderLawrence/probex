@@ -947,8 +947,8 @@ mod backend {
         end_ns: u64,
         max_events_per_pid: usize,
     ) -> BackendResult<ProcessEventsResponse> {
-        const CPU_SAMPLE_BUCKETS_MAX: usize = 600;
-        const CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET: f64 = 3.0;
+        const CPU_SAMPLE_BUCKETS_MAX: usize = 2000;
+        const CPU_SAMPLE_TARGET_SAMPLES_PER_BUCKET: f64 = 1.0;
 
         if end_ns < start_ns {
             return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());

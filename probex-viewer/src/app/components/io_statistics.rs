@@ -1,9 +1,9 @@
-use charming::Chart;
 use charming::component::{Axis, DataZoom, DataZoomType, Grid, Legend};
 use charming::element::{
     AxisLabel, AxisType, Formatter, ItemStyle, JsFunction, LineStyle, TextStyle, Tooltip, Trigger,
 };
 use charming::series::{Bar, Line};
+use charming::Chart;
 use dioxus::prelude::*;
 
 use super::echart::EChart;
@@ -30,9 +30,7 @@ fn percentile_value(sorted: &[u64], p: f64) -> u64 {
 #[derive(Clone, PartialEq)]
 pub struct IoMemoryCardData {
     pub io_stats: Option<IoStatistics>,
-    pub io_loading: bool,
     pub mem_stats: Option<MemoryStatistics>,
-    pub mem_loading: bool,
 }
 
 #[component]
@@ -42,24 +40,11 @@ pub fn IoMemoryCard(data: IoMemoryCardData) -> Element {
         .mem_stats
         .as_ref()
         .is_some_and(|s| s.total_alloc_ops + s.total_free_ops > 0);
-    let io_loading = data.io_loading;
-    let mem_loading = data.mem_loading;
 
-    if !has_io && !has_mem && !io_loading && !mem_loading {
+    if !has_io && !has_mem {
         return rsx! {
             div { class: "bg-white border border-gray-200 rounded px-2 py-1.5",
                 div { class: "text-xs text-gray-400", "No IO or memory data in current scope" }
-            }
-        };
-    }
-
-    if !has_io && !has_mem && (io_loading || mem_loading) {
-        return rsx! {
-            div { class: "bg-white border border-gray-200 rounded px-2 py-1.5",
-                div { class: "flex items-center gap-2 text-xs text-gray-500",
-                    span { class: "inline-block w-3 h-3 rounded-full border-2 border-gray-300 border-t-blue-500 animate-spin" }
-                    span { "Loading..." }
-                }
             }
         };
     }
@@ -68,11 +53,11 @@ pub fn IoMemoryCard(data: IoMemoryCardData) -> Element {
         div { class: "grid grid-cols-2 gap-3",
             // Left: IO Statistics
             div { class: "bg-white border border-gray-200 rounded px-2 py-1.5 space-y-2 min-w-0",
-                IoSection { stats: data.io_stats, loading: io_loading }
+                IoSection { stats: data.io_stats }
             }
             // Right: Memory Statistics
             div { class: "bg-white border border-gray-200 rounded px-2 py-1.5 space-y-2 min-w-0",
-                MemorySection { stats: data.mem_stats, loading: mem_loading }
+                MemorySection { stats: data.mem_stats }
             }
         }
     }
@@ -81,13 +66,8 @@ pub fn IoMemoryCard(data: IoMemoryCardData) -> Element {
 // ---------- IO section ----------
 
 #[component]
-fn IoSection(stats: Option<IoStatistics>, loading: bool) -> Element {
+fn IoSection(stats: Option<IoStatistics>) -> Element {
     let Some(stats) = stats else {
-        if loading {
-            return rsx! {
-                LoadingIndicator { label: "Loading IO statistics..." }
-            };
-        }
         return rsx! {
             div { class: "text-xs text-gray-400", "No IO data" }
         };
@@ -100,10 +80,6 @@ fn IoSection(stats: Option<IoStatistics>, loading: bool) -> Element {
     }
 
     rsx! {
-        if loading {
-            LoadingIndicator { label: "Updating..." }
-        }
-
         div { class: "text-[11px] text-gray-500 flex gap-1",
             span { class: "font-medium", "IO" }
             span { "{format_count(stats.total_ops)} ops · {format_bytes(stats.total_bytes)} total" }
@@ -118,13 +94,8 @@ fn IoSection(stats: Option<IoStatistics>, loading: bool) -> Element {
 // ---------- Memory section ----------
 
 #[component]
-fn MemorySection(stats: Option<MemoryStatistics>, loading: bool) -> Element {
+fn MemorySection(stats: Option<MemoryStatistics>) -> Element {
     let Some(stats) = stats else {
-        if loading {
-            return rsx! {
-                LoadingIndicator { label: "Loading memory statistics..." }
-            };
-        }
         return rsx! {
             div { class: "text-xs text-gray-400", "No memory data" }
         };
@@ -139,10 +110,6 @@ fn MemorySection(stats: Option<MemoryStatistics>, loading: bool) -> Element {
     let net_label = format_net_bytes(stats.total_alloc_bytes, stats.total_free_bytes);
 
     rsx! {
-        if loading {
-            LoadingIndicator { label: "Updating..." }
-        }
-
         div { class: "text-[11px] text-gray-500 flex gap-1 flex-wrap",
             span { class: "font-medium", "Memory" }
             span {

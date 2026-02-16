@@ -408,9 +408,7 @@ pub fn ProcessTimeline(
                     IoMemoryCard {
                         data: IoMemoryCardData {
                             io_stats: data.io_statistics.clone(),
-                            io_loading: data.io_statistics_loading,
                             mem_stats: data.memory_statistics.clone(),
-                            mem_loading: data.memory_statistics_loading,
                         },
                     }
                 }
@@ -571,9 +569,7 @@ pub fn ProcessTimeline(
                     let flamegraph_for_row = data.flamegraph.clone();
                     let flamegraph_loading_for_row = data.flamegraph_loading;
                     let io_statistics_for_row = data.io_statistics.clone();
-                    let io_statistics_loading_for_row = data.io_statistics_loading;
                     let memory_statistics_for_row = data.memory_statistics.clone();
-                    let memory_statistics_loading_for_row = data.memory_statistics_loading;
 
                     rsx! {
                         div {
@@ -844,9 +840,7 @@ pub fn ProcessTimeline(
                                             IoMemoryCard {
                                                 data: IoMemoryCardData {
                                                     io_stats: io_statistics_for_row,
-                                                    io_loading: io_statistics_loading_for_row,
                                                     mem_stats: memory_statistics_for_row,
-                                                    mem_loading: memory_statistics_loading_for_row,
                                                 },
                                             }
                                         },
