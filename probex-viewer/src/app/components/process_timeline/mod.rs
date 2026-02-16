@@ -3,14 +3,14 @@ mod process_tree;
 mod timeline_overview;
 
 use process_activity::{
-    CanvasEventMarker, PROCESS_BAR_SELECTION_THRESHOLD_PX, ProcessActivityCanvas,
-    ProcessBarDragPreview, ProcessBarDragState, build_cpu_usage_points,
-    build_process_bar_drag_preview,
+    build_cpu_usage_points, build_process_bar_drag_preview, CanvasEventMarker,
+    ProcessActivityCanvas, ProcessBarDragPreview, ProcessBarDragState,
+    PROCESS_BAR_SELECTION_THRESHOLD_PX,
 };
 use process_tree::{build_process_tree, event_badge_class};
 use timeline_overview::{
-    TimelineOverview, TimelineOverviewData, TimelineOverviewRange, shift_window,
-    zoom_window_to_duration,
+    shift_window, zoom_window_to_duration, TimelineOverview, TimelineOverviewData,
+    TimelineOverviewRange,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -165,42 +165,7 @@ pub fn ProcessTimeline(
     let on_select_flame_event_type = actions.on_select_flame_event_type;
 
     rsx! {
-        div { class: "bg-white border border-gray-200 rounded-lg p-2.5",
-            div { class: "flex items-center justify-between mb-1.5",
-                span { class: "text-sm font-medium text-gray-700", "Process Lifetimes" }
-                div { class: "flex items-center gap-3",
-                    span { class: "text-xs text-gray-400", "{tree.visible_in_range_count} in view · {tree.sorted_processes.len()} total" }
-                    if has_collapsible_nodes {
-                        button {
-                            class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
-                            disabled: all_tree_expanded,
-                            onclick: move |_| collapsed_nodes.set(HashSet::new()),
-                            "Expand"
-                        }
-                        button {
-                            class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
-                            disabled: all_tree_collapsed,
-                            onclick: {
-                                let collapse_targets = tree.collapsible_nodes.clone();
-                                move |_| {
-                                    let mut all_collapsed = HashSet::new();
-                                    for pid in &collapse_targets {
-                                        all_collapsed.insert(*pid);
-                                    }
-                                    collapsed_nodes.set(all_collapsed);
-                                }
-                            },
-                            "Collapse"
-                        }
-                    }
-                }
-            }
-
-            div { class: "space-y-1 mb-1.5",
-                div { class: "flex justify-between text-xs text-gray-400",
-                    span { "0" }
-                    span { "{format_duration(full_duration_ns)}" }
-                }
+            div { class: "mb-1.5",
                 TimelineOverview {
                     data: TimelineOverviewData {
                         histogram: data.histogram.clone(),
@@ -253,6 +218,36 @@ pub fn ProcessTimeline(
                     span { class: "text-gray-400 mx-1", "\u{2192}" }
                     span { class: "font-mono", "{format_duration(range.view_end_ns - range.full_start_ns)}" }
                     span { class: "text-gray-400 ml-1", "({format_duration(view_duration_ns)})" }
+                }
+
+                div { class: "w-px h-4 bg-gray-200 shrink-0" }
+
+                // Process count + tree expand/collapse
+                div { class: "flex items-center gap-2 shrink-0",
+                    span { class: "text-xs text-gray-400", "{tree.visible_in_range_count} in view · {tree.sorted_processes.len()} total" }
+                    if has_collapsible_nodes {
+                        button {
+                            class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
+                            disabled: all_tree_expanded,
+                            onclick: move |_| collapsed_nodes.set(HashSet::new()),
+                            "Expand"
+                        }
+                        button {
+                            class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
+                            disabled: all_tree_collapsed,
+                            onclick: {
+                                let collapse_targets = tree.collapsible_nodes.clone();
+                                move |_| {
+                                    let mut all_collapsed = HashSet::new();
+                                    for pid in &collapse_targets {
+                                        all_collapsed.insert(*pid);
+                                    }
+                                    collapsed_nodes.set(all_collapsed);
+                                }
+                            },
+                            "Collapse"
+                        }
+                    }
                 }
 
                 // Navigation buttons
@@ -909,6 +904,5 @@ pub fn ProcessTimeline(
                     },
                 }
             }
-        }
     }
 }
