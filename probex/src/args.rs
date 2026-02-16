@@ -10,9 +10,9 @@ use clap::{ArgGroup, Parser};
         .required(true)
 ))]
 pub struct Args {
-    /// Output parquet file (default: trace.parquet)
-    #[arg(short, long, default_value = "trace.parquet")]
-    pub output: String,
+    /// Output parquet file (default: probex-YYYYMMDD-HHMMSS.parquet)
+    #[arg(short, long)]
+    pub output: Option<String>,
 
     /// Port for the viewer web interface
     #[arg(short, long, default_value = "8080")]

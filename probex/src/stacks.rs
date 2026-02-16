@@ -6,7 +6,10 @@ use crate::writer::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use arrow::{
-    array::{Array, ArrayRef, ListBuilder, StringArray, StringViewArray, StringViewBuilder, UInt32Array, UInt64Array},
+    array::{
+        Array, ArrayRef, ListBuilder, StringArray, StringViewArray, StringViewBuilder, UInt32Array,
+        UInt64Array,
+    },
     record_batch::{RecordBatch, RecordBatchReader},
 };
 use aya::maps::{MapData, StackTraceMap};
@@ -15,7 +18,7 @@ use parquet::{
     basic::Compression,
     file::{metadata::KeyValue, properties::WriterProperties},
 };
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,8 +42,7 @@ pub struct ProcMapInlineSegment {
     pub path: String,
 }
 
-pub type ProcMapsSnapshotIndex =
-    HashMap<u32, BTreeMap<u64, Arc<Vec<ProcMapInlineSegment>>>>;
+pub type ProcMapsSnapshotIndex = HashMap<u32, BTreeMap<u64, Arc<Vec<ProcMapInlineSegment>>>>;
 
 #[derive(Default)]
 pub struct ProcMapsSnapshotCollector {
@@ -325,10 +327,7 @@ fn read_process_name(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub fn enrich_process_name(
-    event: &mut Event,
-    pid_name_cache: &mut HashMap<u32, Option<String>>,
-) {
+pub fn enrich_process_name(event: &mut Event, pid_name_cache: &mut HashMap<u32, Option<String>>) {
     let maybe_name = pid_name_cache
         .entry(event.pid)
         .or_insert_with(|| read_process_name(event.pid))
@@ -371,56 +370,41 @@ impl ExportUserSymbolizer {
         self.symbol_map_cache.insert(path.to_string(), symbol_map);
     }
 
-    async fn symbolize_addrs_batch(&mut self, path: &str, addrs: &[u64]) {
-        if addrs.is_empty() {
-            return;
-        }
+    async fn resolve_batch(&mut self, requests: HashMap<String, Vec<u64>>) {
+        for (path, addrs) in requests {
+            self.ensure_symbol_map_loaded(&path).await;
+            if let Some(symbol_map) = self
+                .symbol_map_cache
+                .get(&path)
+                .and_then(|m| m.as_ref())
+            {
+                // Filter already cached
+                let unresolved: Vec<u64> = addrs
+                    .iter()
+                    .filter(|&&addr| !self.symbol_cache.contains_key(&(path.clone(), addr)))
+                    .copied()
+                    .collect();
 
-        let path_key = path.to_string();
-        let mut unresolved = Vec::new();
-        let mut seen = HashSet::new();
-        for addr in addrs {
-            if !seen.insert(*addr) {
-                continue;
+                for addr in unresolved {
+                    let symbol = symbol_map
+                        .lookup(LookupAddress::FileOffset(addr))
+                        .await
+                        .and_then(symbol_labels_from_address_info);
+                    self.symbol_cache.insert((path.clone(), addr), symbol);
+                }
+            } else {
+                // If failed to load map, cache None
+                for addr in addrs {
+                    self.symbol_cache.entry((path.clone(), addr)).or_insert(None);
+                }
             }
-            let cache_key = (path_key.clone(), *addr);
-            if self.symbol_cache.contains_key(&cache_key) {
-                continue;
-            }
-            unresolved.push(*addr);
-        }
-
-        if unresolved.is_empty() {
-            return;
-        }
-
-        self.ensure_symbol_map_loaded(path).await;
-
-        let Some(symbol_map) = self
-            .symbol_map_cache
-            .get(&path_key)
-            .and_then(|m| m.as_ref())
-        else {
-            for addr in unresolved {
-                self.symbol_cache.insert((path_key.clone(), addr), None);
-            }
-            return;
-        };
-
-        for addr in unresolved {
-            let symbol = symbol_map
-                .lookup(LookupAddress::FileOffset(addr))
-                .await
-                .and_then(symbol_labels_from_address_info);
-            self.symbol_cache.insert((path_key.clone(), addr), symbol);
         }
     }
 
-    fn lookup_symbol_labels(&self, path: &str, addr: u64) -> Option<Vec<String>> {
+    fn lookup_cached(&self, path: &str, addr: u64) -> Option<&[String]> {
         self.symbol_cache
             .get(&(path.to_string(), addr))
-            .cloned()
-            .flatten()
+            .and_then(|v| v.as_deref())
     }
 }
 
@@ -450,12 +434,6 @@ fn symbol_labels_from_address_info(address_info: wholesym::AddressInfo) -> Optio
 }
 
 #[derive(Default)]
-struct UserFrameRewriteStats {
-    mapped_fallback_frames: usize,
-    raw_fallback_frames: usize,
-}
-
-#[derive(Default)]
 pub struct StackTraceFinalizationStats {
     pub rewritten_rows: usize,
     pub symbolized_user_rows: usize,
@@ -475,82 +453,6 @@ fn find_segment_for_ip(
 
 fn mapped_frame_fallback_label(path: &str, file_offset: u64) -> String {
     format!("{path}+0x{file_offset:x}")
-}
-
-async fn symbolize_user_frames_for_export(
-    frames: &[u64],
-    inline_snapshot: Option<&[ProcMapInlineSegment]>,
-    symbolizer: &mut ExportUserSymbolizer,
-) -> (Vec<String>, UserFrameRewriteStats) {
-    let mut labels = Vec::with_capacity(frames.len() + 1);
-    labels.push("[user]".to_string());
-
-    let Some(segments) = inline_snapshot else {
-        labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-        return (
-            labels,
-            UserFrameRewriteStats {
-                raw_fallback_frames: frames.len(),
-                ..Default::default()
-            },
-        );
-    };
-
-    if segments.is_empty() {
-        labels.extend(frames.iter().map(|ip| format!("0x{ip:x}")));
-        return (
-            labels,
-            UserFrameRewriteStats {
-                raw_fallback_frames: frames.len(),
-                ..Default::default()
-            },
-        );
-    }
-
-    let mapped_segments: Vec<Option<&ProcMapInlineSegment>> = frames
-        .iter()
-        .map(|ip| find_segment_for_ip(segments, *ip))
-        .collect();
-
-    let mut frame_symbol_keys: Vec<Option<(String, u64)>> = Vec::with_capacity(frames.len());
-    let mut unresolved_by_path: HashMap<String, Vec<u64>> = HashMap::new();
-
-    for (ip, maybe_segment) in frames.iter().zip(mapped_segments.iter()) {
-        if let Some(segment) = maybe_segment {
-            let file_offset = ExportUserSymbolizer::runtime_file_offset(
-                *ip,
-                segment.start_addr,
-                segment.file_offset,
-            );
-            frame_symbol_keys.push(Some((segment.path.clone(), file_offset)));
-            unresolved_by_path
-                .entry(segment.path.clone())
-                .or_default()
-                .push(file_offset);
-        } else {
-            frame_symbol_keys.push(None);
-        }
-    }
-
-    for (path, addrs) in unresolved_by_path {
-        symbolizer.symbolize_addrs_batch(&path, &addrs).await;
-    }
-
-    let mut stats = UserFrameRewriteStats::default();
-    for (ip, maybe_key) in frames.iter().zip(frame_symbol_keys.into_iter()) {
-        if let Some((path, addr)) = maybe_key {
-            if let Some(symbols) = symbolizer.lookup_symbol_labels(&path, addr) {
-                labels.extend(symbols);
-            } else {
-                stats.mapped_fallback_frames += 1;
-                labels.push(mapped_frame_fallback_label(&path, addr));
-            }
-        } else {
-            stats.raw_fallback_frames += 1;
-            labels.push(format!("0x{ip:x}"));
-        }
-    }
-    (labels, stats)
 }
 
 fn extract_option_utf8_from_column<'a>(
@@ -580,41 +482,19 @@ fn sanitize_stack_trace_label(label: &str) -> String {
     }
 }
 
-fn labels_to_stack_trace(labels: Vec<String>) -> Option<String> {
-    let cleaned = labels
-        .into_iter()
-        .map(|label| sanitize_stack_trace_label(&label))
-        .filter(|label| !label.is_empty())
-        .collect::<Vec<_>>();
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned.join(";"))
-    }
-}
-
-fn parse_stack_trace_labels(stack_trace: &str) -> Vec<String> {
+fn parse_stack_trace_labels(stack_trace: &str) -> impl Iterator<Item = String> + '_ {
     stack_trace
         .split(';')
         .filter(|label| !label.is_empty())
         .map(str::to_string)
-        .collect()
 }
 
-fn parse_kernel_labels_from_stack_trace(stack_trace: &str) -> Vec<String> {
-    let mut labels = Vec::new();
-    let mut in_kernel_section = false;
-    for frame in stack_trace.split(';').filter(|frame| !frame.is_empty()) {
-        if frame == "[kernel]" {
-            in_kernel_section = true;
-            labels.push(frame.to_string());
-            continue;
-        }
-        if in_kernel_section {
-            labels.push(frame.to_string());
-        }
-    }
-    labels
+fn parse_kernel_labels_from_stack_trace(stack_trace: &str) -> impl Iterator<Item = String> + '_ {
+    stack_trace
+        .split(';')
+        .filter(|frame| !frame.is_empty())
+        .skip_while(|&frame| frame != "[kernel]")
+        .map(str::to_string)
 }
 
 fn parse_stack_frames_hex(stack_frames: &str) -> Result<Vec<u64>> {
@@ -633,6 +513,32 @@ fn parse_stack_frames_hex(stack_frames: &str) -> Result<Vec<u64>> {
         frames.push(ip);
     }
     Ok(frames)
+}
+
+// Structures for analysis phase
+enum StackType {
+    User,
+    Both,
+    Other,
+}
+
+struct RowAnalysisRequest {
+    stack_type: StackType,
+    frames_hex: String,
+    tgid: u32,
+    ts_ns: u64,
+    current_stack_trace: Option<String>,
+}
+
+struct AnalyzedRow {
+    frames: Vec<MappedFrame>,
+    kernel_stack: Option<String>,
+    fallback_stack_trace: Option<String>, // If parsing failed or no symbolization needed
+}
+
+enum MappedFrame {
+    Resolved { path: String, offset: u64 },
+    Raw { ip: u64 },
 }
 
 pub async fn symbolize_stack_traces_into_events_parquet(
@@ -666,7 +572,7 @@ pub async fn symbolize_stack_traces_into_events_parquet(
         .index_of("stack_trace")
         .with_context(|| "events schema missing stack_trace column")?;
 
-    let tmp_output_path = format!("{events_output_path}.postprocess.tmp");
+    let tmp_output_path = format!("{events_output_path}.probex-tmp");
     let output_file = File::create(&tmp_output_path)
         .with_context(|| format!("failed to create temp output {}", tmp_output_path))?;
     let key_value_metadata = vec![
@@ -690,8 +596,14 @@ pub async fn symbolize_stack_traces_into_events_parquet(
     let mut symbolizer = ExportUserSymbolizer::new();
     let mut stats = StackTraceFinalizationStats::default();
 
+    // Since we can't easily pass the borrowed snapshot_index to spawn tasks with 'static lifetime requirements,
+    // and cloning the entire snapshot index might be heavy if many processes/maps,
+    // we simply clone the HashMap structure. The values are Arc, so the heavy data is shared.
+    let snapshot_index_arc = Arc::new(snapshot_index.clone());
+
     for batch in &mut reader {
         let batch = batch.with_context(|| "failed to read events batch")?;
+        let num_rows = batch.num_rows();
 
         let tgid_array = batch
             .column(tgid_idx)
@@ -706,86 +618,217 @@ pub async fn symbolize_stack_traces_into_events_parquet(
         let stack_kind_column = batch.column(stack_kind_idx).as_ref();
         let stack_frames_column = batch.column(stack_frames_idx).as_ref();
         let stack_trace_column = batch.column(stack_trace_idx).as_ref();
-        let mut stack_trace_builder = ListBuilder::new(StringViewBuilder::new());
 
-        for row_idx in 0..batch.num_rows() {
-            stats.rewritten_rows += 1;
+        // 1. Prepare analysis requests
+        let mut requests = Vec::with_capacity(num_rows);
+        for row_idx in 0..num_rows {
             let stack_kind =
                 extract_option_utf8_from_column(stack_kind_column, row_idx, "stack_kind")?;
             let stack_frames =
                 extract_option_utf8_from_column(stack_frames_column, row_idx, "stack_frames")?;
             let current_stack_trace =
-                extract_option_utf8_from_column(stack_trace_column, row_idx, "stack_trace")?;
+                extract_option_utf8_from_column(stack_trace_column, row_idx, "stack_trace")?
+                    .map(str::to_string);
             let tgid = tgid_array.value(row_idx);
             let ts_ns = ts_ns_array.value(row_idx);
-            let rewritten_stack_trace = match (stack_kind, stack_frames) {
-                (Some("user"), Some(frames_hex)) if !frames_hex.is_empty() => {
-                    let frames = parse_stack_frames_hex(frames_hex)?;
-                    if frames.is_empty() {
-                        labels_to_stack_trace(
-                            current_stack_trace
-                                .map(parse_stack_trace_labels)
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        let snapshot = if tgid == 0 {
-                            None
-                        } else {
-                            find_inline_segments_for_event(snapshot_index, tgid, ts_ns)
-                        };
-                        let (labels, row_stats) =
-                            symbolize_user_frames_for_export(&frames, snapshot, &mut symbolizer)
-                                .await;
-                        stats.symbolized_user_rows += 1;
-                        stats.mapped_fallback_frames += row_stats.mapped_fallback_frames;
-                        stats.raw_fallback_frames += row_stats.raw_fallback_frames;
-                        labels_to_stack_trace(labels)
-                    }
-                }
-                (Some("both"), Some(frames_hex)) if !frames_hex.is_empty() => {
-                    let frames = parse_stack_frames_hex(frames_hex)?;
-                    if frames.is_empty() {
-                        labels_to_stack_trace(
-                            current_stack_trace
-                                .map(parse_stack_trace_labels)
-                                .unwrap_or_default(),
-                        )
-                    } else {
-                        let snapshot = if tgid == 0 {
-                            None
-                        } else {
-                            find_inline_segments_for_event(snapshot_index, tgid, ts_ns)
-                        };
-                        let (mut labels, row_stats) =
-                            symbolize_user_frames_for_export(&frames, snapshot, &mut symbolizer)
-                                .await;
-                        if let Some(trace) = current_stack_trace {
-                            labels.extend(parse_kernel_labels_from_stack_trace(trace));
-                        }
-                        stats.symbolized_mixed_rows += 1;
-                        stats.mapped_fallback_frames += row_stats.mapped_fallback_frames;
-                        stats.raw_fallback_frames += row_stats.raw_fallback_frames;
-                        labels_to_stack_trace(labels)
-                    }
-                }
-                _ => labels_to_stack_trace(
-                    current_stack_trace
-                        .map(parse_stack_trace_labels)
-                        .unwrap_or_default(),
-                ),
+
+            let stack_type = match (stack_kind, stack_frames) {
+                (Some("user"), Some(frames)) if !frames.is_empty() => StackType::User,
+                (Some("both"), Some(frames)) if !frames.is_empty() => StackType::Both,
+                _ => StackType::Other,
             };
-            if let Some(rewritten_stack_trace) = rewritten_stack_trace {
-                let labels = parse_stack_trace_labels(&rewritten_stack_trace);
-                if labels.is_empty() {
-                    stack_trace_builder.append(false);
-                } else {
-                    for label in labels {
-                        stack_trace_builder.values().append_value(label);
+
+            requests.push(RowAnalysisRequest {
+                stack_type,
+                frames_hex: stack_frames.unwrap_or_default().to_string(),
+                tgid,
+                ts_ns,
+                current_stack_trace,
+            });
+        }
+
+        // 2. Parallel Analysis Phase
+        // Determine chunk size based on available parallelism
+        let parallelism = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let chunk_size = (requests.len() + parallelism - 1) / parallelism;
+        let mut tasks = Vec::with_capacity(parallelism);
+
+        for chunk in requests.chunks(chunk_size) {
+            // Move chunk and Arc clone to task
+            let chunk_requests: Vec<RowAnalysisRequest> =
+                chunk.iter().map(|r| RowAnalysisRequest {
+                    stack_type: match r.stack_type {
+                        StackType::User => StackType::User,
+                        StackType::Both => StackType::Both,
+                        StackType::Other => StackType::Other,
+                    },
+                    frames_hex: r.frames_hex.clone(),
+                    tgid: r.tgid,
+                    ts_ns: r.ts_ns,
+                    current_stack_trace: r.current_stack_trace.clone(),
+                }).collect();
+            
+            let snapshot_index_ref = snapshot_index_arc.clone();
+
+            tasks.push(tokio::spawn(async move {
+                let mut analyzed_rows = Vec::with_capacity(chunk_requests.len());
+                let mut needed_symbols: HashMap<String, Vec<u64>> = HashMap::new();
+
+                for req in chunk_requests {
+                    match req.stack_type {
+                        StackType::User | StackType::Both => {
+                            let frames_res = parse_stack_frames_hex(&req.frames_hex);
+                            if let Ok(frames) = frames_res {
+                                if frames.is_empty() {
+                                    analyzed_rows.push(AnalyzedRow {
+                                        frames: vec![],
+                                        kernel_stack: None,
+                                        fallback_stack_trace: req.current_stack_trace,
+                                    });
+                                    continue;
+                                }
+
+                                let snapshot = if req.tgid == 0 {
+                                    None
+                                } else {
+                                    find_inline_segments_for_event(&snapshot_index_ref, req.tgid, req.ts_ns)
+                                };
+
+                                let mut mapped_frames = Vec::with_capacity(frames.len());
+                                if let Some(segments) = snapshot {
+                                    for ip in frames {
+                                        if let Some(segment) = find_segment_for_ip(segments, ip) {
+                                            let offset = ExportUserSymbolizer::runtime_file_offset(
+                                                ip,
+                                                segment.start_addr,
+                                                segment.file_offset,
+                                            );
+                                            mapped_frames.push(MappedFrame::Resolved {
+                                                path: segment.path.clone(),
+                                                offset,
+                                            });
+                                            needed_symbols.entry(segment.path.clone()).or_default().push(offset);
+                                        } else {
+                                            mapped_frames.push(MappedFrame::Raw { ip });
+                                        }
+                                    }
+                                } else {
+                                    for ip in frames {
+                                        mapped_frames.push(MappedFrame::Raw { ip });
+                                    }
+                                }
+
+                                analyzed_rows.push(AnalyzedRow {
+                                    frames: mapped_frames,
+                                    kernel_stack: req.current_stack_trace,
+                                    fallback_stack_trace: None,
+                                });
+                            } else {
+                                // Parse error fallback
+                                analyzed_rows.push(AnalyzedRow {
+                                    frames: vec![],
+                                    kernel_stack: None,
+                                    fallback_stack_trace: req.current_stack_trace,
+                                });
+                            }
+                        }
+                        StackType::Other => {
+                            analyzed_rows.push(AnalyzedRow {
+                                frames: vec![],
+                                kernel_stack: None,
+                                fallback_stack_trace: req.current_stack_trace,
+                            });
+                        }
                     }
-                    stack_trace_builder.append(true);
                 }
+                (analyzed_rows, needed_symbols)
+            }));
+        }
+
+        let mut all_analyzed_rows = Vec::with_capacity(num_rows);
+        let mut global_needed_symbols: HashMap<String, Vec<u64>> = HashMap::new();
+
+        for task in tasks {
+            let (chunk_analyzed, chunk_symbols) = task.await?;
+            all_analyzed_rows.extend(chunk_analyzed);
+            for (path, offsets) in chunk_symbols {
+                global_needed_symbols.entry(path).or_default().extend(offsets);
+            }
+        }
+
+        // 3. Resolve symbols in batch
+        symbolizer.resolve_batch(global_needed_symbols).await;
+
+        // 4. Construct Output
+        let mut stack_trace_builder = ListBuilder::new(StringViewBuilder::new());
+
+        for (_row_idx, analyzed) in all_analyzed_rows.into_iter().enumerate() {
+            stats.rewritten_rows += 1;
+
+            if let Some(fallback) = analyzed.fallback_stack_trace {
+                // Just use the fallback
+                let labels = parse_stack_trace_labels(&fallback);
+                let mut has_items = false;
+                for label in labels {
+                    let sanitized = sanitize_stack_trace_label(&label);
+                    if !sanitized.is_empty() {
+                        stack_trace_builder.values().append_value(sanitized);
+                        has_items = true;
+                    }
+                }
+                stack_trace_builder.append(has_items);
             } else {
-                stack_trace_builder.append(false);
+                // Reconstruct from analyzed frames
+                let mut has_items = false;
+                let has_user_frames = !analyzed.frames.is_empty();
+                // Add [user] marker if we have user frames
+                if has_user_frames {
+                    stack_trace_builder.values().append_value("[user]");
+                    has_items = true;
+                    stats.symbolized_user_rows += 1;
+                }
+
+                for frame in analyzed.frames {
+                    match frame {
+                        MappedFrame::Resolved { path, offset } => {
+                            if let Some(syms) = symbolizer.lookup_cached(&path, offset) {
+                                for sym in syms {
+                                    stack_trace_builder.values().append_value(sym);
+                                }
+                            } else {
+                                stats.mapped_fallback_frames += 1;
+                                stack_trace_builder.values().append_value(mapped_frame_fallback_label(&path, offset));
+                            }
+                        }
+                        MappedFrame::Raw { ip } => {
+                            stats.raw_fallback_frames += 1;
+                            stack_trace_builder.values().append_value(format!("0x{ip:x}"));
+                        }
+                    }
+                }
+
+                // Append kernel stack if present (StackType::Both)
+                if let Some(kernel_trace) = analyzed.kernel_stack {
+                    let kernel_labels = parse_kernel_labels_from_stack_trace(&kernel_trace);
+                    let mut added_kernel = false;
+                    for label in kernel_labels {
+                        stack_trace_builder.values().append_value(label);
+                        added_kernel = true;
+                        has_items = true;
+                    }
+                    if added_kernel {
+                        stats.symbolized_mixed_rows += 1;
+                        // symbolized_user_rows was inc above, dec it to avoid double counting row types?
+                        // Actually logic above is simple counters.
+                        if has_user_frames {
+                             stats.symbolized_user_rows -= 1; // It's mixed, not just user
+                        }
+                    }
+                }
+                
+                stack_trace_builder.append(has_items);
             }
         }
 

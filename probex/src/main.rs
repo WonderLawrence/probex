@@ -216,9 +216,17 @@ async fn main() -> Result<()> {
         .with_context(|| format!("failed to resume child process {}", child_pid))?;
     debug!("Resumed child process {}", child_pid);
 
+    let output_file = args
+        .output
+        .clone()
+        .unwrap_or_else(|| {
+            let now = chrono::Local::now();
+            format!("probex-{}.parquet", now.format("%Y%m%d-%H%M%S"))
+        });
+
     // Create Parquet batch writer
-    let mut writer = ParquetBatchWriter::new(&args.output, args.sample_freq)?;
-    debug!("Writing events to {}", args.output);
+    let mut writer = ParquetBatchWriter::new(&output_file, args.sample_freq)?;
+    debug!("Writing events to {}", output_file);
     let mut snapshot_collector = ProcMapsSnapshotCollector::default();
 
     // Stack trace map for resolving stack ids into raw frame addresses.
@@ -367,7 +375,7 @@ async fn main() -> Result<()> {
 
     info!("Symbolizing stack traces (this may take a few seconds)...");
     let finalization_stats = symbolize_stack_traces_into_events_parquet(
-        &args.output,
+        &output_file,
         snapshot_collector.snapshot_index(),
         args.sample_freq,
     )
@@ -381,12 +389,12 @@ async fn main() -> Result<()> {
         finalization_stats.raw_fallback_frames,
     );
 
-    info!("Wrote {} events to {}", total_events, args.output);
+    info!("Wrote {} events to {}", total_events, output_file);
     debug!("Captured {} proc map rows while tracing", total_maps);
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if total_events > 0 && !args.no_viewer {
-        viewer_server::launch(&args.output, args.port).await?;
+        viewer_server::launch(&output_file, args.port).await?;
     }
 
     Ok(())

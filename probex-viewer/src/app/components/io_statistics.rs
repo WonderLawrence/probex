@@ -7,7 +7,7 @@ use charming::Chart;
 use dioxus::prelude::*;
 
 use super::echart::EChart;
-use crate::api::{IoStatistics, IoTypeStats, MemoryStatistics};
+use crate::api::{EventDetail, IoStatistics, IoTypeStats, MemoryStatistics};
 use crate::app::formatting::{format_bytes, format_count, format_duration, format_duration_short};
 
 const OP_COLORS: &[&str] = &[
@@ -549,6 +549,8 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
 
 #[component]
 fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
+    let mut selected_event = use_signal(|| None::<(String, EventDetail)>);
+
     rsx! {
         div { class: "overflow-x-auto",
             table { class: "w-full text-xs",
@@ -571,11 +573,132 @@ fn IoSummaryTable(operations: Vec<IoTypeStats>) -> Element {
                             td { class: "py-0.5 px-1.5 text-right font-mono", "{format_count(op.total_ops)}" }
                             td { class: "py-0.5 px-1.5 text-right font-mono", "{format_bytes(op.total_bytes)}" }
                             td { class: "py-0.5 px-1.5 text-right font-mono", "{format_duration(op.avg_latency_ns)}" }
-                            td { class: "py-0.5 px-1.5 text-right font-mono", "{format_duration(op.p50_ns)}" }
-                            td { class: "py-0.5 px-1.5 text-right font-mono", "{format_duration(op.p95_ns)}" }
-                            td { class: "py-0.5 px-1.5 text-right font-mono", "{format_duration(op.p99_ns)}" }
-                            td { class: "py-0.5 pl-1.5 text-right font-mono", "{format_duration(op.max_ns)}" }
+
+                            // P50
+                            td { class: "py-0.5 px-1.5 text-right font-mono",
+                                if let Some(event) = &op.p50_event {
+                                    button {
+                                        class: "hover:text-blue-600 hover:underline cursor-pointer decoration-dotted underline-offset-2",
+                                        onclick: {
+                                            let event = event.clone();
+                                            let label = format!("P50 for {}", op.operation);
+                                            move |_| {
+                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                    selected_event.set(None);
+                                                } else {
+                                                    selected_event.set(Some((label.clone(), event.clone())));
+                                                }
+                                            }
+                                        },
+                                        "{format_duration(event.latency_ns.unwrap_or(0))}"
+                                    }
+                                } else {
+                                    "0s"
+                                }
+                            }
+
+                            // P95
+                            td { class: "py-0.5 px-1.5 text-right font-mono",
+                                if let Some(event) = &op.p95_event {
+                                    button {
+                                        class: "hover:text-blue-600 hover:underline cursor-pointer decoration-dotted underline-offset-2",
+                                        onclick: {
+                                            let event = event.clone();
+                                            let label = format!("P95 for {}", op.operation);
+                                            move |_| {
+                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                    selected_event.set(None);
+                                                } else {
+                                                    selected_event.set(Some((label.clone(), event.clone())));
+                                                }
+                                            }
+                                        },
+                                        "{format_duration(event.latency_ns.unwrap_or(0))}"
+                                    }
+                                } else {
+                                    "0s"
+                                }
+                            }
+
+                            // P99
+                            td { class: "py-0.5 px-1.5 text-right font-mono",
+                                if let Some(event) = &op.p99_event {
+                                    button {
+                                        class: "hover:text-blue-600 hover:underline cursor-pointer decoration-dotted underline-offset-2",
+                                        onclick: {
+                                            let event = event.clone();
+                                            let label = format!("P99 for {}", op.operation);
+                                            move |_| {
+                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                    selected_event.set(None);
+                                                } else {
+                                                    selected_event.set(Some((label.clone(), event.clone())));
+                                                }
+                                            }
+                                        },
+                                        "{format_duration(event.latency_ns.unwrap_or(0))}"
+                                    }
+                                } else {
+                                    "0s"
+                                }
+                            }
+
+                            // Max
+                            td { class: "py-0.5 pl-1.5 text-right font-mono",
+                                if let Some(event) = &op.max_event {
+                                    button {
+                                        class: "hover:text-blue-600 hover:underline cursor-pointer decoration-dotted underline-offset-2",
+                                        onclick: {
+                                            let event = event.clone();
+                                            let label = format!("Max for {}", op.operation);
+                                            move |_| {
+                                                if selected_event().as_ref().map_or(false, |(l, _)| l == &label) {
+                                                    selected_event.set(None);
+                                                } else {
+                                                    selected_event.set(Some((label.clone(), event.clone())));
+                                                }
+                                            }
+                                        },
+                                        "{format_duration(event.latency_ns.unwrap_or(0))}"
+                                    }
+                                } else {
+                                    "0s"
+                                }
+                            }
                         }
+                    }
+                }
+            }
+        }
+
+        if let Some((label, event)) = selected_event() {
+            div { class: "mt-2 p-2 bg-slate-50 border border-slate-200 rounded text-xs animate-in fade-in slide-in-from-top-1 duration-200",
+                div { class: "flex justify-between items-start mb-2",
+                    div {
+                        div { class: "font-medium text-slate-700", "{label}" }
+                        div { class: "text-slate-500 text-[10px]",
+                            "PID {event.pid} \u{2022} {event.event_type} \u{2022} end timestamp {event.ts_ns}"
+                        }
+                    }
+                    button {
+                        class: "text-slate-400 hover:text-slate-600 p-0.5 rounded hover:bg-slate-100",
+                        onclick: move |_| selected_event.set(None),
+                        "\u{2715}"
+                    }
+                }
+                div { class: "bg-white border border-slate-200 rounded p-2 overflow-x-auto",
+                    if let Some(stack) = &event.stack_trace {
+                        if stack.is_empty() {
+                            div { class: "text-slate-400 italic", "Empty stack trace" }
+                        } else {
+                            div { class: "font-mono text-[10px] leading-relaxed text-slate-600",
+                                for frame in stack {
+                                    div { class: "whitespace-nowrap hover:bg-slate-50 px-1 rounded", "{frame}" }
+                                }
+                            }
+                        }
+                    } else {
+                        div { class: "text-slate-400 italic", "No stack trace captured for this event" }
                     }
                 }
             }

@@ -298,10 +298,11 @@ pub mod viewer_api {
         pub total_ops: u64,
         pub total_bytes: u64,
         pub avg_latency_ns: u64,
-        pub p50_ns: u64,
-        pub p95_ns: u64,
-        pub p99_ns: u64,
-        pub max_ns: u64,
+        /// Representative events for percentiles
+        pub p50_event: Option<EventDetail>,
+        pub p95_event: Option<EventDetail>,
+        pub p99_event: Option<EventDetail>,
+        pub max_event: Option<EventDetail>,
         /// Sorted raw latency values in nanoseconds.
         pub latencies_ns: Vec<u64>,
         /// Sorted raw size values in bytes.
@@ -336,6 +337,7 @@ pub mod viewer_api {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct EventDetail {
         pub ts_ns: u64,
+        pub latency_ns: Option<u64>,
         pub event_type: String,
         pub pid: u32,
         pub stack_trace: Option<Vec<String>>,
