@@ -50,13 +50,13 @@ pub fn IoMemoryCard(data: IoMemoryCardData) -> Element {
     }
 
     rsx! {
-        div { class: "grid grid-cols-2 gap-3",
+        div { class: "grid grid-cols-2 gap-2",
             // Left: IO Statistics
-            div { class: "bg-white border border-gray-200 rounded px-2 py-1.5 space-y-2 min-w-0",
+            div { class: "bg-white border border-gray-200 rounded px-2 py-1 space-y-1 min-w-0",
                 IoSection { stats: data.io_stats }
             }
             // Right: Memory Statistics
-            div { class: "bg-white border border-gray-200 rounded px-2 py-1.5 space-y-2 min-w-0",
+            div { class: "bg-white border border-gray-200 rounded px-2 py-1 space-y-1 min-w-0",
                 MemorySection { stats: data.mem_stats }
             }
         }
@@ -210,24 +210,24 @@ fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
         )
         .grid(
             Grid::new()
-                .left("40")
-                .right("12")
-                .top("28")
-                .bottom("34")
+                .left("46")
+                .right("8")
+                .top("24")
+                .bottom("28")
                 .contain_label(true),
         )
         .x_axis(
             Axis::new().type_(AxisType::Log).axis_label(
                 AxisLabel::new()
                     .formatter(Formatter::Function(label_fmt))
-                    .font_size(10.0),
+                    .font_size(9.0),
             ),
         )
         .y_axis(
             Axis::new().type_(AxisType::Value).min(0).max(1).axis_label(
                 AxisLabel::new()
                     .formatter(Formatter::String("{value}".into()))
-                    .font_size(10.0),
+                    .font_size(9.0),
             ),
         )
         .tooltip(
@@ -237,13 +237,11 @@ fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
         )
         .data_zoom(
             DataZoom::new()
-                .type_(DataZoomType::Slider)
+                .type_(DataZoomType::Inside)
                 .x_axis_index(0)
                 .start(0)
-                .end(end_pct)
-                .bottom("2"),
+                .end(end_pct),
         )
-        .data_zoom(DataZoom::new().type_(DataZoomType::Inside).x_axis_index(0))
         .animation(false);
 
     for (name, color, points) in &series_data {
@@ -251,16 +249,16 @@ fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
             .name(name.clone())
             .show_symbol(false)
             .item_style(ItemStyle::new().color(*color))
-            .line_style(LineStyle::new().color(*color).width(2.0))
+            .line_style(LineStyle::new().color(*color).width(1.5))
             .data(points.clone());
 
         cdf_chart = cdf_chart.series(line);
     }
 
     // --- Histogram ---
-    // 9 equal-width bins spanning [0, P95], plus a 10th bucket for P95+
-    let p95_val = percentile_value(&ref_op.latencies_ns, 0.95);
-    let bin_width = (p95_val as f64 / 9.0).ceil() as u64;
+    // 9 equal-width bins spanning [0, P90], plus a 10th bucket for P90+
+    let p90_val = percentile_value(&ref_op.latencies_ns, 0.90);
+    let bin_width = (p90_val as f64 / 9.0).ceil() as u64;
     let boundaries: Vec<u64> = if bin_width == 0 {
         vec![1; 9]
     } else {
@@ -271,11 +269,7 @@ fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
         let mut labels = Vec::with_capacity(10);
         let mut prev = 0u64;
         for &b in &boundaries {
-            labels.push(format!(
-                "{}-{}",
-                format_duration_short(prev),
-                format_duration_short(b)
-            ));
+            labels.push(format_duration_short(b));
             prev = b;
         }
         labels.push(format!("{}+", format_duration_short(prev)));
@@ -283,30 +277,25 @@ fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
     };
 
     let mut hist_chart = Chart::new()
-        .legend(
-            Legend::new()
-                .top("0")
-                .left("center")
-                .text_style(TextStyle::new().font_size(10.0)),
-        )
+        .legend(Legend::new().show(false))
         .grid(
             Grid::new()
-                .left("40")
-                .right("8")
-                .top("28")
-                .bottom("24")
+                .left("36")
+                .right("4")
+                .top("8")
+                .bottom("28")
                 .contain_label(true),
         )
         .x_axis(
             Axis::new()
                 .type_(AxisType::Category)
                 .data(bin_labels)
-                .axis_label(AxisLabel::new().font_size(9.0).rotate(45)),
+                .axis_label(AxisLabel::new().font_size(8.0).rotate(40)),
         )
         .y_axis(
             Axis::new()
                 .type_(AxisType::Value)
-                .axis_label(AxisLabel::new().font_size(10.0)),
+                .axis_label(AxisLabel::new().font_size(9.0)),
         )
         .tooltip(Tooltip::new().trigger(Trigger::Axis))
         .animation(false);
@@ -326,11 +315,11 @@ fn LatencyCdfChart(operations: Vec<IoTypeStats>) -> Element {
         div { class: "space-y-0.5",
             div { class: "text-[11px] text-gray-500 font-medium", "Latency CDF" }
             div { class: "flex gap-1",
-                div { class: "flex-[2] min-w-0",
-                    EChart { chart: cdf_chart, height: "220px" }
+                div { class: "flex-1 min-w-0",
+                    EChart { chart: cdf_chart, height: "180px" }
                 }
                 div { class: "flex-1 min-w-0",
-                    EChart { chart: hist_chart, height: "220px" }
+                    EChart { chart: hist_chart, height: "180px" }
                 }
             }
         }
@@ -422,24 +411,24 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
         )
         .grid(
             Grid::new()
-                .left("40")
-                .right("12")
-                .top("28")
-                .bottom("34")
+                .left("46")
+                .right("8")
+                .top("24")
+                .bottom("28")
                 .contain_label(true),
         )
         .x_axis(
             Axis::new().type_(AxisType::Log).axis_label(
                 AxisLabel::new()
                     .formatter(Formatter::Function(label_fmt))
-                    .font_size(10.0),
+                    .font_size(9.0),
             ),
         )
         .y_axis(
             Axis::new().type_(AxisType::Value).min(0).max(1).axis_label(
                 AxisLabel::new()
                     .formatter(Formatter::String("{value}".into()))
-                    .font_size(10.0),
+                    .font_size(9.0),
             ),
         )
         .tooltip(
@@ -449,13 +438,11 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
         )
         .data_zoom(
             DataZoom::new()
-                .type_(DataZoomType::Slider)
+                .type_(DataZoomType::Inside)
                 .x_axis_index(0)
                 .start(0)
-                .end(end_pct)
-                .bottom("2"),
+                .end(end_pct),
         )
-        .data_zoom(DataZoom::new().type_(DataZoomType::Inside).x_axis_index(0))
         .animation(false);
 
     for (name, color, points) in &series_data {
@@ -463,16 +450,16 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
             .name(name.clone())
             .show_symbol(false)
             .item_style(ItemStyle::new().color(*color))
-            .line_style(LineStyle::new().color(*color).width(2.0))
+            .line_style(LineStyle::new().color(*color).width(1.5))
             .data(points.clone());
 
         cdf_chart = cdf_chart.series(line);
     }
 
     // --- Histogram ---
-    // 9 equal-width bins spanning [0, P95], plus a 10th bucket for P95+
-    let p95_val = percentile_value(&ref_op.sizes_bytes, 0.95);
-    let bin_width = (p95_val as f64 / 9.0).ceil() as u64;
+    // 9 equal-width bins spanning [0, P90], plus a 10th bucket for P90+
+    let p90_val = percentile_value(&ref_op.sizes_bytes, 0.90);
+    let bin_width = (p90_val as f64 / 9.0).ceil() as u64;
     let boundaries: Vec<u64> = if bin_width == 0 {
         vec![1; 9]
     } else {
@@ -483,7 +470,7 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
         let mut labels = Vec::with_capacity(10);
         let mut prev = 0u64;
         for &b in &boundaries {
-            labels.push(format!("{}-{}", format_bytes(prev), format_bytes(b)));
+            labels.push(format_bytes(b));
             prev = b;
         }
         labels.push(format!("{}+", format_bytes(prev)));
@@ -491,30 +478,25 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
     };
 
     let mut hist_chart = Chart::new()
-        .legend(
-            Legend::new()
-                .top("0")
-                .left("center")
-                .text_style(TextStyle::new().font_size(10.0)),
-        )
+        .legend(Legend::new().show(false))
         .grid(
             Grid::new()
-                .left("40")
-                .right("8")
-                .top("28")
-                .bottom("24")
+                .left("36")
+                .right("4")
+                .top("8")
+                .bottom("28")
                 .contain_label(true),
         )
         .x_axis(
             Axis::new()
                 .type_(AxisType::Category)
                 .data(bin_labels)
-                .axis_label(AxisLabel::new().font_size(9.0).rotate(45)),
+                .axis_label(AxisLabel::new().font_size(8.0).rotate(40)),
         )
         .y_axis(
             Axis::new()
                 .type_(AxisType::Value)
-                .axis_label(AxisLabel::new().font_size(10.0)),
+                .axis_label(AxisLabel::new().font_size(9.0)),
         )
         .tooltip(Tooltip::new().trigger(Trigger::Axis))
         .animation(false);
@@ -534,11 +516,11 @@ fn SizeCdfChart(operations: Vec<IoTypeStats>) -> Element {
         div { class: "space-y-0.5",
             div { class: "text-[11px] text-gray-500 font-medium", "Size CDF" }
             div { class: "flex gap-1",
-                div { class: "flex-[2] min-w-0",
-                    EChart { chart: cdf_chart, height: "220px" }
+                div { class: "flex-1 min-w-0",
+                    EChart { chart: cdf_chart, height: "180px" }
                 }
                 div { class: "flex-1 min-w-0",
-                    EChart { chart: hist_chart, height: "220px" }
+                    EChart { chart: hist_chart, height: "180px" }
                 }
             }
         }
