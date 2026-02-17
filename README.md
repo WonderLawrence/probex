@@ -35,7 +35,7 @@ sudo ./probex -- sleep 1
 ```
 
 ## Demo 
-<video src="https://raw.githubusercontent.com/XiangpengHao/probex/refs/heads/main/doc/screenshots/probex-demo.mp4" controls="controls"></video>
+<video src="https://github.com/user-attachments/assets/5d66ac40-fefc-4cbb-9edc-2fa31e358ae7" controls="controls"></video>
 
 #### Frame pointers
 
