@@ -34,8 +34,8 @@ tar -xzf probex.tar.gz
 sudo ./probex -- sleep 1
 ```
 
-## What it looks like
-<video src="doc/screenshots/probex-demo.mp4" controls="controls"></video>
+## Demo 
+<video src="https://raw.githubusercontent.com/XiangpengHao/probex/refs/heads/main/doc/screenshots/probex-demo.mp4" controls="controls"></video>
 
 #### Frame pointers
 
