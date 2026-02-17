@@ -30,3 +30,5 @@ charming = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 log.workspace = true
 gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+futures-util = "0.3"

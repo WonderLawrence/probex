@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use crate::api::ProcessLifetime;
 
-use super::ProcessTimelineRange;
-
 pub(super) fn event_badge_class(enabled: bool, event_type: &str) -> String {
     if enabled {
         format!(
@@ -35,7 +33,7 @@ fn event_badge_tone(event_type: &str) -> &'static str {
 }
 
 /// Tree position info for rendering tree lines
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) struct TreePosition {
     /// For each ancestor level, whether that ancestor was the last child at its level
     /// This determines whether to draw | (not last) or space (last) for each column
@@ -48,17 +46,16 @@ pub(super) struct TreePosition {
     pub descendant_count: usize,
 }
 
+#[derive(PartialEq)]
 pub(super) struct ProcessTreeModel {
     pub sorted_processes: Vec<ProcessLifetime>,
     pub visible_process_rows: Vec<(ProcessLifetime, TreePosition)>,
     pub collapsible_nodes: Vec<u32>,
-    pub visible_in_range_count: usize,
 }
 
 pub(super) fn build_process_tree(
     processes: &[ProcessLifetime],
     collapsed_nodes: &HashSet<u32>,
-    range: ProcessTimelineRange,
 ) -> ProcessTreeModel {
     let mut sorted_processes = processes.to_vec();
     sorted_processes.sort_by_key(|p| p.start_ns);
@@ -109,14 +106,6 @@ pub(super) fn build_process_tree(
         })
         .collect::<Vec<_>>();
 
-    let visible_in_range_count = sorted_processes
-        .iter()
-        .filter(|proc| {
-            let process_end = proc.end_ns;
-            proc.start_ns <= range.view_end_ns && process_end >= range.view_start_ns
-        })
-        .count();
-
     let collapsible_nodes = children_map
         .iter()
         .filter_map(|(pid, children)| (!children.is_empty()).then_some(*pid))
@@ -126,7 +115,6 @@ pub(super) fn build_process_tree(
         sorted_processes,
         visible_process_rows,
         collapsible_nodes,
-        visible_in_range_count,
     }
 }
 

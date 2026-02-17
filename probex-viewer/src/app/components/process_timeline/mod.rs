@@ -18,12 +18,17 @@ use std::sync::LazyLock;
 
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
+use futures_util::future::join;
+use gloo_timers::future::sleep;
 
 use crate::api::EventMarker;
 
 // Static empty maps to avoid allocations when process_events is None
 static EMPTY_EVENTS_MAP: LazyLock<HashMap<u32, Vec<EventMarker>>> = LazyLock::new(HashMap::new);
 static EMPTY_CPU_COUNTS_MAP: LazyLock<HashMap<u32, Vec<u16>>> = LazyLock::new(HashMap::new);
+
+/// Debounce delay (ms) before firing network requests after view_range changes.
+const FETCH_DEBOUNCE_MS: u32 = 80;
 
 use super::event_list::EventListCard;
 use super::flamegraph::{
@@ -102,91 +107,119 @@ pub fn ProcessTimeline(
         enabled_event_types.set(default_event_types);
     });
 
-    // ── Owned resources ──────────────────────────────────────────────────────
+    // ── Debounced fetch trigger ────────────────────────────────────────────
+    // `view_range` changes frequently during drag/wheel. We debounce before
+    // firing expensive network requests so intermediate states are skipped.
+    let mut fetch_range = use_signal(|| Option::<ViewRange>::None);
+    let mut fetch_pid = use_signal(|| Option::<u32>::None);
+    let mut fetch_flame_type = use_signal(|| "cpu_sample".to_string());
+
+    use_effect(move || {
+        // Read the reactive deps — this subscribes to changes.
+        let vr = view_range();
+        let pid = selected_pid();
+        let flame_type = selected_flame_event_type();
+        spawn(async move {
+            sleep(std::time::Duration::from_millis(FETCH_DEBOUNCE_MS as u64)).await;
+            // After the debounce period, check if values are still current.
+            // If another change happened, a newer effect will have been queued.
+            if view_range() == vr && selected_pid() == pid && selected_flame_event_type() == flame_type {
+                fetch_range.set(vr);
+                fetch_pid.set(pid);
+                fetch_flame_type.set(flame_type);
+            }
+        });
+    });
+
+    // ── Owned resources (single consolidated fetch) ──────────────────────
 
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
+    let mut selected_pid_event_counts = use_signal(|| None);
+    let mut syscall_latency_stats = use_signal(|| None);
+    let mut event_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
+    let mut flamegraph_loading = use_signal(|| false);
+    let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
+    let mut io_statistics_loading = use_signal(|| false);
+    let mut memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
+    let mut memory_statistics_loading = use_signal(|| false);
+
+    // All network requests run in parallel inside one resource. This means
+    // signals are updated in a single batch after all responses arrive,
+    // causing only one re-render instead of up to six staggered ones.
     use_resource(move || async move {
-        let Some(range) = view_range() else {
+        let Some(range) = fetch_range() else {
             return;
         };
-        match get_process_events(range.start_ns, range.end_ns, MAX_PROCESS_MARKERS_PER_PID).await {
+        let pid = fetch_pid();
+        let flame_type = fetch_flame_type();
+
+        flamegraph_loading.set(true);
+        io_statistics_loading.set(true);
+        memory_statistics_loading.set(true);
+
+        // 1. Process events (always fetched)
+        let events_fut = get_process_events(range.start_ns, range.end_ns, MAX_PROCESS_MARKERS_PER_PID);
+
+        // 2. Event type counts (per-pid or global)
+        let counts_fut = async {
+            if let Some(pid) = pid {
+                get_pid_event_type_counts(pid, Some(range.start_ns), Some(range.end_ns)).await
+            } else {
+                get_event_type_counts(Some(range.start_ns), Some(range.end_ns)).await
+            }
+        };
+
+        // 3. Syscall latency stats
+        let latency_fut = get_syscall_latency_stats(range.start_ns, range.end_ns, pid);
+
+        // 4. Flamegraph (only when a pid + event type are selected)
+        let flamegraph_fut = async {
+            if let Some(pid) = pid {
+                if !flame_type.is_empty() {
+                    return get_event_flamegraph(
+                        range.start_ns, range.end_ns,
+                        Some(pid), flame_type, MAX_FLAME_STACKS,
+                    ).await.ok();
+                }
+            }
+            None
+        };
+
+        // 5. IO statistics
+        let io_fut = get_io_statistics(range.start_ns, range.end_ns, pid);
+
+        // 6. Memory statistics
+        let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid);
+
+        // Fire all six requests concurrently, wait for all to finish.
+        let (events_res, counts_res, latency_res, flamegraph_res, io_res, mem_res) = {
+            // join pairs recursively to join all six
+            let (ab, cd, ef) = {
+                let ab_fut = join(events_fut, counts_fut);
+                let cd_fut = join(latency_fut, flamegraph_fut);
+                let ef_fut = join(io_fut, mem_fut);
+                let (ab, (cd, ef)) = join(ab_fut, join(cd_fut, ef_fut)).await;
+                (ab, cd, ef)
+            };
+            (ab.0, ab.1, cd.0, cd.1, ef.0, ef.1)
+        };
+
+        // Batch-update all signals at once to trigger a single re-render.
+        match events_res {
             Ok(events) => process_events.set(Some(events)),
             Err(e) => log::error!("Process events error: {}", e),
         }
-    });
-
-    let mut selected_pid_event_counts = use_signal(|| None);
-    use_resource(move || async move {
-        let Some(range) = view_range() else {
-            return;
-        };
-        if let Some(pid) = selected_pid() {
-            match get_pid_event_type_counts(pid, Some(range.start_ns), Some(range.end_ns)).await {
-                Ok(counts) => selected_pid_event_counts.set(Some(counts)),
-                Err(e) => log::error!("Selected PID event counts error: {}", e),
-            }
-        } else {
-            match get_event_type_counts(Some(range.start_ns), Some(range.end_ns)).await {
-                Ok(counts) => selected_pid_event_counts.set(Some(counts)),
-                Err(e) => log::error!("Event counts error: {}", e),
-            }
+        match counts_res {
+            Ok(counts) => selected_pid_event_counts.set(Some(counts)),
+            Err(e) => log::error!("Event counts error: {}", e),
         }
-    });
-
-    let mut syscall_latency_stats = use_signal(|| None);
-    use_resource(move || async move {
-        let Some(range) = view_range() else {
-            return;
-        };
-        match get_syscall_latency_stats(range.start_ns, range.end_ns, selected_pid()).await {
+        match latency_res {
             Ok(stats) => syscall_latency_stats.set(Some(stats)),
             Err(e) => log::error!("Syscall latency stats error: {}", e),
         }
-    });
-
-    let mut event_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
-    let mut flamegraph_loading = use_signal(|| false);
-    use_resource(move || async move {
-        let Some(range) = view_range() else {
-            return;
-        };
-        let pid = selected_pid();
-        let event_type = selected_flame_event_type();
-
-        if let Some(pid) = pid {
-            if !event_type.is_empty() {
-                flamegraph_loading.set(true);
-                match get_event_flamegraph(
-                    range.start_ns,
-                    range.end_ns,
-                    Some(pid),
-                    event_type,
-                    MAX_FLAME_STACKS,
-                )
-                .await
-                {
-                    Ok(data) => event_flamegraph.set(Some(data)),
-                    Err(e) => log::error!("Event flamegraph error: {}", e),
-                }
-                flamegraph_loading.set(false);
-            } else {
-                flamegraph_loading.set(false);
-                event_flamegraph.set(None);
-            }
-        } else {
-            flamegraph_loading.set(false);
-            event_flamegraph.set(None);
-        }
-    });
-
-    let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
-    let mut io_statistics_loading = use_signal(|| false);
-    use_resource(move || async move {
-        let Some(range) = view_range() else {
-            return;
-        };
-        io_statistics_loading.set(true);
-        match get_io_statistics(range.start_ns, range.end_ns, selected_pid()).await {
+        event_flamegraph.set(flamegraph_res);
+        flamegraph_loading.set(false);
+        match io_res {
             Ok(stats) => io_statistics.set(Some(stats)),
             Err(e) => {
                 log::error!("IO statistics error: {}", e);
@@ -194,16 +227,7 @@ pub fn ProcessTimeline(
             }
         }
         io_statistics_loading.set(false);
-    });
-
-    let mut memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
-    let mut memory_statistics_loading = use_signal(|| false);
-    use_resource(move || async move {
-        let Some(range) = view_range() else {
-            return;
-        };
-        memory_statistics_loading.set(true);
-        match get_memory_statistics(range.start_ns, range.end_ns, selected_pid()).await {
+        match mem_res {
             Ok(stats) => memory_statistics.set(Some(stats)),
             Err(e) => {
                 log::error!("Memory statistics error: {}", e);
@@ -213,18 +237,31 @@ pub fn ProcessTimeline(
         memory_statistics_loading.set(false);
     });
 
-    // ── Derived state ────────────────────────────────────────────────────────
-    let selected_pid_counts = selected_pid_event_counts();
-    let pid_summary = build_pid_event_summary(selected_pid_counts.as_ref());
+    // ── Derived state (memoized) ───────────────────────────────────────────
+    let pid_summary = use_memo(move || {
+        let counts = selected_pid_event_counts();
+        build_pid_event_summary(counts.as_ref())
+    });
     let selected_pid_value = selected_pid();
     let selected_flame_event_type_value = selected_flame_event_type();
 
-    let flame_event_type_options = build_flame_event_type_options(
-        &summary,
-        selected_pid_value,
-        &pid_summary,
-        &selected_flame_event_type_value,
-    );
+    let summary_for_options = summary.clone();
+    let flame_event_type_options = use_memo(move || {
+        build_flame_event_type_options(
+            &summary_for_options,
+            selected_pid(),
+            &pid_summary(),
+            &selected_flame_event_type(),
+        )
+    });
+
+    // Memoize tree structure — only rebuilds when processes or collapsed nodes change,
+    // NOT on every view_range drag/zoom.
+    let processes_for_tree = processes.clone();
+    let tree = use_memo(move || {
+        let collapsed = collapsed_nodes();
+        build_process_tree(&processes_for_tree, &collapsed)
+    });
 
     // ── Range values ─────────────────────────────────────────────────────────
     let Some(vr) = view_range() else {
@@ -244,12 +281,19 @@ pub fn ProcessTimeline(
         return rsx! {};
     }
 
-    let collapsed_set = collapsed_nodes();
-    let tree = build_process_tree(&processes, &collapsed_set, range);
+    let tree = tree.read();
     if tree.visible_process_rows.is_empty() {
         return rsx! {};
     }
 
+    // Cheap: compute visible-in-range count from sorted_processes + current range.
+    let visible_in_range_count = tree
+        .sorted_processes
+        .iter()
+        .filter(|proc| proc.start_ns <= range.view_end_ns && proc.end_ns >= range.view_start_ns)
+        .count();
+
+    let collapsed_set = collapsed_nodes();
     let has_collapsible_nodes = !tree.collapsible_nodes.is_empty();
     let all_tree_expanded = tree
         .collapsible_nodes
@@ -279,6 +323,7 @@ pub fn ProcessTimeline(
     let has_io_uring_stats = stats.io_uring.count > 0;
     let has_mem_stats = stats.mmap_alloc_bytes > 0 || stats.munmap_free_bytes > 0;
     let active_process_bar_drag_preview = process_bar_drag_preview();
+    let pid_summary_val = pid_summary();
 
     // ── Local action closures ────────────────────────────────────────────────
     let mut set_view_range = move |start: u64, end: u64| {
@@ -338,7 +383,7 @@ pub fn ProcessTimeline(
                     }
                     {
                         let ev_count = if selected_pid_value.is_some() {
-                            pid_summary.total
+                            pid_summary_val.total
                         } else {
                             summary.total_events
                         };
@@ -360,7 +405,7 @@ pub fn ProcessTimeline(
 
                 // Process count + tree expand/collapse
                 div { class: "flex items-center gap-2 shrink-0",
-                    span { class: "text-xs text-gray-400", "{tree.visible_in_range_count} in view · {tree.sorted_processes.len()} total" }
+                    span { class: "text-xs text-gray-400", "{visible_in_range_count} in view · {tree.sorted_processes.len()} total" }
                     if has_collapsible_nodes {
                         button {
                             class: "text-xs text-gray-500 hover:text-gray-700 underline disabled:opacity-40 disabled:no-underline",
@@ -466,8 +511,8 @@ pub fn ProcessTimeline(
 
             // Event type badges row (always rendered to avoid layout flicker)
             div { class: "flex flex-wrap items-center gap-1 mb-1.5 min-h-[1.5rem]",
-                if !pid_summary.breakdown.is_empty() {
-                    {pid_summary.breakdown.iter().map(|(event_type, count)| {
+                if !pid_summary_val.breakdown.is_empty() {
+                    {pid_summary_val.breakdown.iter().map(|(event_type, count)| {
                         let enabled = enabled_event_types().contains(event_type);
                         let event_type_clone = event_type.clone();
                         let badge_class = event_badge_class(enabled, event_type);
@@ -700,7 +745,7 @@ pub fn ProcessTimeline(
                     // Build tree line prefixes
                     let tree_pos_clone = tree_pos.clone();
                     let row_is_selected = is_selected;
-                    let flame_event_type_options_for_row = flame_event_type_options.clone();
+                    let flame_event_type_options_for_row = flame_event_type_options();
                     let selected_flame_event_type_for_row = selected_flame_event_type_value.clone();
                     let flamegraph_for_row = event_flamegraph();
                     let flamegraph_loading_for_row = flamegraph_loading();
