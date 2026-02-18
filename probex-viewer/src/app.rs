@@ -394,7 +394,43 @@ fn TraceViewer() -> Element {
                                             break;
                                         }
                                     }
-                                    let _ = get_trace_run_status(None, Some(250)).await;
+                                    match get_trace_run_status(None, Some(250)).await {
+                                        Ok(response) => {
+                                            trace_status_sequence.set(response.sequence);
+                                            let status = response.status;
+                                            let should_poll =
+                                                matches!(status, TraceRunStatus::Running { .. });
+                                            let is_non_idle = !matches!(status, TraceRunStatus::Idle);
+                                            trace_run_status.set(status);
+                                            if is_non_idle {
+                                                trace_starting.set(false);
+                                            }
+                                            if should_poll && !trace_poller_active() {
+                                                trace_poller_active.set(true);
+                                                spawn_trace_status_poller(
+                                                    trace_status_sequence,
+                                                    trace_run_status,
+                                                    trace_last_loaded_run_id,
+                                                    trace_error,
+                                                    trace_poller_active,
+                                                    summary,
+                                                    histogram,
+                                                    selected_pid_event_counts,
+                                                    syscall_latency_stats,
+                                                    event_flamegraph,
+                                                    process_lifetimes,
+                                                    process_events,
+                                                    selected_pid,
+                                                    reload_nonce,
+                                                );
+                                            }
+                                        }
+                                        Err(error) => {
+                                            trace_error.set(Some(format!(
+                                                "Failed to query trace status: {error}"
+                                            )));
+                                        }
+                                    }
                                 }
                             });
                             spawn(async move {

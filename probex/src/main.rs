@@ -1814,8 +1814,11 @@ pub(crate) async fn run_trace_command(
     let mut ebpf = if custom_mode {
         let generated_source = generate_custom_probe_source(&custom_probe_plan)
             .with_context(|| "step=generate_rust_code failed")?;
-        let generated_binary = build_generated_ebpf_binary(&generated_source)
-            .with_context(|| "step=build_generated_ebpf failed")?;
+        let generated_binary =
+            tokio::task::spawn_blocking(move || build_generated_ebpf_binary(&generated_source))
+                .await
+                .with_context(|| "step=build_generated_ebpf failed: task join error")?
+                .with_context(|| "step=build_generated_ebpf failed")?;
         aya::Ebpf::load(&generated_binary).with_context(|| "step=load_ebpf failed")?
     } else {
         aya::Ebpf::load(aya::include_bytes_aligned!(concat!(

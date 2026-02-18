@@ -743,6 +743,12 @@ fn write_embedded_ebpf_scaffold(scaffold_root: &Path, probex_common_root: &Path)
 pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
+    // Cache key must include scaffold contents so template/runtime edits invalidate
+    // previously built generated binaries.
+    EMBEDDED_EBPF_CARGO_TOML.hash(&mut hasher);
+    EMBEDDED_EBPF_BUILD_RS.hash(&mut hasher);
+    EMBEDDED_EBPF_LIB_RS.hash(&mut hasher);
+    EMBEDDED_EBPF_MAIN_RS.hash(&mut hasher);
     let key = hasher.finish();
 
     let build_root = std::env::temp_dir()

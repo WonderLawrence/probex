@@ -683,7 +683,13 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
                 None,
             );
         }
-        match build_generated_ebpf_preview(&generated_code) {
+        let generated_code_for_preview = generated_code.clone();
+        let preview = tokio::task::spawn_blocking(move || {
+            build_generated_ebpf_preview(&generated_code_for_preview)
+        })
+        .await
+        .map_err(|error| IoError::other(format!("preview build task failed: {error}")))?;
+        match preview {
             Ok(detail) => {
                 let mut state = state().lock().await;
                 set_debug_step_status(
