@@ -26,6 +26,21 @@ cargo build --release -p probex --locked
 sudo target/release/probex -- sleep 1
 ```
 
+### Launch modes
+
+`probex` supports three user-facing modes:
+
+```shell
+# Launch backend + frontend only (no initial trace loaded)
+sudo probex
+
+# Open an existing trace file
+sudo probex --view trace.parquet
+
+# Trace a command, then open the result in the viewer
+sudo probex -- sleep 1
+```
+
 ### Download binary
 
 ```shell
@@ -33,6 +48,20 @@ wget -O probex.tar.gz $(curl -s https://api.github.com/repos/XiangpengHao/probex
 tar -xzf probex.tar.gz
 sudo ./probex -- sleep 1
 ```
+
+### Runtime custom probes (Viewer)
+
+In the viewer, custom probes support:
+
+- `tracepoint`
+- `fentry`
+- `fexit`
+
+Only some argument/return field types are supported for now.
+
+Generated custom-probe build artifacts are cached under:
+
+- `~/.cache/probex/generated`
 
 ## Demo 
 <video src="https://github.com/user-attachments/assets/5d66ac40-fefc-4cbb-9edc-2fa31e358ae7" controls="controls"></video>
