@@ -1040,7 +1040,7 @@ impl Drop for BuildLockGuard {
     }
 }
 
-pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
+pub(crate) fn build_generated_ebpf_binary_path(source: &str) -> Result<PathBuf> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut hasher);
     // Cache key must include scaffold contents so template/runtime edits invalidate
@@ -1059,12 +1059,7 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
         .join("release")
         .join("probex");
     if built_binary.is_file() {
-        return fs::read(&built_binary).with_context(|| {
-            format!(
-                "failed to read cached generated ebpf binary '{}'",
-                built_binary.display()
-            )
-        });
+        return Ok(built_binary);
     }
 
     fs::create_dir_all(&build_root).with_context(|| {
@@ -1087,12 +1082,7 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
             Ok(file) => break file,
             Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                 if built_binary.is_file() {
-                    return fs::read(&built_binary).with_context(|| {
-                        format!(
-                            "failed to read cached generated ebpf binary '{}'",
-                            built_binary.display()
-                        )
-                    });
+                    return Ok(built_binary);
                 }
                 if let Ok(metadata) = fs::metadata(&lock_path)
                     && let Ok(modified_at) = metadata.modified()
@@ -1129,12 +1119,7 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     };
 
     if built_binary.is_file() {
-        return fs::read(&built_binary).with_context(|| {
-            format!(
-                "failed to read cached generated ebpf binary '{}'",
-                built_binary.display()
-            )
-        });
+        return Ok(built_binary);
     }
 
     let drop_target = resolve_cargo_drop_target()?;
@@ -1225,10 +1210,21 @@ pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
         return Err(anyhow!(message));
     }
 
-    fs::read(&built_binary).with_context(|| {
+    if !built_binary.is_file() {
+        return Err(anyhow!(
+            "generated ebpf build succeeded but output '{}' was not found",
+            built_binary.display()
+        ));
+    }
+    Ok(built_binary)
+}
+
+pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
+    let path = build_generated_ebpf_binary_path(source)?;
+    fs::read(&path).with_context(|| {
         format!(
             "failed to read generated ebpf binary '{}'",
-            built_binary.display()
+            path.display()
         )
     })
 }

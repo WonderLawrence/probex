@@ -415,6 +415,18 @@ pub mod viewer_api {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedProbeSchemasQuery {
+        pub search: Option<String>,
+        pub category: Option<String>,
+        pub provider: Option<String>,
+        pub kinds: Option<Vec<ProbeSchemaKind>>,
+        pub source: Option<ProbeSchemaSource>,
+        pub offset: usize,
+        pub limit: usize,
+        pub include_fields: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct StartTraceRequest {
         pub program: String,
         pub args: Vec<String>,
@@ -481,15 +493,26 @@ pub mod viewer_api {
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub enum PrivilegedDaemonRequest {
-        StartTrace { request: StartTraceRequest },
+        StartTrace {
+            request: StartTraceRequest,
+            prebuilt_generated_ebpf_path: Option<String>,
+        },
         StopTrace,
         Status,
+        QueryProbeSchemasPage {
+            query: PrivilegedProbeSchemasQuery,
+        },
+        QueryProbeSchemaDetail {
+            display_name: String,
+        },
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct PrivilegedDaemonResponse {
         pub ok: bool,
         pub status: Option<TraceRunStatusResponse>,
+        pub probe_schemas_page: Option<ProbeSchemasPageResponse>,
+        pub probe_schema_detail: Option<ProbeSchema>,
         pub error: Option<String>,
     }
 

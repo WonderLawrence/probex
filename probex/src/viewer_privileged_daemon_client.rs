@@ -1,7 +1,8 @@
-use crate::{TraceCommandConfig, TraceCommandOutcome};
+use crate::{TraceCommandConfig, TraceCommandOutcome, custom_codegen};
 use anyhow::{Context as _, Result, anyhow};
 use probex_common::viewer_api::{
-    PrivilegedDaemonRequest, PrivilegedDaemonResponse, StartTraceRequest, TraceRunStatus,
+    PrivilegedDaemonRequest, PrivilegedDaemonResponse, PrivilegedProbeSchemasQuery,
+    ProbeSchema, ProbeSchemasPageResponse, StartTraceRequest, TraceRunStatus,
 };
 use std::env;
 use std::path::PathBuf;
@@ -25,6 +26,37 @@ fn to_start_request(config: TraceCommandConfig) -> StartTraceRequest {
         sample_freq_hz: config.sample_freq_hz,
         custom_probes: config.custom_probes,
     }
+}
+
+async fn resolve_custom_probe_schemas(
+    specs: &[probex_common::viewer_api::CustomProbeSpec],
+) -> Result<std::collections::HashMap<String, probex_common::viewer_api::ProbeSchema>> {
+    let mut resolved = std::collections::HashMap::with_capacity(specs.len());
+    for spec in specs {
+        let schema = crate::viewer_backend::query_probe_schema_detail(spec.probe_display_name.clone())
+            .await
+            .map_err(|error| anyhow!("failed to resolve custom probe '{}': {error}", spec.probe_display_name))?;
+        resolved.insert(spec.probe_display_name.clone(), schema);
+    }
+    Ok(resolved)
+}
+
+async fn maybe_build_prebuilt_generated_ebpf(
+    config: &TraceCommandConfig,
+) -> Result<Option<String>> {
+    if config.custom_probes.is_empty() {
+        return Ok(None);
+    }
+    let schemas = resolve_custom_probe_schemas(&config.custom_probes).await?;
+    let plan = custom_codegen::compile_custom_probe_plan(&config.custom_probes, &schemas)
+        .with_context(|| "failed to compile custom probe plan for daemon prebuild")?;
+    let source = custom_codegen::generate_custom_probe_source(&plan)
+        .with_context(|| "failed to generate custom probe source for daemon prebuild")?;
+    let built_path = tokio::task::spawn_blocking(move || custom_codegen::build_generated_ebpf_binary_path(&source))
+        .await
+        .with_context(|| "failed to join custom probe prebuild task")?
+        .with_context(|| "failed to build generated eBPF object for daemon prebuild")?;
+    Ok(Some(built_path.to_string_lossy().to_string()))
 }
 
 async fn send_request(request: PrivilegedDaemonRequest) -> Result<PrivilegedDaemonResponse> {
@@ -124,8 +156,10 @@ pub(crate) async fn run_trace_via_daemon(
     mut stop_signal: Option<watch::Receiver<bool>>,
 ) -> Result<TraceCommandOutcome> {
     ensure_daemon_running().await?;
+    let prebuilt_generated_ebpf_path = maybe_build_prebuilt_generated_ebpf(&config).await?;
     let start_resp = send_request(PrivilegedDaemonRequest::StartTrace {
         request: to_start_request(config),
+        prebuilt_generated_ebpf_path,
     })
     .await?;
     if !start_resp.ok {
@@ -161,4 +195,43 @@ pub(crate) async fn run_trace_via_daemon(
             return status;
         }
     }
+}
+
+pub(crate) async fn query_probe_schemas_page_via_daemon(
+    query: PrivilegedProbeSchemasQuery,
+) -> Result<ProbeSchemasPageResponse> {
+    ensure_daemon_running().await?;
+    let response = send_request(PrivilegedDaemonRequest::QueryProbeSchemasPage { query }).await?;
+    if !response.ok {
+        return Err(anyhow!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "privileged daemon probe schemas page query failed".to_string())
+        ));
+    }
+    response
+        .probe_schemas_page
+        .ok_or_else(|| anyhow!("privileged daemon response missing probe_schemas_page"))
+}
+
+pub(crate) async fn query_probe_schema_detail_via_daemon(
+    display_name: String,
+) -> Result<ProbeSchema> {
+    ensure_daemon_running().await?;
+    let response = send_request(PrivilegedDaemonRequest::QueryProbeSchemaDetail {
+        display_name,
+    })
+    .await?;
+    if !response.ok {
+        return Err(anyhow!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "privileged daemon probe schema detail query failed".to_string())
+        ));
+    }
+    response
+        .probe_schema_detail
+        .ok_or_else(|| anyhow!("privileged daemon response missing probe_schema_detail"))
 }

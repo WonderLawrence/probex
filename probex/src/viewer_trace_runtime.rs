@@ -696,6 +696,21 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
     if request.sample_freq_hz == 0 {
         return Err(IoError::new(ErrorKind::InvalidInput, "sample_freq_hz must be > 0").into());
     }
+    let output_parquet = {
+        let raw = std::path::PathBuf::from(request.output_parquet.as_str());
+        if raw.is_absolute() {
+            raw
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(raw))
+                .map_err(|error| {
+                    IoError::other(format!(
+                        "failed to resolve output_parquet against current directory: {error}"
+                    ))
+                })?
+        }
+    };
+    let output_parquet = output_parquet.to_string_lossy().to_string();
     {
         let mut state = state().lock().await;
         reset_debug_info(&mut state, &request);
@@ -842,11 +857,12 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let config = TraceCommandConfig {
-        output: request.output_parquet.clone(),
+        output: output_parquet.clone(),
         sample_freq_hz: request.sample_freq_hz,
         program: request.program,
         args: request.args,
         custom_probes: request.custom_probes,
+        prebuilt_generated_ebpf_path: None,
     };
     let task =
         tokio::spawn(async move { run_trace_with_privilege_fallback(config, Some(stop_rx)).await });
@@ -861,7 +877,7 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
     state.active = Some(ActiveTraceRun {
         run_id,
         command: traced_command,
-        output_parquet: request.output_parquet,
+        output_parquet,
         started_at_unix_ms,
         stop_tx,
         task,

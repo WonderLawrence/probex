@@ -15,7 +15,7 @@ use std::error::Error;
 
 mod backend {
     use super::*;
-    use crate::viewer_probe_catalog;
+    use crate::{viewer_privileged_daemon_client, viewer_probe_catalog};
     use datafusion::arrow::array::{
         Array, Int32Array, Int64Array, ListArray, StringArray, StringViewArray, UInt32Array,
         UInt64Array,
@@ -37,6 +37,37 @@ mod backend {
     const PARQUET_METADATA_CUSTOM_PAYLOAD_SCHEMAS_KEY: &str = "probex.custom_payload_schemas_v1";
     const STACK_TRACE_FORMAT_SYMBOLIZED_V1: &str = "symbolized_v1";
     type BackendResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    fn looks_like_permission_error(error_text: &str) -> bool {
+        let lower = error_text.to_ascii_lowercase();
+        lower.contains("permission denied")
+            || lower.contains("operation not permitted")
+            || lower.contains("eperm")
+            || lower.contains("eacces")
+    }
+
+    fn wants_function_kinds(query: &viewer_probe_catalog::ProbeSchemasQuery) -> bool {
+        query.kinds.as_ref().is_none_or(|kinds| {
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, ProbeSchemaKind::Fentry | ProbeSchemaKind::Fexit))
+        })
+    }
+
+    fn to_privileged_query(
+        query: viewer_probe_catalog::ProbeSchemasQuery,
+    ) -> probex_common::viewer_api::PrivilegedProbeSchemasQuery {
+        probex_common::viewer_api::PrivilegedProbeSchemasQuery {
+            search: query.search,
+            category: query.category,
+            provider: query.provider,
+            kinds: query.kinds,
+            source: query.source,
+            offset: query.offset,
+            limit: query.limit,
+            include_fields: query.include_fields,
+        }
+    }
 
     #[derive(Debug, Deserialize)]
     struct JsonPayloadValue {
@@ -325,11 +356,98 @@ mod backend {
     pub async fn query_probe_schemas_page(
         query: viewer_probe_catalog::ProbeSchemasQuery,
     ) -> BackendResult<ProbeSchemasPageResponse> {
-        viewer_probe_catalog::query_probe_schemas_page(query).await
+        match viewer_probe_catalog::query_probe_schemas_page(query.clone()).await {
+            Ok(page) => {
+                if wants_function_kinds(&query) {
+                    match viewer_probe_catalog::has_function_probes_loaded() {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return viewer_privileged_daemon_client::query_probe_schemas_page_via_daemon(
+                                to_privileged_query(query),
+                            )
+                            .await
+                            .map_err(|fallback_error| {
+                                IoError::new(
+                                    ErrorKind::PermissionDenied,
+                                    format!(
+                                        "local catalog has no fentry/fexit probes; privileged daemon fallback failed: {fallback_error:#}"
+                                    ),
+                                )
+                            })
+                            .map_err(Into::into);
+                        }
+                        Err(error) => {
+                            let error_text = error.to_string();
+                            if looks_like_permission_error(&error_text) {
+                                return viewer_privileged_daemon_client::query_probe_schemas_page_via_daemon(
+                                    to_privileged_query(query),
+                                )
+                                .await
+                                .map_err(|fallback_error| {
+                                    IoError::new(
+                                        ErrorKind::PermissionDenied,
+                                        format!(
+                                            "probe schemas page local function probe check failed: {error_text}; privileged daemon fallback failed: {fallback_error:#}"
+                                        ),
+                                    )
+                                })
+                                .map_err(Into::into);
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+                Ok(page)
+            }
+            Err(error) => {
+                let error_text = error.to_string();
+                if !looks_like_permission_error(&error_text) {
+                    return Err(error);
+                }
+                let page = viewer_privileged_daemon_client::query_probe_schemas_page_via_daemon(
+                    to_privileged_query(query),
+                )
+                .await
+                .map_err(|fallback_error| {
+                    IoError::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "probe schemas page query failed: {error_text}; privileged daemon fallback failed: {fallback_error:#}"
+                        ),
+                    )
+                })?;
+                Ok(page)
+            }
+        }
     }
 
     pub async fn query_probe_schema_detail(display_name: String) -> BackendResult<ProbeSchema> {
-        viewer_probe_catalog::query_probe_schema_detail(display_name).await
+        match viewer_probe_catalog::query_probe_schema_detail(display_name.clone()).await {
+            Ok(schema) => Ok(schema),
+            Err(error) => {
+                let error_text = error.to_string();
+                let is_function_probe = display_name.starts_with("fentry:")
+                    || display_name.starts_with("fexit:");
+                if !looks_like_permission_error(&error_text)
+                    && !(is_function_probe && error_text.to_ascii_lowercase().contains("not found"))
+                {
+                    return Err(error);
+                }
+                let schema = viewer_privileged_daemon_client::query_probe_schema_detail_via_daemon(
+                    display_name,
+                )
+                .await
+                .map_err(|fallback_error| {
+                    IoError::new(
+                        ErrorKind::PermissionDenied,
+                        format!(
+                            "probe schema detail query failed: {error_text}; privileged daemon fallback failed: {fallback_error:#}"
+                        ),
+                    )
+                })?;
+                Ok(schema)
+            }
+        }
     }
 
     pub async fn query_probe_schemas() -> BackendResult<ProbeSchemasResponse> {

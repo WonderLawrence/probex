@@ -783,3 +783,26 @@ pub async fn query_probe_schemas() -> ProbeCatalogResult<ProbeSchemasResponse> {
         probes: entries.iter().map(|entry| entry.schema.clone()).collect(),
     })
 }
+
+pub fn has_function_probes_loaded() -> ProbeCatalogResult<bool> {
+    ensure_probe_index_loading();
+    let state = get_probe_index_state();
+    if let Some(error) = state
+        .error
+        .lock()
+        .map_err(|_| IoError::other("failed to lock probe index error"))?
+        .clone()
+    {
+        return Err(IoError::other(error).into());
+    }
+    let entries = state
+        .entries
+        .lock()
+        .map_err(|_| IoError::other("failed to lock probe index entries"))?;
+    Ok(entries.iter().any(|entry| {
+        matches!(
+            entry.schema.kind,
+            ProbeSchemaKind::Fentry | ProbeSchemaKind::Fexit
+        )
+    }))
+}

@@ -1,8 +1,8 @@
 use crate::{TraceCommandConfig, run_trace_command};
 use anyhow::{Context as _, Result, anyhow};
 use probex_common::viewer_api::{
-    PrivilegedDaemonRequest, PrivilegedDaemonResponse, StartTraceRequest, TraceRunStatus,
-    TraceRunStatusResponse,
+    PrivilegedDaemonRequest, PrivilegedDaemonResponse, PrivilegedProbeSchemasQuery,
+    StartTraceRequest, TraceRunStatus, TraceRunStatusResponse,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -135,13 +135,30 @@ async fn refresh(state: &mut DaemonState) -> Result<()> {
     Ok(())
 }
 
-fn config_from_request(request: StartTraceRequest) -> TraceCommandConfig {
+fn config_from_request(
+    request: StartTraceRequest,
+    prebuilt_generated_ebpf_path: Option<String>,
+) -> TraceCommandConfig {
     TraceCommandConfig {
         output: request.output_parquet,
         sample_freq_hz: request.sample_freq_hz,
         program: request.program,
         args: request.args,
         custom_probes: request.custom_probes,
+        prebuilt_generated_ebpf_path,
+    }
+}
+
+fn to_probe_schemas_query(query: PrivilegedProbeSchemasQuery) -> crate::viewer_probe_catalog::ProbeSchemasQuery {
+    crate::viewer_probe_catalog::ProbeSchemasQuery {
+        search: query.search,
+        category: query.category,
+        provider: query.provider,
+        kinds: query.kinds,
+        source: query.source,
+        offset: query.offset,
+        limit: query.limit,
+        include_fields: query.include_fields,
     }
 }
 
@@ -150,12 +167,17 @@ async fn handle_request(
     request: PrivilegedDaemonRequest,
 ) -> PrivilegedDaemonResponse {
     match request {
-        PrivilegedDaemonRequest::StartTrace { request } => {
+        PrivilegedDaemonRequest::StartTrace {
+            request,
+            prebuilt_generated_ebpf_path,
+        } => {
             let mut guard = state.lock().await;
             if let Err(error) = refresh(&mut guard).await {
                 return PrivilegedDaemonResponse {
                     ok: false,
                     status: Some(status_response(&guard)),
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
                     error: Some(format!("failed to refresh daemon state: {error:#}")),
                 };
             }
@@ -163,6 +185,8 @@ async fn handle_request(
                 return PrivilegedDaemonResponse {
                     ok: false,
                     status: Some(status_response(&guard)),
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
                     error: Some("a privileged trace is already running".to_string()),
                 };
             }
@@ -173,7 +197,34 @@ async fn handle_request(
             command.push(request.program.clone());
             command.extend(request.args.clone());
             let output_parquet = request.output_parquet.clone();
-            let config = config_from_request(request);
+            if let Some(path) = prebuilt_generated_ebpf_path.as_deref() {
+                let candidate = std::path::Path::new(path);
+                if !candidate.is_absolute() {
+                    return PrivilegedDaemonResponse {
+                        ok: false,
+                        status: Some(status_response(&guard)),
+                        probe_schemas_page: None,
+                        probe_schema_detail: None,
+                        error: Some(format!(
+                            "prebuilt_generated_ebpf_path must be absolute, got {}",
+                            path
+                        )),
+                    };
+                }
+                if !candidate.is_file() {
+                    return PrivilegedDaemonResponse {
+                        ok: false,
+                        status: Some(status_response(&guard)),
+                        probe_schemas_page: None,
+                        probe_schema_detail: None,
+                        error: Some(format!(
+                            "prebuilt_generated_ebpf_path does not exist or is not a file: {}",
+                            path
+                        )),
+                    };
+                }
+            }
+            let config = config_from_request(request, prebuilt_generated_ebpf_path);
             let (stop_tx, stop_rx) = watch::channel(false);
             let task = tokio::spawn(async move { run_trace_command(config, Some(stop_rx), false).await });
             guard.finished = None;
@@ -189,6 +240,8 @@ async fn handle_request(
             PrivilegedDaemonResponse {
                 ok: true,
                 status: Some(status_response(&guard)),
+                probe_schemas_page: None,
+                probe_schema_detail: None,
                 error: None,
             }
         }
@@ -198,6 +251,8 @@ async fn handle_request(
                 return PrivilegedDaemonResponse {
                     ok: false,
                     status: Some(status_response(&guard)),
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
                     error: Some(format!("failed to refresh daemon state: {error:#}")),
                 };
             }
@@ -208,6 +263,8 @@ async fn handle_request(
             PrivilegedDaemonResponse {
                 ok: true,
                 status: Some(status_response(&guard)),
+                probe_schemas_page: None,
+                probe_schema_detail: None,
                 error: None,
             }
         }
@@ -217,13 +274,55 @@ async fn handle_request(
                 return PrivilegedDaemonResponse {
                     ok: false,
                     status: Some(status_response(&guard)),
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
                     error: Some(format!("failed to refresh daemon state: {error:#}")),
                 };
             }
             PrivilegedDaemonResponse {
                 ok: true,
                 status: Some(status_response(&guard)),
+                probe_schemas_page: None,
+                probe_schema_detail: None,
                 error: None,
+            }
+        }
+        PrivilegedDaemonRequest::QueryProbeSchemasPage { query } => {
+            match crate::viewer_probe_catalog::query_probe_schemas_page(to_probe_schemas_query(query))
+                .await
+            {
+                Ok(page) => PrivilegedDaemonResponse {
+                    ok: true,
+                    status: None,
+                    probe_schemas_page: Some(page),
+                    probe_schema_detail: None,
+                    error: None,
+                },
+                Err(error) => PrivilegedDaemonResponse {
+                    ok: false,
+                    status: None,
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
+                    error: Some(format!("privileged daemon failed to query probe schemas page: {error}")),
+                },
+            }
+        }
+        PrivilegedDaemonRequest::QueryProbeSchemaDetail { display_name } => {
+            match crate::viewer_probe_catalog::query_probe_schema_detail(display_name).await {
+                Ok(schema) => PrivilegedDaemonResponse {
+                    ok: true,
+                    status: None,
+                    probe_schemas_page: None,
+                    probe_schema_detail: Some(schema),
+                    error: None,
+                },
+                Err(error) => PrivilegedDaemonResponse {
+                    ok: false,
+                    status: None,
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
+                    error: Some(format!("privileged daemon failed to query probe schema detail: {error}")),
+                },
             }
         }
     }
@@ -274,7 +373,20 @@ pub(crate) async fn run(socket_path: &Path, owner_uid: u32) -> Result<()> {
         .with_context(|| format!("failed to bind daemon socket {:?}", socket_path))?;
     #[cfg(unix)]
     {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
+
+        let socket_cstr = CString::new(socket_path.as_os_str().as_bytes())
+            .with_context(|| "failed to encode daemon socket path for chown")?;
+        let chown_ret = unsafe { libc::chown(socket_cstr.as_ptr(), owner_uid, u32::MAX) };
+        if chown_ret != 0 {
+            return Err(anyhow!(
+                "failed to chown daemon socket to uid {}: {}",
+                owner_uid,
+                std::io::Error::last_os_error()
+            ));
+        }
         let mut perms = std::fs::metadata(socket_path)
             .with_context(|| "failed to stat daemon socket")?
             .permissions();
