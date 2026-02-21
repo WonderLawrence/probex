@@ -19,7 +19,7 @@ use arrow::{
 };
 use aya::{
     Btf,
-    maps::{HashMap as AyaHashMap, MapData, PerCpuArray, RingBuf, StackTraceMap},
+    maps::{HashMap as AyaHashMap, Map, MapData, PerCpuArray, RingBuf, StackTraceMap},
     programs::{
         FEntry, FExit, TracePoint,
         perf_event::{PerfEvent, PerfEventScope, PerfTypeId, SamplePolicy, perf_sw_ids},
@@ -54,6 +54,7 @@ use std::{
     env,
     ffi::CString,
     fs::File,
+    os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -68,6 +69,7 @@ mod viewer_privileged_daemon_client;
 mod viewer_probe_catalog;
 mod viewer_server;
 mod viewer_trace_runtime;
+mod unix_fd;
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
@@ -252,8 +254,7 @@ impl ParquetBatchWriter {
     /// Create a new ParquetBatchWriter that writes to the specified file
     fn new(path: &str, sample_freq_hz: u64, custom_payload_schemas_json: &str) -> Result<Self> {
         let schema = Arc::new(create_intermediate_schema());
-        let file =
-            File::create(path).with_context(|| format!("failed to create output file {}", path))?;
+        let file = create_output_file(path)?;
 
         let key_value_metadata = vec![
             KeyValue::new(
@@ -402,6 +403,27 @@ impl ParquetBatchWriter {
             .close()
             .with_context(|| "failed to close Parquet writer")?;
         Ok(self.total_written)
+    }
+}
+
+fn create_output_file(path: &str) -> Result<File> {
+    match File::create(path) {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            let output = Path::new(path);
+            if !output.exists() {
+                return Err(anyhow!("failed to create output file {}: {}", path, error));
+            }
+            std::fs::remove_file(output).with_context(|| {
+                format!(
+                    "failed to replace existing output file {} after permission denied",
+                    path
+                )
+            })?;
+            File::create(output)
+                .with_context(|| format!("failed to recreate output file {}", path))
+        }
+        Err(error) => Err(anyhow!("failed to create output file {}: {}", path, error)),
     }
 }
 
@@ -1792,6 +1814,14 @@ pub(crate) struct TraceCommandOutcome {
     pub output_path: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TraceMapFdBundle {
+    pub events_fd: i32,
+    pub stack_traces_fd: i32,
+    pub cpu_sample_stats_fd: i32,
+    pub custom_events_fd: Option<i32>,
+}
+
 pub(crate) struct PreparedTraceSession {
     ebpf: aya::Ebpf,
     child_pid: Pid,
@@ -1800,6 +1830,272 @@ pub(crate) struct PreparedTraceSession {
     custom_mode: bool,
     custom_payload_schemas_json: String,
     privilege_drop_target: Option<PrivilegeDropTarget>,
+}
+
+fn map_data_ref(map: &Map) -> &MapData {
+    match map {
+        Map::Array(v) => v,
+        Map::BloomFilter(v) => v,
+        Map::CpuMap(v) => v,
+        Map::DevMap(v) => v,
+        Map::DevMapHash(v) => v,
+        Map::HashMap(v) => v,
+        Map::LpmTrie(v) => v,
+        Map::LruHashMap(v) => v,
+        Map::PerCpuArray(v) => v,
+        Map::PerCpuHashMap(v) => v,
+        Map::PerCpuLruHashMap(v) => v,
+        Map::PerfEventArray(v) => v,
+        Map::ProgramArray(v) => v,
+        Map::Queue(v) => v,
+        Map::RingBuf(v) => v,
+        Map::SockHash(v) => v,
+        Map::SockMap(v) => v,
+        Map::Stack(v) => v,
+        Map::StackTraceMap(v) => v,
+        Map::Unsupported(v) => v,
+        Map::XskMap(v) => v,
+    }
+}
+
+fn map_raw_fd(ebpf: &mut aya::Ebpf, map_name: &str) -> Result<i32> {
+    let map = ebpf
+        .map_mut(map_name)
+        .ok_or_else(|| anyhow!("map {map_name} not found"))?;
+    Ok(map_data_ref(map).fd().as_fd().as_raw_fd())
+}
+
+pub(crate) fn trace_map_fds_from_prepared_session(
+    session: &mut PreparedTraceSession,
+) -> Result<TraceMapFdBundle> {
+    Ok(TraceMapFdBundle {
+        events_fd: map_raw_fd(&mut session.ebpf, "EVENTS")
+            .with_context(|| "failed to resolve EVENTS map fd")?,
+        stack_traces_fd: map_raw_fd(&mut session.ebpf, "STACK_TRACES")
+            .with_context(|| "failed to resolve STACK_TRACES map fd")?,
+        cpu_sample_stats_fd: map_raw_fd(&mut session.ebpf, "CPU_SAMPLE_STATS")
+            .with_context(|| "failed to resolve CPU_SAMPLE_STATS map fd")?,
+        custom_events_fd: if session.custom_mode {
+            Some(
+                map_raw_fd(&mut session.ebpf, "CUSTOM_EVENTS")
+                    .with_context(|| "failed to resolve CUSTOM_EVENTS map fd")?,
+            )
+        } else {
+            None
+        },
+    })
+}
+
+fn ring_buf_from_fd(fd: i32) -> Result<RingBuf<MapData>> {
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let map_data = MapData::from_fd(owned)?;
+    RingBuf::try_from(Map::RingBuf(map_data)).with_context(|| "failed to create ringbuf from fd")
+}
+
+fn stack_trace_map_from_fd(fd: i32) -> Result<StackTraceMap<MapData>> {
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let map_data = MapData::from_fd(owned)?;
+    StackTraceMap::try_from(Map::StackTraceMap(map_data))
+        .with_context(|| "failed to create stack trace map from fd")
+}
+
+fn cpu_sample_stats_from_fd(fd: i32) -> Result<PerCpuArray<MapData, [u64; CPU_SAMPLE_STATS_LEN]>> {
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let map_data = MapData::from_fd(owned)?;
+    PerCpuArray::try_from(Map::PerCpuArray(map_data))
+        .with_context(|| "failed to create cpu sample stats map from fd")
+}
+
+pub(crate) async fn consume_trace_from_map_fds(
+    config: TraceCommandConfig,
+    custom_probe_plan: CompiledCustomPlan,
+    custom_payload_schemas_json: String,
+    map_fds: TraceMapFdBundle,
+    mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
+    mut finished_signal: tokio::sync::watch::Receiver<bool>,
+) -> Result<TraceCommandOutcome> {
+    let custom_mode = !custom_probe_plan.by_probe_id.is_empty();
+    let mut writer = ParquetBatchWriter::new(
+        &config.output,
+        config.sample_freq_hz,
+        &custom_payload_schemas_json,
+    )?;
+    info!("Writing events to {}", config.output);
+    let mut snapshot_collector = ProcMapsSnapshotCollector::default();
+
+    let stack_traces = stack_trace_map_from_fd(map_fds.stack_traces_fd)?;
+    let cpu_sample_stats = cpu_sample_stats_from_fd(map_fds.cpu_sample_stats_fd)?;
+    let kernel_syms = kernel_symbols().ok();
+    if kernel_syms.is_none() {
+        debug!("kernel symbols unavailable; kernel stack frames will be shown as raw addresses");
+    }
+
+    let ring_buf = ring_buf_from_fd(map_fds.events_fd)?;
+    let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
+    let mut custom_async_ring_buf = if let Some(custom_fd) = map_fds.custom_events_fd {
+        let custom_ring_buf = ring_buf_from_fd(custom_fd)
+            .with_context(|| "step=open_custom_events_map_fd failed")?;
+        Some(AsyncFd::with_interest(
+            custom_ring_buf,
+            tokio::io::Interest::READABLE,
+        )?)
+    } else {
+        None
+    };
+
+    let mut pid_name_cache: HashMap<u32, Option<String>> = HashMap::new();
+    let mut stack_trace_cache: StackTraceCache = HashMap::new();
+    let mut proc_map_snapshot_cache: HashMap<u32, Vec<ProcMapEntry>> = HashMap::new();
+    let mut seen_tgids: HashSet<u32> = HashSet::new();
+
+    let mut handle_event = |event: &mut Event| -> Result<()> {
+        enrich_process_name(event, &mut pid_name_cache);
+        enrich_stack_data(
+            event,
+            &stack_traces,
+            kernel_syms.as_ref(),
+            &mut stack_trace_cache,
+        );
+
+        if event.tgid > 0 {
+            let is_first_seen = seen_tgids.insert(event.tgid);
+            let should_refresh =
+                is_first_seen || should_refresh_maps_for_event(event.event_type.as_str());
+            if should_refresh {
+                maybe_capture_proc_maps_snapshot(
+                    event.tgid,
+                    event.ts_ns,
+                    should_refresh,
+                    &mut proc_map_snapshot_cache,
+                    &mut snapshot_collector,
+                );
+            }
+        }
+
+        if event.event_type == "process_fork"
+            && let Some(child_pid) = event.child_pid
+        {
+            maybe_capture_proc_maps_snapshot(
+                child_pid,
+                event.ts_ns,
+                true,
+                &mut proc_map_snapshot_cache,
+                &mut snapshot_collector,
+            );
+            seen_tgids.insert(child_pid);
+        }
+
+        writer.push(std::mem::take(event))
+    };
+
+    loop {
+        if stop_signal.as_ref().is_some_and(|sig| *sig.borrow()) {
+            return Err(anyhow!("trace stopped by request"));
+        }
+        if *finished_signal.borrow() {
+            while let Some(item) = async_ring_buf.get_mut().next() {
+                let mut event = parse_event(&item)
+                    .with_context(|| "failed to parse ring buffer event while draining")?;
+                handle_event(&mut event)?;
+            }
+            if let Some(custom_ring) = custom_async_ring_buf.as_mut() {
+                while let Some(item) = custom_ring.get_mut().next() {
+                    if let Some(mut custom_event) =
+                        parse_custom_runtime_event(&item, &custom_probe_plan)?
+                    {
+                        handle_event(&mut custom_event)?;
+                    }
+                }
+            }
+            break;
+        }
+
+        let stop_changed = async {
+            if let Some(signal) = stop_signal.as_mut() {
+                let _ = signal.changed().await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(stop_changed);
+
+        tokio::select! {
+            _ = finished_signal.changed() => {}
+            _ = &mut stop_changed => {
+                return Err(anyhow!("trace stopped by request"));
+            }
+            result = async_ring_buf.readable_mut() => {
+                let mut guard = result?;
+                while let Some(item) = guard.get_inner_mut().next() {
+                    let mut event =
+                        parse_event(&item).with_context(|| "failed to parse ring buffer event")?;
+                    handle_event(&mut event)?;
+                }
+                if custom_mode
+                    && let Some(custom_ring) = custom_async_ring_buf.as_mut()
+                {
+                    while let Some(item) = custom_ring.get_mut().next() {
+                        if let Some(mut custom_event) =
+                            parse_custom_runtime_event(&item, &custom_probe_plan)?
+                        {
+                            handle_event(&mut custom_event)?;
+                        }
+                    }
+                }
+                guard.clear_ready();
+            }
+        }
+    }
+
+    match read_cpu_sample_stats(&cpu_sample_stats) {
+        Ok(stats) => {
+            let total = stats[CPU_SAMPLE_STAT_CALLBACK_TOTAL];
+            let filtered = stats[CPU_SAMPLE_STAT_FILTERED_NOT_TRACED];
+            let emitted = stats[CPU_SAMPLE_STAT_EMITTED];
+            let dropped = stats[CPU_SAMPLE_STAT_RINGBUF_DROPPED];
+            let user_stack = stats[CPU_SAMPLE_STAT_USER_STACK];
+            let kernel_stack = stats[CPU_SAMPLE_STAT_KERNEL_STACK];
+            let no_stack = stats[CPU_SAMPLE_STAT_NO_STACK];
+            let drop_pct = if emitted + dropped > 0 {
+                (dropped as f64) * 100.0 / ((emitted + dropped) as f64)
+            } else {
+                0.0
+            };
+            info!(
+                "CPU samples: {} total, {} filtered, {} emitted, {} dropped ({:.1}% loss) | stacks: {} user, {} kernel, {} none",
+                total, filtered, emitted, dropped, drop_pct, user_stack, kernel_stack, no_stack
+            );
+        }
+        Err(error) => debug!("Failed to read CPU sampler stats: {error}"),
+    }
+
+    let total_events = writer.finish()?;
+    let total_maps = snapshot_collector.total_rows();
+
+    debug!("Symbolizing stack traces (this may take a few seconds)...");
+    let finalization_stats = symbolize_stack_traces_into_events_parquet(
+        &config.output,
+        snapshot_collector.snapshot_index(),
+        config.sample_freq_hz,
+        &custom_payload_schemas_json,
+    )
+    .await?;
+    info!(
+        "Post-processing complete: rows={}, symbolized_user_rows={}, symbolized_mixed_rows={}, mapped_fallback_frames={}, raw_fallback_frames={}",
+        finalization_stats.rewritten_rows,
+        finalization_stats.symbolized_user_rows,
+        finalization_stats.symbolized_mixed_rows,
+        finalization_stats.mapped_fallback_frames,
+        finalization_stats.raw_fallback_frames,
+    );
+
+    info!("Wrote {} events to {}", total_events, config.output);
+    debug!("Captured {} proc map rows while tracing", total_maps);
+
+    Ok(TraceCommandOutcome {
+        total_events,
+        output_path: config.output,
+    })
 }
 
 async fn resolve_custom_probe_schemas(

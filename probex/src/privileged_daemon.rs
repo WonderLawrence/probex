@@ -1,23 +1,35 @@
-use crate::{TraceCommandConfig, run_trace_command};
+use crate::{
+    TraceCommandConfig, TraceMapFdBundle, prepare_trace_session,
+    trace_map_fds_from_prepared_session,
+};
 use anyhow::{Context as _, Result, anyhow};
+use nix::{
+    sys::{
+        signal::{Signal, kill},
+        wait::WaitStatus,
+    },
+    unistd::Pid,
+};
 use probex_common::viewer_api::{
-    PrivilegedDaemonRequest, PrivilegedDaemonResponse, PrivilegedProbeSchemasQuery,
+    PrivilegedDaemonRequest, PrivilegedDaemonResponse, PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse,
     StartTraceRequest, TraceRunStatus, TraceRunStatusResponse,
 };
+use std::os::fd::AsRawFd as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
 
 struct ActiveRun {
     run_id: u64,
     command: Vec<String>,
     output_parquet: String,
     started_at_unix_ms: u64,
-    stop_tx: watch::Sender<bool>,
-    task: tokio::task::JoinHandle<anyhow::Result<crate::TraceCommandOutcome>>,
+    session: crate::PreparedTraceSession,
+    map_fds: TraceMapFdBundle,
+    has_custom_events: bool,
 }
 
 #[derive(Clone)]
@@ -89,7 +101,7 @@ async fn refresh(state: &mut DaemonState) -> Result<()> {
     let is_finished = state
         .active
         .as_ref()
-        .is_some_and(|active| active.task.is_finished());
+        .is_some_and(|active| active.session.child_wait.is_finished());
     if !is_finished {
         return Ok(());
     }
@@ -98,16 +110,40 @@ async fn refresh(state: &mut DaemonState) -> Result<()> {
         .take()
         .ok_or_else(|| anyhow!("active run missing while refreshing"))?;
     let finished_at_unix_ms = now_unix_ms();
-    let finished = match active.task.await {
-        Ok(Ok(outcome)) => FinishedRun {
+    let finished = match active.session.child_wait.await {
+        Ok(Ok(WaitStatus::Exited(_, code))) => FinishedRun {
             run_id: active.run_id,
             command: active.command,
-            output_parquet: outcome.output_path,
+            output_parquet: active.output_parquet,
             started_at_unix_ms: active.started_at_unix_ms,
             finished_at_unix_ms,
-            exit_code: 0,
-            success: true,
-            error: None,
+            exit_code: code,
+            success: code == 0,
+            error: if code == 0 {
+                None
+            } else {
+                Some(format!("child exited with status {code}"))
+            },
+        },
+        Ok(Ok(WaitStatus::Signaled(_, signal, _))) => FinishedRun {
+            run_id: active.run_id,
+            command: active.command,
+            output_parquet: active.output_parquet,
+            started_at_unix_ms: active.started_at_unix_ms,
+            finished_at_unix_ms,
+            exit_code: 1,
+            success: false,
+            error: Some(format!("child terminated by signal {signal}")),
+        },
+        Ok(Ok(status)) => FinishedRun {
+            run_id: active.run_id,
+            command: active.command,
+            output_parquet: active.output_parquet,
+            started_at_unix_ms: active.started_at_unix_ms,
+            finished_at_unix_ms,
+            exit_code: 1,
+            success: false,
+            error: Some(format!("unexpected wait status: {status:?}")),
         },
         Ok(Err(error)) => FinishedRun {
             run_id: active.run_id,
@@ -117,7 +153,7 @@ async fn refresh(state: &mut DaemonState) -> Result<()> {
             finished_at_unix_ms,
             exit_code: 1,
             success: false,
-            error: Some(format!("{error:#}")),
+            error: Some(format!("waitpid failed: {error}")),
         },
         Err(error) => FinishedRun {
             run_id: active.run_id,
@@ -127,7 +163,7 @@ async fn refresh(state: &mut DaemonState) -> Result<()> {
             finished_at_unix_ms,
             exit_code: 1,
             success: false,
-            error: Some(format!("trace task failed: {error}")),
+            error: Some(format!("wait task failed: {error}")),
         },
     };
     state.finished = Some(finished);
@@ -225,16 +261,56 @@ async fn handle_request(
                 }
             }
             let config = config_from_request(request, prebuilt_generated_ebpf_path);
-            let (stop_tx, stop_rx) = watch::channel(false);
-            let task = tokio::spawn(async move { run_trace_command(config, Some(stop_rx), false).await });
+            let mut prepared = match prepare_trace_session(&config).await {
+                Ok(session) => session,
+                Err(error) => {
+                    return PrivilegedDaemonResponse {
+                        ok: false,
+                        status: Some(status_response(&guard)),
+                        probe_schemas_page: None,
+                        probe_schema_detail: None,
+                        error: Some(format!(
+                            "failed to prepare trace session in privileged daemon: {error:#}"
+                        )),
+                    };
+                }
+            };
+            let map_fds = match trace_map_fds_from_prepared_session(&mut prepared) {
+                Ok(fds) => fds,
+                Err(error) => {
+                    return PrivilegedDaemonResponse {
+                        ok: false,
+                        status: Some(status_response(&guard)),
+                        probe_schemas_page: None,
+                        probe_schema_detail: None,
+                        error: Some(format!(
+                            "failed to extract trace map fds in privileged daemon: {error:#}"
+                        )),
+                    };
+                }
+            };
+            let has_custom_events = map_fds.custom_events_fd.is_some();
+            let child_pid = prepared.child_pid;
+            if let Err(error) = kill(child_pid, Signal::SIGCONT).with_context(|| {
+                format!("failed to resume child process {} in privileged daemon", child_pid)
+            }) {
+                return PrivilegedDaemonResponse {
+                    ok: false,
+                    status: Some(status_response(&guard)),
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
+                    error: Some(format!("{error:#}")),
+                };
+            }
             guard.finished = None;
             guard.active = Some(ActiveRun {
                 run_id,
                 command,
                 output_parquet,
                 started_at_unix_ms,
-                stop_tx,
-                task,
+                session: prepared,
+                map_fds,
+                has_custom_events,
             });
             guard.sequence = guard.sequence.saturating_add(1);
             PrivilegedDaemonResponse {
@@ -243,6 +319,27 @@ async fn handle_request(
                 probe_schemas_page: None,
                 probe_schema_detail: None,
                 error: None,
+            }
+        }
+        PrivilegedDaemonRequest::TakeTraceMapFds => {
+            let mut guard = state.lock().await;
+            if let Err(error) = refresh(&mut guard).await {
+                return PrivilegedDaemonResponse {
+                    ok: false,
+                    status: Some(status_response(&guard)),
+                    probe_schemas_page: None,
+                    probe_schema_detail: None,
+                    error: Some(format!("failed to refresh daemon state: {error:#}")),
+                };
+            }
+            PrivilegedDaemonResponse {
+                ok: false,
+                status: Some(status_response(&guard)),
+                probe_schemas_page: None,
+                probe_schema_detail: None,
+                error: Some(
+                    "TakeTraceMapFds must be handled via fd-transfer endpoint".to_string(),
+                ),
             }
         }
         PrivilegedDaemonRequest::StopTrace => {
@@ -257,7 +354,8 @@ async fn handle_request(
                 };
             }
             if let Some(active) = guard.active.as_ref() {
-                let _ = active.stop_tx.send(true);
+                let pid = active.session.child_pid;
+                let _ = kill(Pid::from_raw(pid.as_raw()), Signal::SIGTERM);
                 guard.sequence = guard.sequence.saturating_add(1);
             }
             PrivilegedDaemonResponse {
@@ -353,6 +451,55 @@ async fn handle_conn(
     }
     let request: PrivilegedDaemonRequest = serde_json::from_slice(&buf)
         .with_context(|| "failed to parse daemon request")?;
+    if matches!(request, PrivilegedDaemonRequest::TakeTraceMapFds) {
+        let mut guard = state.lock().await;
+        if let Err(error) = refresh(&mut guard).await {
+            let response = PrivilegedTraceMapFdsResponse {
+                ok: false,
+                run_id: None,
+                has_custom_events: false,
+                error: Some(format!("failed to refresh daemon state: {error:#}")),
+            };
+            let payload = serde_json::to_vec(&response)
+                .with_context(|| "failed to serialize daemon fd-transfer response")?;
+            crate::unix_fd::send_with_fds(stream.as_raw_fd(), &payload, &[])?;
+            return Ok(());
+        }
+        let (response, fds): (PrivilegedTraceMapFdsResponse, Vec<i32>) =
+            if let Some(active) = guard.active.as_ref() {
+                let mut fds = vec![
+                    active.map_fds.events_fd,
+                    active.map_fds.stack_traces_fd,
+                    active.map_fds.cpu_sample_stats_fd,
+                ];
+                if let Some(custom) = active.map_fds.custom_events_fd {
+                    fds.push(custom);
+                }
+                (
+                    PrivilegedTraceMapFdsResponse {
+                        ok: true,
+                        run_id: Some(active.run_id),
+                        has_custom_events: active.has_custom_events,
+                        error: None,
+                    },
+                    fds,
+                )
+            } else {
+                (
+                    PrivilegedTraceMapFdsResponse {
+                        ok: false,
+                        run_id: None,
+                        has_custom_events: false,
+                        error: Some("no active privileged trace run".to_string()),
+                    },
+                    Vec::new(),
+                )
+            };
+        let payload = serde_json::to_vec(&response)
+            .with_context(|| "failed to serialize daemon fd-transfer response")?;
+        crate::unix_fd::send_with_fds(stream.as_raw_fd(), &payload, &fds)?;
+        return Ok(());
+    }
     let response = handle_request(state, request).await;
     let payload =
         serde_json::to_vec(&response).with_context(|| "failed to serialize daemon response")?;

@@ -497,6 +497,7 @@ pub mod viewer_api {
             request: StartTraceRequest,
             prebuilt_generated_ebpf_path: Option<String>,
         },
+        TakeTraceMapFds,
         StopTrace,
         Status,
         QueryProbeSchemasPage {
@@ -513,6 +514,14 @@ pub mod viewer_api {
         pub status: Option<TraceRunStatusResponse>,
         pub probe_schemas_page: Option<ProbeSchemasPageResponse>,
         pub probe_schema_detail: Option<ProbeSchema>,
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedTraceMapFdsResponse {
+        pub ok: bool,
+        pub run_id: Option<u64>,
+        pub has_custom_events: bool,
         pub error: Option<String>,
     }
 

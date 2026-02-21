@@ -27,7 +27,7 @@ clap = { workspace = true, features = ["derive", "help"] }
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-nix = { workspace = true, features = ["signal", "process"] }
+nix = { workspace = true, features = ["signal", "process", "socket", "uio"] }
 arrow = { workspace = true }
 parquet = { workspace = true }
 tokio = { workspace = true, features = [
