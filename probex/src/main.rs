@@ -1792,6 +1792,16 @@ pub(crate) struct TraceCommandOutcome {
     pub output_path: String,
 }
 
+struct PreparedTraceSession {
+    ebpf: aya::Ebpf,
+    child_pid: Pid,
+    child_wait: tokio::task::JoinHandle<Result<WaitStatus, nix::Error>>,
+    custom_probe_plan: CompiledCustomPlan,
+    custom_mode: bool,
+    custom_payload_schemas_json: String,
+    privilege_drop_target: Option<PrivilegeDropTarget>,
+}
+
 async fn resolve_custom_probe_schemas(
     specs: &[probex_common::viewer_api::CustomProbeSpec],
 ) -> Result<std::collections::HashMap<String, probex_common::viewer_api::ProbeSchema>> {
@@ -1811,11 +1821,7 @@ async fn resolve_custom_probe_schemas(
     Ok(resolved)
 }
 
-pub(crate) async fn run_trace_command(
-    config: TraceCommandConfig,
-    mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
-    allow_ctrl_c: bool,
-) -> Result<TraceCommandOutcome> {
+async fn prepare_trace_session(config: &TraceCommandConfig) -> Result<PreparedTraceSession> {
     let resolved_custom_probe_schemas =
         resolve_custom_probe_schemas(&config.custom_probes)
             .await
@@ -1882,7 +1888,7 @@ pub(crate) async fn run_trace_command(
 
     wait_for_child_stop(child_pid).with_context(|| "step=wait_child_stop failed")?;
 
-    let mut child_wait = tokio::task::spawn_blocking(move || waitpid(child_pid, None));
+    let child_wait = tokio::task::spawn_blocking(move || waitpid(child_pid, None));
 
     // Insert child PID into TRACED_PIDS map
     {
@@ -2086,8 +2092,35 @@ pub(crate) async fn run_trace_command(
         .context("child pid is negative and cannot be used for perf scope")?;
     attach_cpu_sampler(&mut ebpf, target_pid, config.sample_freq_hz)?;
 
+    Ok(PreparedTraceSession {
+        ebpf,
+        child_pid,
+        child_wait,
+        custom_probe_plan,
+        custom_mode,
+        custom_payload_schemas_json,
+        privilege_drop_target,
+    })
+}
+
+async fn consume_trace_session(
+    config: TraceCommandConfig,
+    mut session: PreparedTraceSession,
+    mut stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
+    allow_ctrl_c: bool,
+) -> Result<TraceCommandOutcome> {
+    let PreparedTraceSession {
+        ebpf,
+        child_pid,
+        child_wait,
+        custom_probe_plan,
+        custom_mode,
+        custom_payload_schemas_json,
+        privilege_drop_target,
+    } = &mut session;
+
     if allow_ctrl_c && let Some(target) = privilege_drop_target {
-        drop_process_privileges(target).context("failed to drop runtime privileges")?;
+        drop_process_privileges(*target).context("failed to drop runtime privileges")?;
         debug!(
             "Dropped privileges to uid={}, gid={} after eBPF setup",
             target.uid, target.gid
@@ -2097,7 +2130,7 @@ pub(crate) async fn run_trace_command(
     }
 
     // Resume child process
-    kill(child_pid, Signal::SIGCONT)
+    kill(*child_pid, Signal::SIGCONT)
         .with_context(|| format!("failed to resume child process {}", child_pid))?;
     debug!("Resumed child process {}", child_pid);
 
@@ -2105,7 +2138,7 @@ pub(crate) async fn run_trace_command(
     let mut writer = ParquetBatchWriter::new(
         &config.output,
         config.sample_freq_hz,
-        &custom_payload_schemas_json,
+        custom_payload_schemas_json,
     )?;
     info!("Writing events to {}", config.output);
     let mut snapshot_collector = ProcMapsSnapshotCollector::default();
@@ -2130,7 +2163,7 @@ pub(crate) async fn run_trace_command(
             .ok_or_else(|| anyhow!("map EVENTS not found"))?,
     )?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
-    let mut custom_async_ring_buf = if custom_mode {
+    let mut custom_async_ring_buf = if *custom_mode {
         let custom_ring_buf = RingBuf::try_from(
             ebpf.take_map("CUSTOM_EVENTS")
                 .ok_or_else(|| anyhow!("map CUSTOM_EVENTS not found"))?,
@@ -2196,7 +2229,7 @@ pub(crate) async fn run_trace_command(
         if stop_signal.as_ref().is_some_and(|sig| *sig.borrow()) {
             info!("Received stop request, exiting trace loop...");
             if !child_wait.is_finished() {
-                let _ = kill(child_pid, Signal::SIGTERM);
+                let _ = kill(*child_pid, Signal::SIGTERM);
             }
             break;
         }
@@ -2219,7 +2252,7 @@ pub(crate) async fn run_trace_command(
         tokio::pin!(ctrl_c);
 
         tokio::select! {
-            result = &mut child_wait => {
+            result = &mut *child_wait => {
                 child_wait_done = true;
                 match result {
                     Ok(Ok(WaitStatus::Exited(_, _))) | Ok(Ok(WaitStatus::Signaled(_, _, _))) => {}
@@ -2237,7 +2270,7 @@ pub(crate) async fn run_trace_command(
                 if let Some(custom_ring) = custom_async_ring_buf.as_mut() {
                     while let Some(item) = custom_ring.get_mut().next() {
                         if let Some(mut custom_event) =
-                            parse_custom_runtime_event(&item, &custom_probe_plan)?
+                            parse_custom_runtime_event(&item, custom_probe_plan)?
                         {
                             handle_event(&mut custom_event)?;
                         }
@@ -2249,14 +2282,14 @@ pub(crate) async fn run_trace_command(
             _ = &mut stop_changed => {
                 info!("Received stop request, exiting...");
                 if !child_wait.is_finished() {
-                    let _ = kill(child_pid, Signal::SIGTERM);
+                    let _ = kill(*child_pid, Signal::SIGTERM);
                 }
                 break;
             }
             _ = &mut ctrl_c => {
                 info!("Received Ctrl-C, exiting...");
                 if !child_wait.is_finished() {
-                    let _ = kill(child_pid, Signal::SIGTERM);
+                    let _ = kill(*child_pid, Signal::SIGTERM);
                 }
                 break;
             }
@@ -2274,7 +2307,7 @@ pub(crate) async fn run_trace_command(
                 if let Some(custom_ring) = custom_async_ring_buf.as_mut() {
                     while let Some(item) = custom_ring.get_mut().next() {
                         if let Some(mut custom_event) =
-                            parse_custom_runtime_event(&item, &custom_probe_plan)?
+                            parse_custom_runtime_event(&item, custom_probe_plan)?
                         {
                             handle_event(&mut custom_event)?;
                         }
@@ -2321,7 +2354,7 @@ pub(crate) async fn run_trace_command(
         &config.output,
         snapshot_collector.snapshot_index(),
         config.sample_freq_hz,
-        &custom_payload_schemas_json,
+        custom_payload_schemas_json,
     )
     .await?;
     info!(
@@ -2340,6 +2373,15 @@ pub(crate) async fn run_trace_command(
         total_events,
         output_path: config.output,
     })
+}
+
+pub(crate) async fn run_trace_command(
+    config: TraceCommandConfig,
+    stop_signal: Option<tokio::sync::watch::Receiver<bool>>,
+    allow_ctrl_c: bool,
+) -> Result<TraceCommandOutcome> {
+    let session = prepare_trace_session(&config).await?;
+    consume_trace_session(config, session, stop_signal, allow_ctrl_c).await
 }
 
 #[tokio::main]
