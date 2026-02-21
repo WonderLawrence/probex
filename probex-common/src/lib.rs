@@ -480,6 +480,20 @@ pub mod viewer_api {
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub enum PrivilegedDaemonRequest {
+        StartTrace { request: StartTraceRequest },
+        StopTrace,
+        Status,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    pub struct PrivilegedDaemonResponse {
+        pub ok: bool,
+        pub status: Option<TraceRunStatusResponse>,
+        pub error: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
     pub struct CustomEventDebugField {
         pub field_id: u16,
         pub name: String,

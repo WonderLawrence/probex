@@ -1,7 +1,9 @@
 use crate::{
     TraceCommandConfig, custom_codegen::build_generated_ebpf_binary,
     generate_custom_probe_source_preview, run_trace_command, viewer_backend,
+    viewer_privileged_daemon_client,
 };
+use anyhow::Context as _;
 use probex_common::viewer_api::{
     CustomProbeFieldRef, CustomProbeFilter, CustomProbeFilterOp, CustomProbeSpec, ProbeSchema,
     ProbeSchemaKind, StartTraceRequest, TraceDebugInfo, TraceDebugStep, TraceDebugStepStatus,
@@ -623,6 +625,37 @@ async fn refresh_active_run(state: &mut TraceRuntimeState) -> RuntimeResult<()> 
     Ok(())
 }
 
+fn looks_like_permission_error(error_text: &str) -> bool {
+    let lower = error_text.to_ascii_lowercase();
+    lower.contains("permission denied")
+        || lower.contains("operation not permitted")
+        || lower.contains("eperm")
+        || lower.contains("eacces")
+}
+
+async fn run_trace_with_privilege_fallback(
+    config: TraceCommandConfig,
+    stop_signal: Option<watch::Receiver<bool>>,
+) -> AnyhowResult<crate::TraceCommandOutcome> {
+    let direct_stop = stop_signal.as_ref().map(Clone::clone);
+    match run_trace_command(config.clone(), direct_stop, false).await {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            let error_text = format!("{error:#}");
+            if !looks_like_permission_error(&error_text) {
+                return Err(error);
+            }
+            viewer_privileged_daemon_client::run_trace_via_daemon(config, stop_signal)
+                .await
+                .with_context(|| {
+                    format!(
+                        "direct tracing failed with permission error: {error_text}; privileged daemon fallback failed"
+                    )
+                })
+        }
+    }
+}
+
 pub fn initialize() -> RuntimeResult<()> {
     let _ = state();
     Ok(())
@@ -815,7 +848,8 @@ pub async fn start(request: StartTraceRequest) -> RuntimeResult<TraceRunStatusRe
         args: request.args,
         custom_probes: request.custom_probes,
     };
-    let task = tokio::spawn(async move { run_trace_command(config, Some(stop_rx), false).await });
+    let task =
+        tokio::spawn(async move { run_trace_with_privilege_fallback(config, Some(stop_rx)).await });
     let mut state = state().lock().await;
     set_debug_step_status(
         &mut state,

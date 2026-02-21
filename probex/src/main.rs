@@ -61,8 +61,10 @@ use tokio::{io::unix::AsyncFd, signal};
 use wholesym::{LookupAddress, SymbolManager, SymbolManagerConfig};
 
 mod custom_codegen;
+mod privileged_daemon;
 mod tracepoint_format;
 mod viewer_backend;
+mod viewer_privileged_daemon_client;
 mod viewer_probe_catalog;
 mod viewer_server;
 mod viewer_trace_runtime;
@@ -102,6 +104,18 @@ struct Args {
     /// Command to run
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+
+    /// Internal mode: run privileged daemon on a local Unix socket.
+    #[arg(long, hide = true)]
+    privileged_daemon: bool,
+
+    /// Socket path used by privileged daemon mode.
+    #[arg(long, hide = true, default_value = "/tmp/probex-privileged.sock")]
+    privileged_daemon_socket: String,
+
+    /// Owner uid allowed to use privileged daemon socket.
+    #[arg(long, hide = true)]
+    privileged_daemon_owner_uid: Option<u32>,
 }
 
 /// Flattened event structure for Parquet output.
@@ -2326,6 +2340,12 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
+    if args.privileged_daemon {
+        let owner_uid = args.privileged_daemon_owner_uid.ok_or_else(|| {
+            anyhow!("--privileged-daemon requires --privileged-daemon-owner-uid")
+        })?;
+        return privileged_daemon::run(std::path::Path::new(&args.privileged_daemon_socket), owner_uid).await;
+    }
 
     if let Some(parquet_file) = args.view.as_deref() {
         return viewer_server::launch(parquet_file, args.port).await;
