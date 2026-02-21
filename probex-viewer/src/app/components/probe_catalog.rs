@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use gloo_timers::future::TimeoutFuture;
 use std::collections::{HashMap, HashSet};
 
 use crate::api::{
@@ -47,6 +48,7 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
     let mut has_more_pages = use_signal(|| false);
     let mut page_offset = use_signal(|| 0usize);
     let mut page_request_in_flight = use_signal(|| false);
+    let mut backend_refresh_scheduled = use_signal(|| false);
     let mut scroll_load_armed = use_signal(|| true);
     let mut last_scroll_top = use_signal(|| 0.0f64);
     let mut probe_error = use_signal(|| Option::<String>::None);
@@ -57,6 +59,7 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
         if !catalog_initialized() {
             return;
         }
+        let _refresh = refresh_nonce();
         page_request_in_flight.set(true);
         probes_loading.set(true);
         probe_error.set(None);
@@ -117,7 +120,24 @@ pub fn ProbeCatalog(custom_probes: Signal<Vec<CustomProbeSpec>>) -> Element {
 
         probes_loading.set(false);
         page_request_in_flight.set(false);
-        let _ = refresh_nonce();
+    });
+
+    use_effect(move || {
+        if !catalog_initialized() || !backend_loading() || backend_refresh_scheduled() {
+            return;
+        }
+        backend_refresh_scheduled.set(true);
+        spawn(async move {
+            TimeoutFuture::new(900).await;
+            backend_refresh_scheduled.set(false);
+            if catalog_initialized()
+                && backend_loading()
+                && !probes_loading()
+                && !page_request_in_flight()
+            {
+                refresh_nonce.set(refresh_nonce().wrapping_add(1));
+            }
+        });
     });
 
     let selected_probe_set: HashSet<String> = selected_probes().iter().cloned().collect();
