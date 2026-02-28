@@ -166,6 +166,40 @@ async fn send_request(request: PrivilegedDaemonRequest) -> Result<PrivilegedDaem
     Ok(response)
 }
 
+async fn spawn_daemon_with(
+    command: &str,
+    exe: &std::path::Path,
+    socket: &PathBuf,
+    session_token: &str,
+) -> Result<tokio::process::Child> {
+    let mut child = Command::new(command)
+        .arg(exe)
+        .arg("--privileged-daemon")
+        .arg("--privileged-daemon-socket")
+        .arg(socket.as_os_str())
+        .arg("--privileged-daemon-owner-uid")
+        .arg(format!("{}", unsafe { libc::geteuid() }))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn privileged daemon via {} (is it installed and authorized?). {}",
+                command,
+                trace_privilege::privilege_hint()
+            )
+        })?;
+    let mut stdin: ChildStdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("failed to open privileged daemon stdin for token transfer"))?;
+    stdin
+        .write_all(format!("{session_token}\n").as_bytes())
+        .await
+        .with_context(|| "failed to write privileged daemon session token")?;
+    drop(stdin);
+    Ok(child)
+}
+
 async fn ensure_daemon_running() -> Result<()> {
     if send_request(PrivilegedDaemonRequest::Status).await.is_ok() {
         return Ok(());
@@ -181,47 +215,36 @@ async fn ensure_daemon_running() -> Result<()> {
     let socket = daemon_socket_path();
     let exe = env::current_exe().with_context(|| "failed to resolve current executable path")?;
     let session_token = daemon_session_token()?.to_string();
-    let mut child = Command::new("pkexec")
-        .arg(exe)
-        .arg("--privileged-daemon")
-        .arg("--privileged-daemon-socket")
-        .arg(socket.as_os_str())
-        .arg("--privileged-daemon-owner-uid")
-        .arg(format!("{}", unsafe { libc::geteuid() }))
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn privileged daemon via pkexec (is pkexec installed and authorized?). {}",
-                trace_privilege::privilege_hint()
-            )
-        })?;
-    let mut stdin: ChildStdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("failed to open privileged daemon stdin for token transfer"))?;
-    stdin
-        .write_all(format!("{session_token}\n").as_bytes())
-        .await
-        .with_context(|| "failed to write privileged daemon session token")?;
-    drop(stdin);
 
-    // Wait for daemon socket readiness. Keep pkexec process running in background.
-    for _ in 0..300u32 {
-        if send_request(PrivilegedDaemonRequest::Status).await.is_ok() {
-            return Ok(());
+    let mut child = spawn_daemon_with("pkexec", &exe, &socket, &session_token).await?;
+    let mut attempted_sudo = false;
+
+    loop {
+        // Wait for daemon socket readiness. Keep helper process running in background.
+        for _ in 0..300u32 {
+            if send_request(PrivilegedDaemonRequest::Status).await.is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Some(status) = child
+                .try_wait()
+                .with_context(|| "failed waiting privileged helper process")?
+                && !status.success()
+            {
+                break;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| "failed waiting pkexec process")?
-            && !status.success()
-        {
+
+        if attempted_sudo {
             break;
         }
+        attempted_sudo = true;
+        log::warn!("pkexec did not succeed; trying sudo as a fallback");
+        child = spawn_daemon_with("sudo", &exe, &socket, &session_token).await?;
     }
+
     Err(anyhow!(
-        "privileged daemon did not become ready; ensure pkexec auth succeeded. {}",
+        "privileged daemon did not become ready; ensure pkexec or sudo auth succeeded. {}",
         trace_privilege::privilege_hint()
     ))
 }

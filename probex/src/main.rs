@@ -2978,11 +2978,16 @@ async fn main() -> Result<()> {
             .await
             .with_context(|| "failed to start privileged daemon")?;
     }
-
     if let Some(parquet_file) = args.view.as_deref() {
         return viewer_server::launch(parquet_file, args.port).await;
     }
     if args.command.is_empty() {
+        if env::var("DISPLAY").is_err() && env::var("WAYLAND_DISPLAY").is_err() {
+            info!("No GUI detected; starting privileged daemon proactively");
+            viewer_privileged_daemon_client::start_privileged_daemon()
+                .await
+                .with_context(|| "failed to start privileged daemon (headless heuristic)")?;
+        }
         return viewer_server::launch_empty(args.port).await;
     }
     let (program, program_args) = args
