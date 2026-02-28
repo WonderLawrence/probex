@@ -206,8 +206,8 @@ async fn ensure_daemon_running() -> Result<()> {
         .with_context(|| "failed to write privileged daemon session token")?;
     drop(stdin);
 
-    // Wait briefly for daemon socket readiness. Keep pkexec process running in background.
-    for _ in 0..50u32 {
+    // Wait for daemon socket readiness. Keep pkexec process running in background.
+    for _ in 0..300u32 {
         if send_request(PrivilegedDaemonRequest::Status).await.is_ok() {
             return Ok(());
         }
@@ -224,6 +224,10 @@ async fn ensure_daemon_running() -> Result<()> {
         "privileged daemon did not become ready; ensure pkexec auth succeeded. {}",
         trace_privilege::privilege_hint()
     ))
+}
+
+pub(crate) async fn start_privileged_daemon() -> Result<()> {
+    ensure_daemon_running().await
 }
 
 pub(crate) async fn run_trace_via_daemon(

@@ -119,6 +119,10 @@ struct Args {
     /// Owner uid allowed to use privileged daemon socket.
     #[arg(long, hide = true)]
     privileged_daemon_owner_uid: Option<u32>,
+
+    /// Start the privileged daemon upfront (prompts for auth immediately).
+    #[arg(long)]
+    start_privileged_daemon: bool,
 }
 
 /// Flattened event structure for Parquet output.
@@ -2968,6 +2972,11 @@ async fn main() -> Result<()> {
             session_token,
         )
         .await;
+    }
+    if args.start_privileged_daemon {
+        viewer_privileged_daemon_client::start_privileged_daemon()
+            .await
+            .with_context(|| "failed to start privileged daemon")?;
     }
 
     if let Some(parquet_file) = args.view.as_deref() {
