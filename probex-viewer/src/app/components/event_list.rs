@@ -71,10 +71,7 @@ pub fn EventListCard(
     let total_pages = data.total_in_range.div_ceil(PAGE_SIZE);
     let expanded = expanded_idx();
     let custom_columns = top_custom_columns(&data, MAX_CUSTOM_COLUMNS);
-    let custom_column_set = custom_columns
-        .iter()
-        .cloned()
-        .collect::<HashSet<String>>();
+    let custom_column_set = custom_columns.iter().cloned().collect::<HashSet<String>>();
     let expanded_colspan = 3 + custom_columns.len();
 
     rsx! {

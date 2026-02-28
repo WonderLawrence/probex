@@ -3,13 +3,13 @@
 //! Uses DataFusion to query parquet trace files.
 
 pub use probex_common::viewer_api::{
-    CumulativeMemoryPoint, CustomEventDebugField, CustomEventDebugRow, CustomEventsDebugResponse,
-    CustomEventField, CustomEventPayload, CustomPayloadSchema, CustomPayloadTypeKind, EventDetail,
-    EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts, HistogramBucket,
-    HistogramResponse, IoStatistics, IoTypeStats, LatencySummary, MemoryStatistics, ProbeSchema,
-    ProbeSchemaKind, ProbeSchemaSource, ProbeSchemasPageResponse, ProbeSchemasResponse,
-    ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse, SyscallLatencyStats,
-    TraceSummary,
+    CumulativeMemoryPoint, CustomEventDebugField, CustomEventDebugRow, CustomEventField,
+    CustomEventPayload, CustomEventsDebugResponse, CustomPayloadSchema, CustomPayloadTypeKind,
+    EventDetail, EventFlamegraphResponse, EventListResponse, EventMarker, EventTypeCounts,
+    HistogramBucket, HistogramResponse, IoStatistics, IoTypeStats, LatencySummary,
+    MemoryStatistics, ProbeSchema, ProbeSchemaKind, ProbeSchemaSource, ProbeSchemasPageResponse,
+    ProbeSchemasResponse, ProcessEventsResponse, ProcessLifetime, ProcessLifetimesResponse,
+    SyscallLatencyStats, TraceSummary,
 };
 use std::error::Error;
 
@@ -425,8 +425,8 @@ mod backend {
             Ok(schema) => Ok(schema),
             Err(error) => {
                 let error_text = error.to_string();
-                let is_function_probe = display_name.starts_with("fentry:")
-                    || display_name.starts_with("fexit:");
+                let is_function_probe =
+                    display_name.starts_with("fentry:") || display_name.starts_with("fexit:");
                 if !looks_like_permission_error(&error_text)
                     && !(is_function_probe && error_text.to_ascii_lowercase().contains("not found"))
                 {
@@ -607,9 +607,10 @@ mod backend {
                 };
                 let display_value = match type_kind {
                     CustomPayloadTypeKind::U64 => value.value_u64.to_string(),
-                    CustomPayloadTypeKind::I64 => {
-                        value.value_i64.unwrap_or(value.value_u64 as i64).to_string()
-                    }
+                    CustomPayloadTypeKind::I64 => value
+                        .value_i64
+                        .unwrap_or(value.value_u64 as i64)
+                        .to_string(),
                 };
                 Ok(CustomEventField {
                     field_id: value.field_id,

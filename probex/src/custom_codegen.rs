@@ -1221,10 +1221,6 @@ pub(crate) fn build_generated_ebpf_binary_path(source: &str) -> Result<PathBuf> 
 
 pub(crate) fn build_generated_ebpf_binary(source: &str) -> Result<Vec<u8>> {
     let path = build_generated_ebpf_binary_path(source)?;
-    fs::read(&path).with_context(|| {
-        format!(
-            "failed to read generated ebpf binary '{}'",
-            path.display()
-        )
-    })
+    fs::read(&path)
+        .with_context(|| format!("failed to read generated ebpf binary '{}'", path.display()))
 }

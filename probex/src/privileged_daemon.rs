@@ -4,16 +4,13 @@ use crate::{
 };
 use anyhow::{Context as _, Result, anyhow};
 use nix::{
-    sys::{
-        signal::Signal,
-        signal::kill,
-    },
+    sys::{signal::Signal, signal::kill},
     unistd::Pid,
 };
 use probex_common::viewer_api::{
     PrivilegedDaemonEnvelope, PrivilegedDaemonRequest, PrivilegedDaemonResponse,
-    PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse,
-    TraceRunStatus, TraceRunStatusResponse,
+    PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse, TraceRunStatus,
+    TraceRunStatusResponse,
 };
 use std::os::fd::AsRawFd as _;
 use std::path::Path;
@@ -79,7 +76,9 @@ async fn refresh(state: &mut DaemonState) -> Result<()> {
     Ok(())
 }
 
-fn to_probe_schemas_query(query: PrivilegedProbeSchemasQuery) -> crate::viewer_probe_catalog::ProbeSchemasQuery {
+fn to_probe_schemas_query(
+    query: PrivilegedProbeSchemasQuery,
+) -> crate::viewer_probe_catalog::ProbeSchemasQuery {
     crate::viewer_probe_catalog::ProbeSchemasQuery {
         search: query.search,
         category: query.category,
@@ -225,9 +224,7 @@ async fn handle_request(
                 status: Some(status_response(&guard)),
                 probe_schemas_page: None,
                 probe_schema_detail: None,
-                error: Some(
-                    "TakeTraceMapFds must be handled via fd-transfer endpoint".to_string(),
-                ),
+                error: Some("TakeTraceMapFds must be handled via fd-transfer endpoint".to_string()),
             }
         }
         PrivilegedDaemonRequest::StopTrace => {
@@ -275,8 +272,10 @@ async fn handle_request(
             }
         }
         PrivilegedDaemonRequest::QueryProbeSchemasPage { query } => {
-            match crate::viewer_probe_catalog::query_probe_schemas_page(to_probe_schemas_query(query))
-                .await
+            match crate::viewer_probe_catalog::query_probe_schemas_page(to_probe_schemas_query(
+                query,
+            ))
+            .await
             {
                 Ok(page) => PrivilegedDaemonResponse {
                     ok: true,
@@ -290,7 +289,9 @@ async fn handle_request(
                     status: None,
                     probe_schemas_page: None,
                     probe_schema_detail: None,
-                    error: Some(format!("privileged daemon failed to query probe schemas page: {error}")),
+                    error: Some(format!(
+                        "privileged daemon failed to query probe schemas page: {error}"
+                    )),
                 },
             }
         }
@@ -308,7 +309,9 @@ async fn handle_request(
                     status: None,
                     probe_schemas_page: None,
                     probe_schema_detail: None,
-                    error: Some(format!("privileged daemon failed to query probe schema detail: {error}")),
+                    error: Some(format!(
+                        "privileged daemon failed to query probe schema detail: {error}"
+                    )),
                 },
             }
         }
@@ -339,8 +342,8 @@ async fn handle_conn(
     if buf.is_empty() {
         return Ok(());
     }
-    let envelope: PrivilegedDaemonEnvelope = serde_json::from_slice(&buf)
-        .with_context(|| "failed to parse daemon request envelope")?;
+    let envelope: PrivilegedDaemonEnvelope =
+        serde_json::from_slice(&buf).with_context(|| "failed to parse daemon request envelope")?;
     if envelope.session_token != *expected_session_token {
         return Err(anyhow!("unauthorized daemon client: invalid session token"));
     }
@@ -401,7 +404,10 @@ async fn handle_conn(
         .write_all(&payload)
         .await
         .with_context(|| "failed to write daemon response")?;
-    stream.flush().await.with_context(|| "failed to flush daemon response")?;
+    stream
+        .flush()
+        .await
+        .with_context(|| "failed to flush daemon response")?;
     Ok(())
 }
 
@@ -439,12 +445,16 @@ pub(crate) async fn run(socket_path: &Path, owner_uid: u32, session_token: Strin
     let state = Arc::new(Mutex::new(DaemonState::new()));
     let expected_session_token = Arc::new(session_token);
     loop {
-        let (stream, _) = listener.accept().await.with_context(|| "daemon accept failed")?;
+        let (stream, _) = listener
+            .accept()
+            .await
+            .with_context(|| "daemon accept failed")?;
         let state = Arc::clone(&state);
         let owner_uid = owner_uid;
         let expected_session_token = Arc::clone(&expected_session_token);
         tokio::spawn(async move {
-            if let Err(error) = handle_conn(state, stream, owner_uid, expected_session_token).await {
+            if let Err(error) = handle_conn(state, stream, owner_uid, expected_session_token).await
+            {
                 log::error!("privileged daemon connection error: {error:#}");
             }
         });

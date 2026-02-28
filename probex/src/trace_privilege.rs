@@ -1,4 +1,6 @@
-use crate::{TraceCommandConfig, TraceCommandOutcome, run_trace_command, viewer_privileged_daemon_client};
+use crate::{
+    TraceCommandConfig, TraceCommandOutcome, run_trace_command, viewer_privileged_daemon_client,
+};
 use anyhow::{Context as _, Result};
 use tokio::sync::watch;
 

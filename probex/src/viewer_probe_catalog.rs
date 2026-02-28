@@ -629,7 +629,9 @@ fn contains_case_insensitive(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
-    haystack.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+    haystack
+        .to_ascii_lowercase()
+        .contains(&needle.to_ascii_lowercase())
 }
 
 pub async fn query_probe_schemas_page(
@@ -669,8 +671,7 @@ pub async fn query_probe_schemas_page(
                 .into_iter()
                 .filter_map(|entry| {
                     let score = pattern.score(entry.search_text.slice(..), &mut matcher)?;
-                    let substring_match =
-                        contains_case_insensitive(&entry.schema.probe, trimmed);
+                    let substring_match = contains_case_insensitive(&entry.schema.probe, trimmed);
                     let kind_boost = if substring_match {
                         search_kind_boost(&entry.schema.kind)
                     } else {
@@ -680,20 +681,23 @@ pub async fn query_probe_schemas_page(
                     Some((boosted, score, entry))
                 })
                 .collect::<Vec<_>>();
-            scored.sort_by(|(boosted_a, score_a, entry_a), (boosted_b, score_b, entry_b)| {
-                boosted_b.cmp(boosted_a).then_with(|| {
-                    score_b.cmp(score_a).then_with(|| {
-                    entry_a
-                        .schema
-                        .display_name
-                        .cmp(&entry_b.schema.display_name)
-                        .then_with(|| entry_a.schema.target.cmp(&entry_b.schema.target))
-                        .then_with(|| {
-                            kind_rank(&entry_a.schema.kind).cmp(&kind_rank(&entry_b.schema.kind))
+            scored.sort_by(
+                |(boosted_a, score_a, entry_a), (boosted_b, score_b, entry_b)| {
+                    boosted_b.cmp(boosted_a).then_with(|| {
+                        score_b.cmp(score_a).then_with(|| {
+                            entry_a
+                                .schema
+                                .display_name
+                                .cmp(&entry_b.schema.display_name)
+                                .then_with(|| entry_a.schema.target.cmp(&entry_b.schema.target))
+                                .then_with(|| {
+                                    kind_rank(&entry_a.schema.kind)
+                                        .cmp(&kind_rank(&entry_b.schema.kind))
+                                })
                         })
                     })
-                })
-            });
+                },
+            );
             matching = scored.into_iter().map(|(_, _, entry)| entry).collect();
         }
     }

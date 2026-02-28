@@ -3,16 +3,14 @@ use crate::{
     custom_codegen, trace_privilege,
 };
 use anyhow::{Context as _, Result, anyhow};
-use nix::{
-    sys::{
-        signal::{Signal, kill},
-        wait::waitpid,
-    },
+use nix::sys::{
+    signal::{Signal, kill},
+    wait::waitpid,
 };
 use probex_common::viewer_api::{
     PrivilegedDaemonEnvelope, PrivilegedDaemonRequest, PrivilegedDaemonResponse,
-    PrivilegedProbeSchemasQuery,
-    PrivilegedTraceMapFdsResponse, ProbeSchema, ProbeSchemasPageResponse,
+    PrivilegedProbeSchemasQuery, PrivilegedTraceMapFdsResponse, ProbeSchema,
+    ProbeSchemasPageResponse,
 };
 use std::env;
 use std::io::Read as _;
@@ -21,8 +19,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::UnixStream;
-use tokio::process::Command;
 use tokio::process::ChildStdin;
+use tokio::process::Command;
 use tokio::sync::{Mutex, OnceCell, watch};
 
 static DAEMON_START_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
@@ -42,10 +40,7 @@ fn daemon_session_token() -> Result<&'static str> {
         .with_context(|| "failed to open /dev/urandom for daemon session token")?;
     file.read_exact(&mut bytes)
         .with_context(|| "failed to read daemon session token bytes from /dev/urandom")?;
-    let token = bytes
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let token = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let _ = DAEMON_SESSION_TOKEN.set(token);
     Ok(DAEMON_SESSION_TOKEN
         .get()
@@ -58,9 +53,15 @@ async fn resolve_custom_probe_schemas(
 ) -> Result<std::collections::HashMap<String, probex_common::viewer_api::ProbeSchema>> {
     let mut resolved = std::collections::HashMap::with_capacity(specs.len());
     for spec in specs {
-        let schema = crate::viewer_backend::query_probe_schema_detail(spec.probe_display_name.clone())
-            .await
-            .map_err(|error| anyhow!("failed to resolve custom probe '{}': {error}", spec.probe_display_name))?;
+        let schema =
+            crate::viewer_backend::query_probe_schema_detail(spec.probe_display_name.clone())
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "failed to resolve custom probe '{}': {error}",
+                        spec.probe_display_name
+                    )
+                })?;
         resolved.insert(spec.probe_display_name.clone(), schema);
     }
     Ok(resolved)
@@ -77,10 +78,12 @@ async fn maybe_build_prebuilt_generated_ebpf(
         .with_context(|| "failed to compile custom probe plan for daemon prebuild")?;
     let source = custom_codegen::generate_custom_probe_source(&plan)
         .with_context(|| "failed to generate custom probe source for daemon prebuild")?;
-    let built_path = tokio::task::spawn_blocking(move || custom_codegen::build_generated_ebpf_binary_path(&source))
-        .await
-        .with_context(|| "failed to join custom probe prebuild task")?
-        .with_context(|| "failed to build generated eBPF object for daemon prebuild")?;
+    let built_path = tokio::task::spawn_blocking(move || {
+        custom_codegen::build_generated_ebpf_binary_path(&source)
+    })
+    .await
+    .with_context(|| "failed to join custom probe prebuild task")?
+    .with_context(|| "failed to build generated eBPF object for daemon prebuild")?;
     Ok(Some(built_path.to_string_lossy().to_string()))
 }
 
@@ -167,7 +170,9 @@ async fn ensure_daemon_running() -> Result<()> {
     if send_request(PrivilegedDaemonRequest::Status).await.is_ok() {
         return Ok(());
     }
-    let lock = DAEMON_START_LOCK.get_or_init(|| async { Mutex::new(()) }).await;
+    let lock = DAEMON_START_LOCK
+        .get_or_init(|| async { Mutex::new(()) })
+        .await;
     let _guard = lock.lock().await;
     if send_request(PrivilegedDaemonRequest::Status).await.is_ok() {
         return Ok(());
@@ -207,7 +212,9 @@ async fn ensure_daemon_running() -> Result<()> {
             return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        if let Some(status) = child.try_wait().with_context(|| "failed waiting pkexec process")?
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| "failed waiting pkexec process")?
             && !status.success()
         {
             break;
@@ -287,10 +294,7 @@ pub(crate) async fn run_trace_via_daemon(
     .await;
 
     let consume_outcome = if let Err(error) = consume_result {
-        if error
-            .to_string()
-            .contains("trace stopped by request")
-        {
+        if error.to_string().contains("trace stopped by request") {
             let _ = kill(child_pid, Signal::SIGTERM);
             let _ = send_request(PrivilegedDaemonRequest::StopTrace).await;
         }
@@ -327,10 +331,8 @@ pub(crate) async fn query_probe_schema_detail_via_daemon(
     display_name: String,
 ) -> Result<ProbeSchema> {
     ensure_daemon_running().await?;
-    let response = send_request(PrivilegedDaemonRequest::QueryProbeSchemaDetail {
-        display_name,
-    })
-    .await?;
+    let response =
+        send_request(PrivilegedDaemonRequest::QueryProbeSchemaDetail { display_name }).await?;
     if !response.ok {
         return Err(anyhow!(
             "{}",
@@ -344,8 +346,8 @@ pub(crate) async fn query_probe_schema_detail_via_daemon(
         .ok_or_else(|| anyhow!("privileged daemon response missing probe_schema_detail"))
 }
 
-pub(crate) async fn take_trace_map_fds_via_daemon(
-) -> Result<(PrivilegedTraceMapFdsResponse, Vec<i32>)> {
+pub(crate) async fn take_trace_map_fds_via_daemon()
+-> Result<(PrivilegedTraceMapFdsResponse, Vec<i32>)> {
     ensure_daemon_running().await?;
     let socket = daemon_socket_path();
     let payload = serde_json::to_vec(&PrivilegedDaemonEnvelope {
@@ -354,36 +356,38 @@ pub(crate) async fn take_trace_map_fds_via_daemon(
     })
     .with_context(|| "failed to encode daemon request")?;
     let socket_clone = socket.clone();
-    tokio::task::spawn_blocking(move || -> Result<(PrivilegedTraceMapFdsResponse, Vec<i32>)> {
-        use std::io::{Read as _, Write as _};
-        use std::os::unix::net::UnixStream as StdUnixStream;
+    tokio::task::spawn_blocking(
+        move || -> Result<(PrivilegedTraceMapFdsResponse, Vec<i32>)> {
+            use std::io::{Read as _, Write as _};
+            use std::os::unix::net::UnixStream as StdUnixStream;
 
-        let mut stream = StdUnixStream::connect(&socket_clone).with_context(|| {
-            format!(
-                "failed to connect privileged daemon socket {:?}",
-                socket_clone
-            )
-        })?;
-        stream
-            .write_all(&payload)
-            .with_context(|| "failed to write daemon request")?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .with_context(|| "failed to shutdown daemon request stream")?;
+            let mut stream = StdUnixStream::connect(&socket_clone).with_context(|| {
+                format!(
+                    "failed to connect privileged daemon socket {:?}",
+                    socket_clone
+                )
+            })?;
+            stream
+                .write_all(&payload)
+                .with_context(|| "failed to write daemon request")?;
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .with_context(|| "failed to shutdown daemon request stream")?;
 
-        let mut buf = vec![0u8; 16 * 1024];
-        let (bytes, fds) = crate::unix_fd::recv_with_fds(stream.as_raw_fd(), &mut buf, 8)
-            .with_context(|| "failed to receive daemon fd-transfer response")?;
-        if bytes == 0 {
-            return Err(anyhow!("privileged daemon returned empty response"));
-        }
-        let response: PrivilegedTraceMapFdsResponse = serde_json::from_slice(&buf[..bytes])
-            .with_context(|| "failed to parse daemon fd-transfer response")?;
-        // Drain potential remaining data to avoid abrupt close on some transports.
-        let mut sink = Vec::new();
-        let _ = stream.read_to_end(&mut sink);
-        Ok((response, fds))
-    })
+            let mut buf = vec![0u8; 16 * 1024];
+            let (bytes, fds) = crate::unix_fd::recv_with_fds(stream.as_raw_fd(), &mut buf, 8)
+                .with_context(|| "failed to receive daemon fd-transfer response")?;
+            if bytes == 0 {
+                return Err(anyhow!("privileged daemon returned empty response"));
+            }
+            let response: PrivilegedTraceMapFdsResponse = serde_json::from_slice(&buf[..bytes])
+                .with_context(|| "failed to parse daemon fd-transfer response")?;
+            // Drain potential remaining data to avoid abrupt close on some transports.
+            let mut sink = Vec::new();
+            let _ = stream.read_to_end(&mut sink);
+            Ok((response, fds))
+        },
+    )
     .await
     .with_context(|| "failed to join daemon fd-transfer task")?
 }

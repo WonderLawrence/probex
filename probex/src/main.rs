@@ -65,12 +65,12 @@ mod custom_codegen;
 mod privileged_daemon;
 mod trace_privilege;
 mod tracepoint_format;
+mod unix_fd;
 mod viewer_backend;
 mod viewer_privileged_daemon_client;
 mod viewer_probe_catalog;
 mod viewer_server;
 mod viewer_trace_runtime;
-mod unix_fd;
 
 /// Batch size for Parquet writes (10,000 events per batch)
 const BATCH_SIZE: usize = 10_000;
@@ -421,8 +421,7 @@ fn create_output_file(path: &str) -> Result<File> {
                     path
                 )
             })?;
-            File::create(output)
-                .with_context(|| format!("failed to recreate output file {}", path))
+            File::create(output).with_context(|| format!("failed to recreate output file {}", path))
         }
         Err(error) => Err(anyhow!("failed to create output file {}: {}", path, error)),
     }
@@ -1876,8 +1875,7 @@ pub(crate) fn trace_map_fds_from_parts(
     custom_mode: bool,
 ) -> Result<TraceMapFdBundle> {
     Ok(TraceMapFdBundle {
-        events_fd: map_raw_fd(ebpf, "EVENTS")
-            .with_context(|| "failed to resolve EVENTS map fd")?,
+        events_fd: map_raw_fd(ebpf, "EVENTS").with_context(|| "failed to resolve EVENTS map fd")?,
         stack_traces_fd: map_raw_fd(ebpf, "STACK_TRACES")
             .with_context(|| "failed to resolve STACK_TRACES map fd")?,
         cpu_sample_stats_fd: map_raw_fd(ebpf, "CPU_SAMPLE_STATS")
@@ -1940,8 +1938,8 @@ pub(crate) async fn consume_trace_from_map_fds(
     let ring_buf = ring_buf_from_fd(map_fds.events_fd)?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
     let mut custom_async_ring_buf = if let Some(custom_fd) = map_fds.custom_events_fd {
-        let custom_ring_buf = ring_buf_from_fd(custom_fd)
-            .with_context(|| "step=open_custom_events_map_fd failed")?;
+        let custom_ring_buf =
+            ring_buf_from_fd(custom_fd).with_context(|| "step=open_custom_events_map_fd failed")?;
         Some(AsyncFd::with_interest(
             custom_ring_buf,
             tokio::io::Interest::READABLE,
@@ -2158,19 +2156,19 @@ pub(crate) async fn prepare_trace_session(
 
     // Load eBPF program (embedded by default, generated when custom probes are present).
     let mut ebpf = if custom_mode {
-        let generated_binary = if let Some(prebuilt_path) = config.prebuilt_generated_ebpf_path.as_ref()
-        {
-            std::fs::read(prebuilt_path).with_context(|| {
-                format!("step=load_prebuilt_generated_ebpf failed: {prebuilt_path}")
-            })?
-        } else {
-            let generated_source = generate_custom_probe_source(&custom_probe_plan)
-                .with_context(|| "step=generate_rust_code failed")?;
-            tokio::task::spawn_blocking(move || build_generated_ebpf_binary(&generated_source))
-                .await
-                .with_context(|| "step=build_generated_ebpf failed: task join error")?
-                .with_context(|| "step=build_generated_ebpf failed")?
-        };
+        let generated_binary =
+            if let Some(prebuilt_path) = config.prebuilt_generated_ebpf_path.as_ref() {
+                std::fs::read(prebuilt_path).with_context(|| {
+                    format!("step=load_prebuilt_generated_ebpf failed: {prebuilt_path}")
+                })?
+            } else {
+                let generated_source = generate_custom_probe_source(&custom_probe_plan)
+                    .with_context(|| "step=generate_rust_code failed")?;
+                tokio::task::spawn_blocking(move || build_generated_ebpf_binary(&generated_source))
+                    .await
+                    .with_context(|| "step=build_generated_ebpf failed: task join error")?
+                    .with_context(|| "step=build_generated_ebpf failed")?
+            };
         aya::Ebpf::load(&generated_binary).with_context(|| "step=load_ebpf failed")?
     } else {
         aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
@@ -2417,8 +2415,9 @@ pub(crate) async fn prepare_trace_session_for_existing_pid(
     let resolved_custom_probe_schemas = resolve_custom_probe_schemas(custom_probes)
         .await
         .with_context(|| "step=resolve_custom_probe_schemas failed")?;
-    let custom_probe_plan = compile_custom_probe_plan(custom_probes, &resolved_custom_probe_schemas)
-        .with_context(|| "step=compile_custom_probe_plan failed")?;
+    let custom_probe_plan =
+        compile_custom_probe_plan(custom_probes, &resolved_custom_probe_schemas)
+            .with_context(|| "step=compile_custom_probe_plan failed")?;
     let custom_mode = !custom_probe_plan.by_probe_id.is_empty();
     if custom_mode {
         info!(
@@ -2950,9 +2949,9 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
     if args.privileged_daemon {
-        let owner_uid = args.privileged_daemon_owner_uid.ok_or_else(|| {
-            anyhow!("--privileged-daemon requires --privileged-daemon-owner-uid")
-        })?;
+        let owner_uid = args
+            .privileged_daemon_owner_uid
+            .ok_or_else(|| anyhow!("--privileged-daemon requires --privileged-daemon-owner-uid"))?;
         let mut token_buf = String::new();
         std::io::stdin()
             .read_line(&mut token_buf)
@@ -2989,8 +2988,7 @@ async fn main() -> Result<()> {
         custom_probes: Vec::new(),
         prebuilt_generated_ebpf_path: None,
     };
-    let outcome =
-        trace_privilege::run_trace_with_privilege_fallback(config, None, true).await?;
+    let outcome = trace_privilege::run_trace_with_privilege_fallback(config, None, true).await?;
 
     // Launch the viewer if we have events and --no-viewer wasn't specified
     if outcome.total_events > 0 && !args.no_viewer {
