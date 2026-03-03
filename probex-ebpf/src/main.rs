@@ -288,10 +288,10 @@ fn try_sched_switch(ctx: &TracePointContext) -> Result<u32, i64> {
 
 /// sched_process_fork tracepoint handler
 /// Tracepoint format from /sys/kernel/tracing/events/sched/sched_process_fork/format:
-/// - parent_comm[16]: offset 8
-/// - parent_pid: offset 24
-/// - child_comm[16]: offset 28
-/// - child_pid: offset 44
+/// - parent_comm (__data_loc): offset 8
+/// - parent_pid: offset 12
+/// - child_comm (__data_loc): offset 16
+/// - child_pid: offset 20
 #[tracepoint]
 pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
     match try_sched_process_fork(&ctx) {
@@ -301,10 +301,10 @@ pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
 }
 
 fn try_sched_process_fork(ctx: &TracePointContext) -> Result<u32, i64> {
-    // Read parent_pid at offset 24
-    let parent_pid: u32 = unsafe { ctx.read_at(24)? };
-    // Read child_pid at offset 44
-    let child_pid: u32 = unsafe { ctx.read_at(44)? };
+    // Read parent_pid at offset 12
+    let parent_pid: u32 = unsafe { ctx.read_at(12)? };
+    // Read child_pid at offset 20
+    let child_pid: u32 = unsafe { ctx.read_at(20)? };
 
     // Only track if parent is being traced
     if !is_traced(parent_pid) {
