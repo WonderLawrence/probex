@@ -165,7 +165,6 @@ jobs:
             CARGO_ENCODED_RUSTFLAGS=$'\''--cfg=bpf_target_arch="x86_64"\x1f-Cdebuginfo=2\x1f-Clink-arg=--btf'\'' \
               cargo build \
                 --package probex-ebpf \
-                -Z build-std=core \
                 --bins \
                 --release \
                 --target bpfel-unknown-none \
