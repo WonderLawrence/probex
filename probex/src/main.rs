@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
         "io_uring",
         "io_uring_complete",
     )?;
-    attach_cpu_sampler(&mut ebpf, target_pid_u32, args.sample_freq)?;
+    attach_cpu_sampler(&mut ebpf, target_pid_u32, args.sample_freq, is_attach_mode)?;
 
     // In attach mode, capture the initial /proc/[pid]/maps snapshot before
     // privilege drop, since we may lose read access to /proc/[pid]/maps after.

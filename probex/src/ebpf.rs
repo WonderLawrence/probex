@@ -28,7 +28,12 @@ pub fn attach_tracepoint(
     Ok(())
 }
 
-pub fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u64) -> Result<()> {
+pub fn attach_cpu_sampler(
+    ebpf: &mut aya::Ebpf,
+    target_pid: u32,
+    frequency_hz: u64,
+    attach_mode: bool,
+) -> Result<()> {
     if frequency_hz == 0 {
         return Err(anyhow!("--sample-freq must be greater than 0"));
     }
@@ -39,18 +44,39 @@ pub fn attach_cpu_sampler(ebpf: &mut aya::Ebpf, target_pid: u32, frequency_hz: u
         .try_into()?;
     program.load()?;
 
-    program.attach(
-        PerfTypeId::Software,
-        perf_sw_ids::PERF_COUNT_SW_CPU_CLOCK as u64,
-        PerfEventScope::OneProcessAnyCpu { pid: target_pid },
-        SamplePolicy::Frequency(frequency_hz),
-        true,
-    )?;
+    if attach_mode {
+        // In attach mode, OneProcessAnyCpu only monitors the main thread and
+        // misses existing worker threads. Instead, attach to every online CPU
+        // and let the eBPF program's TRACED_PIDS filter select the target process.
+        let num_cpus = aya::util::online_cpus()
+            .map_err(|e| anyhow!("failed to get online CPUs: {:?}", e))?;
+        for cpu in num_cpus {
+            program.attach(
+                PerfTypeId::Software,
+                perf_sw_ids::PERF_COUNT_SW_CPU_CLOCK as u64,
+                PerfEventScope::AllProcessesOneCpu { cpu },
+                SamplePolicy::Frequency(frequency_hz),
+                false,
+            )?;
+        }
+        debug!(
+            "Attached CPU sampler at {} Hz on all CPUs for pid {} (per-cpu mode)",
+            frequency_hz, target_pid
+        );
+    } else {
+        program.attach(
+            PerfTypeId::Software,
+            perf_sw_ids::PERF_COUNT_SW_CPU_CLOCK as u64,
+            PerfEventScope::OneProcessAnyCpu { pid: target_pid },
+            SamplePolicy::Frequency(frequency_hz),
+            true,
+        )?;
+        debug!(
+            "Attached CPU sampler at {} Hz for pid {} (inherit=true)",
+            frequency_hz, target_pid
+        );
+    }
 
-    debug!(
-        "Attached CPU sampler at {} Hz for pid {} (inherit=true)",
-        frequency_hz, target_pid
-    );
     Ok(())
 }
 
