@@ -9,9 +9,12 @@ use aya::{
 };
 use clap::Parser;
 use log::{debug, info};
-use nix::sys::{
-    signal::{Signal, kill},
-    wait::{WaitStatus, waitpid},
+use nix::{
+    sys::{
+        signal::{Signal, kill},
+        wait::{WaitStatus, waitpid},
+    },
+    unistd::Pid,
 };
 use probex_common::{
     CPU_SAMPLE_STAT_CALLBACK_TOTAL, CPU_SAMPLE_STAT_EMITTED, CPU_SAMPLE_STAT_FILTERED_NOT_TRACED,
@@ -78,28 +81,49 @@ async fn main() -> Result<()> {
         debug!("failed to initialize eBPF logger: {e}");
     }
 
-    // Spawn child process with SIGSTOP
-    let (program, program_args) = args
-        .command
-        .split_first()
-        .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
+    // Determine target PID: either spawn a child or attach to an existing process
+    let is_attach_mode = args.pid.is_some();
+    let target_pid: Pid;
+    let target_pid_u32: u32;
 
-    let child_pid = spawn_child(program, program_args, privilege_drop_target)?;
-    let child_pid_u32 = child_pid.as_raw() as u32;
-    info!("Spawned child process with PID {}", child_pid);
+    let mut child_wait: Option<tokio::task::JoinHandle<nix::Result<WaitStatus>>> = None;
 
-    wait_for_child_stop(child_pid)?;
+    if let Some(pid) = args.pid {
+        // Attach mode: verify the process exists
+        target_pid_u32 = pid;
+        target_pid = Pid::from_raw(pid as i32);
+        // Check that the process exists by sending signal 0
+        kill(target_pid, None).with_context(|| {
+            format!("cannot attach to PID {pid}: process not found or permission denied")
+        })?;
+        info!("Attaching to existing process with PID {}", pid);
+    } else {
+        // Spawn mode: create child process with SIGSTOP
+        let (program, program_args) = args
+            .command
+            .split_first()
+            .ok_or_else(|| anyhow!("clap invariant violated: missing command in trace mode"))?;
 
-    let mut child_wait = tokio::task::spawn_blocking(move || waitpid(child_pid, None));
+        let child_pid = spawn_child(program, program_args, privilege_drop_target)?;
+        target_pid = child_pid;
+        target_pid_u32 = child_pid.as_raw() as u32;
+        info!("Spawned child process with PID {}", child_pid);
 
-    // Insert child PID into TRACED_PIDS map
+        wait_for_child_stop(child_pid)?;
+
+        child_wait = Some(tokio::task::spawn_blocking(move || {
+            waitpid(child_pid, None)
+        }));
+    }
+
+    // Insert target PID into TRACED_PIDS map
     {
         let mut traced_pids: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
             ebpf.map_mut("TRACED_PIDS")
                 .ok_or_else(|| anyhow!("map TRACED_PIDS not found"))?,
         )?;
-        traced_pids.insert(child_pid_u32, 1, 0)?;
-        info!("Added PID {} to traced PIDs", child_pid_u32);
+        traced_pids.insert(target_pid_u32, 1, 0)?;
+        info!("Added PID {} to traced PIDs", target_pid_u32);
     }
 
     // Attach all tracepoints
@@ -199,9 +223,7 @@ async fn main() -> Result<()> {
         "io_uring",
         "io_uring_complete",
     )?;
-    let target_pid = u32::try_from(child_pid.as_raw())
-        .context("child pid is negative and cannot be used for perf scope")?;
-    attach_cpu_sampler(&mut ebpf, target_pid, args.sample_freq)?;
+    attach_cpu_sampler(&mut ebpf, target_pid_u32, args.sample_freq)?;
 
     if let Some(target) = privilege_drop_target {
         drop_process_privileges(target).context("failed to drop runtime privileges")?;
@@ -211,10 +233,12 @@ async fn main() -> Result<()> {
         );
     }
 
-    // Resume child process
-    kill(child_pid, Signal::SIGCONT)
-        .with_context(|| format!("failed to resume child process {}", child_pid))?;
-    debug!("Resumed child process {}", child_pid);
+    if !is_attach_mode {
+        // Resume child process
+        kill(target_pid, Signal::SIGCONT)
+            .with_context(|| format!("failed to resume child process {}", target_pid))?;
+        debug!("Resumed child process {}", target_pid);
+    }
 
     let output_file = args.output.clone().unwrap_or_else(|| {
         let now = chrono::Local::now();
@@ -246,6 +270,15 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("map EVENTS not found"))?,
     )?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
+
+    // In attach mode, capture the initial /proc/[pid]/maps snapshot immediately
+    // since the process is already running and may have loaded libraries.
+    if is_attach_mode {
+        let initial_maps = stacks::read_proc_maps(target_pid_u32);
+        if !initial_maps.is_empty() {
+            snapshot_collector.capture(target_pid_u32, 0, &initial_maps);
+        }
+    }
 
     let mut child_wait_done = false;
     let mut pid_name_cache: HashMap<u32, Option<String>> = HashMap::new();
@@ -293,16 +326,27 @@ async fn main() -> Result<()> {
     };
 
     // Event loop
+    // In attach mode, use a real deadline; in spawn mode, use a future that never resolves.
+    let deadline = if is_attach_mode {
+        info!(
+            "Tracing PID {} for {} seconds (Ctrl-C to stop early)...",
+            target_pid, args.attach_duration
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(args.attach_duration))
+    } else {
+        tokio::time::sleep(std::time::Duration::MAX)
+    };
+    tokio::pin!(deadline);
 
     loop {
         tokio::select! {
-            result = &mut child_wait => {
+            result = async { child_wait.as_mut().unwrap().await }, if child_wait.is_some() => {
                 child_wait_done = true;
                 match result {
                     Ok(Ok(WaitStatus::Exited(_, _))) | Ok(Ok(WaitStatus::Signaled(_, _, _))) => {}
                     Ok(Ok(_)) => {}
-                    Ok(Err(err)) => debug!("failed to wait on child process {}: {err}", child_pid),
-                    Err(err) => debug!("wait task failed for child process {}: {err}", child_pid),
+                    Ok(Err(err)) => debug!("failed to wait on child process {}: {err}", target_pid),
+                    Err(err) => debug!("wait task failed for child process {}: {err}", target_pid),
                 }
 
                 // Drain any remaining events
@@ -311,15 +355,26 @@ async fn main() -> Result<()> {
                         .with_context(|| "failed to parse ring buffer event while draining")?;
                     handle_event(&mut event)?;
                 }
-                info!("Child process {} exited", child_pid);
+                info!("Child process {} exited", target_pid);
                 break;
             }
+
+            _ = &mut deadline, if is_attach_mode => {
+                info!("Duration ({} seconds) elapsed, detaching...", args.attach_duration);
+                // Drain any remaining events
+                while let Some(item) = async_ring_buf.get_mut().next() {
+                    let mut event = parse_event(&item)
+                        .with_context(|| "failed to parse ring buffer event while draining")?;
+                    handle_event(&mut event)?;
+                }
+                break;
+            }
+
             // Check for Ctrl-C
             _ = signal::ctrl_c() => {
                 info!("Received Ctrl-C, exiting...");
-                // Kill child process if still running
-                if !child_wait.is_finished() {
-                    let _ = kill(child_pid, Signal::SIGTERM);
+                if !is_attach_mode {
+                    let _ = kill(target_pid, Signal::SIGTERM);
                 }
                 break;
             }
@@ -336,12 +391,25 @@ async fn main() -> Result<()> {
                 }
 
                 guard.clear_ready();
+
+                // In attach mode, check if the target process is still alive
+                if is_attach_mode && kill(target_pid, None).is_err() {
+                    info!("Target process {} exited", target_pid);
+                    while let Some(item) = async_ring_buf.get_mut().next() {
+                        let mut event = parse_event(&item)
+                            .with_context(|| "failed to parse ring buffer event while draining")?;
+                        handle_event(&mut event)?;
+                    }
+                    break;
+                }
             }
         }
     }
 
     if !child_wait_done {
-        let _ = child_wait.await;
+        if let Some(child_wait) = child_wait {
+            let _ = child_wait.await;
+        }
     }
 
     match read_cpu_sample_stats(&cpu_sample_stats) {
