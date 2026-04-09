@@ -225,6 +225,18 @@ async fn main() -> Result<()> {
     )?;
     attach_cpu_sampler(&mut ebpf, target_pid_u32, args.sample_freq)?;
 
+    // In attach mode, capture the initial /proc/[pid]/maps snapshot before
+    // privilege drop, since we may lose read access to /proc/[pid]/maps after.
+    let initial_proc_maps = if is_attach_mode {
+        let maps = stacks::read_proc_maps(target_pid_u32);
+        if maps.is_empty() {
+            debug!("Warning: could not read /proc/{}/maps", target_pid_u32);
+        }
+        Some(maps)
+    } else {
+        None
+    };
+
     if let Some(target) = privilege_drop_target {
         drop_process_privileges(target).context("failed to drop runtime privileges")?;
         debug!(
@@ -250,6 +262,13 @@ async fn main() -> Result<()> {
     debug!("Writing events to {}", output_file);
     let mut snapshot_collector = ProcMapsSnapshotCollector::default();
 
+    // Apply the initial proc maps snapshot captured before privilege drop.
+    if let Some(maps) = initial_proc_maps {
+        if !maps.is_empty() {
+            snapshot_collector.capture(target_pid_u32, 0, &maps);
+        }
+    }
+
     // Stack trace map for resolving stack ids into raw frame addresses.
     let stack_traces: StackTraceMap<_> = StackTraceMap::try_from(
         ebpf.take_map("STACK_TRACES")
@@ -270,15 +289,6 @@ async fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("map EVENTS not found"))?,
     )?;
     let mut async_ring_buf = AsyncFd::with_interest(ring_buf, tokio::io::Interest::READABLE)?;
-
-    // In attach mode, capture the initial /proc/[pid]/maps snapshot immediately
-    // since the process is already running and may have loaded libraries.
-    if is_attach_mode {
-        let initial_maps = stacks::read_proc_maps(target_pid_u32);
-        if !initial_maps.is_empty() {
-            snapshot_collector.capture(target_pid_u32, 0, &initial_maps);
-        }
-    }
 
     let mut child_wait_done = false;
     let mut pid_name_cache: HashMap<u32, Option<String>> = HashMap::new();
