@@ -392,8 +392,11 @@ async fn main() -> Result<()> {
 
                 guard.clear_ready();
 
-                // In attach mode, check if the target process is still alive
-                if is_attach_mode && kill(target_pid, None).is_err() {
+                // In attach mode, check if the target process is still alive.
+                // Use /proc/[pid] instead of kill(pid, 0) because after privilege
+                // drop, kill() returns EPERM for processes owned by other users,
+                // which would be misinterpreted as "process exited".
+                if is_attach_mode && !std::path::Path::new(&format!("/proc/{}", target_pid_u32)).exists() {
                     info!("Target process {} exited", target_pid);
                     while let Some(item) = async_ring_buf.get_mut().next() {
                         let mut event = parse_event(&item)
