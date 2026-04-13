@@ -258,6 +258,7 @@ pub mod viewer_api {
     #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
     pub struct ProcessLifetime {
         pub pid: u32,
+        pub tgid: u32,
         pub process_name: Option<String>,
         pub parent_pid: Option<u32>,
         pub start_ns: u64,

@@ -63,6 +63,15 @@ struct EventFlamegraphQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct ProcessFlamegraphQuery {
+    start_ns: u64,
+    end_ns: u64,
+    tgid: u32,
+    event_type: String,
+    max_stacks: usize,
+}
+
+#[derive(Debug, Deserialize)]
 struct IoStatisticsQuery {
     start_ns: u64,
     end_ns: u64,
@@ -116,6 +125,7 @@ pub async fn launch(parquet_file: &str, port: u16) -> Result<()> {
         .route("/api/process_lifetimes", get(get_process_lifetimes))
         .route("/api/process_events", get(get_process_events))
         .route("/api/event_flamegraph", get(get_event_flamegraph))
+        .route("/api/process_flamegraph", get(get_process_flamegraph))
         .route("/api/io_statistics", get(get_io_statistics))
         .route("/api/memory_statistics", get(get_memory_statistics))
         .route("/api/event_list", get(get_event_list));
@@ -183,6 +193,19 @@ async fn get_event_flamegraph(Query(query): Query<EventFlamegraphQuery>) -> Resp
             query.start_ns,
             query.end_ns,
             query.pid,
+            query.event_type,
+            query.max_stacks,
+        )
+        .await,
+    )
+}
+
+async fn get_process_flamegraph(Query(query): Query<ProcessFlamegraphQuery>) -> Response {
+    into_json_response(
+        viewer_backend::query_process_flamegraph(
+            query.start_ns,
+            query.end_ns,
+            query.tgid,
             query.event_type,
             query.max_stacks,
         )

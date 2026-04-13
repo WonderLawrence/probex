@@ -148,6 +148,23 @@ pub async fn get_event_flamegraph(
     get_json("/api/event_flamegraph", &query).await
 }
 
+pub async fn get_process_flamegraph(
+    start_ns: u64,
+    end_ns: u64,
+    tgid: u32,
+    event_type: String,
+    max_stacks: usize,
+) -> ApiResult<EventFlamegraphResponse> {
+    let query = vec![
+        ("start_ns", start_ns.to_string()),
+        ("end_ns", end_ns.to_string()),
+        ("tgid", tgid.to_string()),
+        ("event_type", event_type),
+        ("max_stacks", max_stacks.to_string()),
+    ];
+    get_json("/api/process_flamegraph", &query).await
+}
+
 pub async fn get_event_list(
     start_ns: u64,
     end_ns: u64,

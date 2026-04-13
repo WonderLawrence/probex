@@ -33,13 +33,14 @@ const FETCH_DEBOUNCE_MS: u32 = 80;
 use super::event_list::EventListCard;
 use super::flamegraph::{
     EventFlamegraphCard, FlamegraphCardData, FlamegraphCardScope, FlamegraphCardSelection,
+    ProcessFlamegraphCard, ProcessFlamegraphCardScope,
 };
 use super::io_statistics::{IoMemoryCard, IoMemoryCardData};
 use crate::api::{
     EventFlamegraphResponse, HistogramResponse, IoStatistics, MemoryStatistics,
     ProcessEventsResponse, ProcessLifetime, TraceSummary, get_event_flamegraph,
     get_event_type_counts, get_io_statistics, get_memory_statistics, get_pid_event_type_counts,
-    get_process_events, get_syscall_latency_stats,
+    get_process_events, get_process_flamegraph, get_syscall_latency_stats,
 };
 use crate::app::formatting::{
     format_bytes, format_duration, format_duration_short, format_net_bytes_signed,
@@ -88,7 +89,9 @@ pub fn ProcessTimeline(
     let process_bar_width_px = use_signal(|| 0.0f64);
     let mut hover_time_ns = use_signal(|| Option::<u64>::None);
     let mut analysis_tab = use_signal(|| AnalysisTab::Flamegraph);
+    let mut process_analysis_tab = use_signal(|| AnalysisTab::Flamegraph);
     let mut stats_expanded = use_signal(|| false);
+    let mut selected_tgid = use_signal(|| Option::<u32>::None);
 
     // ── Localized filter/selection signals ────────────────────────────────────
     let mut enabled_event_types = use_signal(HashSet::<String>::new);
@@ -110,12 +113,14 @@ pub fn ProcessTimeline(
     // firing expensive network requests so intermediate states are skipped.
     let mut fetch_range = use_signal(|| Option::<ViewRange>::None);
     let mut fetch_pid = use_signal(|| Option::<u32>::None);
+    let mut fetch_tgid = use_signal(|| Option::<u32>::None);
     let mut fetch_flame_type = use_signal(|| "cpu_sample".to_string());
 
     use_effect(move || {
         // Read the reactive deps — this subscribes to changes.
         let vr = view_range();
         let pid = selected_pid();
+        let tgid = selected_tgid();
         let flame_type = selected_flame_event_type();
         spawn(async move {
             sleep(std::time::Duration::from_millis(FETCH_DEBOUNCE_MS as u64)).await;
@@ -123,10 +128,12 @@ pub fn ProcessTimeline(
             // If another change happened, a newer effect will have been queued.
             if view_range() == vr
                 && selected_pid() == pid
+                && selected_tgid() == tgid
                 && selected_flame_event_type() == flame_type
             {
                 fetch_range.set(vr);
                 fetch_pid.set(pid);
+                fetch_tgid.set(tgid);
                 fetch_flame_type.set(flame_type);
             }
         });
@@ -137,6 +144,8 @@ pub fn ProcessTimeline(
     let mut process_events = use_signal(|| Option::<ProcessEventsResponse>::None);
     let mut selected_pid_event_counts = use_signal(|| None);
     let mut syscall_latency_stats = use_signal(|| None);
+    let mut process_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
+    let mut process_flamegraph_loading = use_signal(|| false);
     let mut event_flamegraph = use_signal(|| Option::<EventFlamegraphResponse>::None);
     let mut flamegraph_loading = use_signal(|| false);
     let mut io_statistics = use_signal(|| Option::<IoStatistics>::None);
@@ -152,8 +161,10 @@ pub fn ProcessTimeline(
             return;
         };
         let pid = fetch_pid();
+        let tgid = fetch_tgid();
         let flame_type = fetch_flame_type();
 
+        process_flamegraph_loading.set(true);
         flamegraph_loading.set(true);
         io_statistics_loading.set(true);
         memory_statistics_loading.set(true);
@@ -174,16 +185,36 @@ pub fn ProcessTimeline(
         // 3. Syscall latency stats
         let latency_fut = get_syscall_latency_stats(range.start_ns, range.end_ns, pid);
 
-        // 4. Flamegraph (only when a pid + event type are selected)
+        // 4. Per-thread flamegraph (only when a pid + event type are selected)
+        let flame_type_for_thread = flame_type.clone();
         let flamegraph_fut = async {
             if let Some(pid) = pid
-                && !flame_type.is_empty()
+                && !flame_type_for_thread.is_empty()
             {
                 return get_event_flamegraph(
                     range.start_ns,
                     range.end_ns,
                     Some(pid),
-                    flame_type,
+                    flame_type_for_thread,
+                    MAX_FLAME_STACKS,
+                )
+                .await
+                .ok();
+            }
+            None
+        };
+
+        // 4b. Process-level flamegraph (triggered by selected_tgid)
+        let flame_type_for_process = flame_type.clone();
+        let process_flamegraph_fut = async {
+            if let Some(tgid) = tgid
+                && !flame_type_for_process.is_empty()
+            {
+                return get_process_flamegraph(
+                    range.start_ns,
+                    range.end_ns,
+                    tgid,
+                    flame_type_for_process,
                     MAX_FLAME_STACKS,
                 )
                 .await
@@ -198,17 +229,14 @@ pub fn ProcessTimeline(
         // 6. Memory statistics
         let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid);
 
-        // Fire all six requests concurrently, wait for all to finish.
-        let (events_res, counts_res, latency_res, flamegraph_res, io_res, mem_res) = {
-            // join pairs recursively to join all six
-            let (ab, cd, ef) = {
-                let ab_fut = join(events_fut, counts_fut);
-                let cd_fut = join(latency_fut, flamegraph_fut);
-                let ef_fut = join(io_fut, mem_fut);
-                let (ab, (cd, ef)) = join(ab_fut, join(cd_fut, ef_fut)).await;
-                (ab, cd, ef)
-            };
-            (ab.0, ab.1, cd.0, cd.1, ef.0, ef.1)
+        // Fire all requests concurrently, wait for all to finish.
+        let (events_res, counts_res, latency_res, flamegraph_res, proc_flamegraph_res, io_res, mem_res) = {
+            let ab_fut = join(events_fut, counts_fut);
+            let cd_fut = join(latency_fut, flamegraph_fut);
+            let ef_fut = join(io_fut, mem_fut);
+            let ((ab, (cd, ef)), proc_fg) =
+                join(join(ab_fut, join(cd_fut, ef_fut)), process_flamegraph_fut).await;
+            (ab.0, ab.1, cd.0, cd.1, proc_fg, ef.0, ef.1)
         };
 
         // Batch-update all signals at once to trigger a single re-render.
@@ -224,6 +252,8 @@ pub fn ProcessTimeline(
             Ok(stats) => syscall_latency_stats.set(Some(stats)),
             Err(e) => log::error!("Syscall latency stats error: {}", e),
         }
+        process_flamegraph.set(proc_flamegraph_res);
+        process_flamegraph_loading.set(false);
         event_flamegraph.set(flamegraph_res);
         flamegraph_loading.set(false);
         match io_res {
@@ -269,6 +299,18 @@ pub fn ProcessTimeline(
         let collapsed = collapsed_nodes();
         build_process_tree(&processes_for_tree, &collapsed)
     });
+
+    // ── Unique tgids (process groups) ─────────────────────────────────────
+    // Build a list of unique tgids with their process name (from the first thread).
+    let unique_tgids: Vec<(u32, Option<String>)> = {
+        let mut seen = HashSet::new();
+        processes
+            .iter()
+            .filter(|p| seen.insert(p.tgid))
+            .map(|p| (p.tgid, p.process_name.clone()))
+            .collect()
+    };
+    let selected_tgid_value = selected_tgid();
 
     // ── Range values ─────────────────────────────────────────────────────────
     let Some(vr) = view_range() else {
@@ -348,6 +390,23 @@ pub fn ProcessTimeline(
             Some(pid)
         };
         selected_pid.set(next);
+        // Clear process row selection when selecting a thread
+        if next.is_some() {
+            selected_tgid.set(None);
+        }
+    };
+
+    let mut toggle_tgid = move |tgid: u32| {
+        let next = if selected_tgid() == Some(tgid) {
+            None
+        } else {
+            Some(tgid)
+        };
+        selected_tgid.set(next);
+        // Clear thread row selection when selecting a process
+        if next.is_some() {
+            selected_pid.set(None);
+        }
     };
 
     rsx! {
@@ -643,6 +702,75 @@ pub fn ProcessTimeline(
                         }
                     }
                 }
+
+                // ── Process-level rows (one per unique tgid) ────────────────
+                {unique_tgids.iter().map(|(tgid, proc_name)| {
+                    let tgid = *tgid;
+                    let is_process_selected = selected_tgid_value == Some(tgid);
+                    let proc_label = proc_name.as_deref().unwrap_or("unknown");
+                    let thread_count = processes.iter().filter(|p| p.tgid == tgid).count();
+                    let process_flamegraph_for_row = process_flamegraph();
+                    let process_flamegraph_loading_for_row = process_flamegraph_loading();
+                    let flame_event_type_options_for_process = flame_event_type_options();
+                    let selected_flame_event_type_for_process = selected_flame_event_type_value.clone();
+
+                    rsx! {
+                        div {
+                            key: "process-{tgid}",
+                            class: "mb-1",
+                            // Clickable process row header
+                            div {
+                                class: if is_process_selected {
+                                    "flex items-center gap-2 px-2 py-1 rounded cursor-pointer border-2 border-blue-400 bg-blue-50"
+                                } else {
+                                    "flex items-center gap-2 px-2 py-1 rounded cursor-pointer border-2 border-blue-200 bg-white hover:bg-blue-50/50"
+                                },
+                                onclick: move |_| toggle_tgid(tgid),
+                                span { class: "text-xs font-medium text-blue-700", "{proc_label}" }
+                                span { class: "text-[11px] text-gray-400", "Process {tgid}" }
+                                span { class: "text-[11px] text-gray-400", "\u{00b7} {thread_count} threads" }
+                            }
+                            // Expanded analysis panel
+                            if is_process_selected {
+                                div { class: "ml-4 mt-1 space-y-1",
+                                    // Tab bar
+                                    div { class: "flex items-center gap-0.5 border-b border-gray-200",
+                                        button {
+                                            class: AnalysisTab::Flamegraph.class(process_analysis_tab()),
+                                            onclick: move |_| process_analysis_tab.set(AnalysisTab::Flamegraph),
+                                            "Flamegraph"
+                                        }
+                                    }
+                                    // Tab content
+                                    match process_analysis_tab() {
+                                        AnalysisTab::Flamegraph => rsx! {
+                                            ProcessFlamegraphCard {
+                                                selection: FlamegraphCardSelection {
+                                                    selected_event_type: selected_flame_event_type_for_process,
+                                                    event_type_options: flame_event_type_options_for_process,
+                                                },
+                                                scope: ProcessFlamegraphCardScope {
+                                                    tgid,
+                                                    full_start_ns: range.full_start_ns,
+                                                    view_start_ns: range.view_start_ns,
+                                                    view_end_ns: range.view_end_ns,
+                                                },
+                                                data: FlamegraphCardData {
+                                                    flamegraph: process_flamegraph_for_row,
+                                                    loading: process_flamegraph_loading_for_row,
+                                                },
+                                                on_select_event_type: move |event_type: String| {
+                                                    selected_flame_event_type.set(event_type);
+                                                },
+                                            }
+                                        },
+                                        _ => rsx! {},
+                                    }
+                                }
+                            }
+                        }
+                    }
+                })}
 
                 div { class: if tree.visible_process_rows.len() > 15 { "space-y-0.5 max-h-[72vh] overflow-y-auto bg-gray-50/50 p-2 rounded" } else { "space-y-0.5 bg-gray-50/50 p-2 rounded" },
                 {tree.visible_process_rows.iter().map(|(proc, tree_pos)| {

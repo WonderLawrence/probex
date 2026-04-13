@@ -840,8 +840,8 @@ mod backend {
         let exit_df = ctx.sql(exit_sql).await?;
         let exit_batches = exit_df.collect().await?;
 
-        // Get first and last seen times for all PIDs
-        let times_sql = "SELECT pid, MIN(ts_ns) as first_seen, MAX(ts_ns) as last_seen FROM events GROUP BY pid";
+        // Get first and last seen times for all PIDs, along with their tgid
+        let times_sql = "SELECT pid, MIN(tgid) as tgid, MIN(ts_ns) as first_seen, MAX(ts_ns) as last_seen FROM events GROUP BY pid";
         let times_df = ctx.sql(times_sql).await?;
         let times_batches = times_df.collect().await?;
 
@@ -856,8 +856,8 @@ mod backend {
             std::collections::HashMap::new(); // child -> (parent, ts)
         let mut exit_info: std::collections::HashMap<u32, (i32, u64)> =
             std::collections::HashMap::new(); // pid -> (exit_code, ts)
-        let mut pid_times: std::collections::HashMap<u32, (u64, u64)> =
-            std::collections::HashMap::new(); // pid -> (first, last)
+        let mut pid_times: std::collections::HashMap<u32, (u32, u64, u64)> =
+            std::collections::HashMap::new(); // pid -> (tgid, first, last)
         let mut pid_names: std::collections::HashMap<u32, String> =
             std::collections::HashMap::new(); // pid -> name
 
@@ -888,13 +888,14 @@ mod backend {
             }
         }
 
-        // Parse first/last times
+        // Parse first/last times and tgid
         for batch in &times_batches {
             for row in 0..batch.num_rows() {
                 let pid = extract_u32(batch, "pid", row)?;
+                let tgid = extract_u32(batch, "tgid", row)?;
                 let first = extract_u64(batch, "first_seen", row)?;
                 let last = extract_u64(batch, "last_seen", row)?;
-                pid_times.insert(pid, (first, last));
+                pid_times.insert(pid, (tgid, first, last));
             }
         }
 
@@ -910,7 +911,7 @@ mod backend {
 
         // Build process lifetimes
         let mut processes: Vec<ProcessLifetime> = Vec::new();
-        for (pid, (first_seen, last_seen)) in &pid_times {
+        for (pid, (tgid, first_seen, last_seen)) in &pid_times {
             let (parent_pid, start_ns, was_forked) =
                 if let Some((parent, fork_ts)) = fork_info.get(pid) {
                     (Some(*parent), *fork_ts, true)
@@ -926,6 +927,7 @@ mod backend {
 
             processes.push(ProcessLifetime {
                 pid: *pid,
+                tgid: *tgid,
                 process_name: pid_names.get(pid).cloned(),
                 parent_pid,
                 start_ns,
@@ -1561,12 +1563,15 @@ mod backend {
         })
     }
 
-    pub async fn query_event_flamegraph(
+    /// Shared flamegraph builder: runs a SQL query with the given extra WHERE
+    /// conditions, reservoir-samples stack traces, and renders an SVG.
+    async fn build_flamegraph(
+        extra_conditions: &[String],
         start_ns: u64,
         end_ns: u64,
-        pid: Option<u32>,
         event_type: String,
         max_stacks: usize,
+        rng_seed_extra: u64,
     ) -> BackendResult<EventFlamegraphResponse> {
         let ctx = get_ctx()?;
         if end_ns < start_ns {
@@ -1587,9 +1592,7 @@ mod backend {
             format!("event_type = '{}'", event_type.replace('\'', "''")),
             "(stack_trace IS NOT NULL)".to_string(),
         ];
-        if let Some(pid) = pid {
-            conditions.push(format!("pid = {}", pid));
-        }
+        conditions.extend_from_slice(extra_conditions);
 
         let sql = format!(
             "SELECT stack_trace
@@ -1609,7 +1612,7 @@ mod backend {
             let mut hasher = DefaultHasher::new();
             start_ns.hash(&mut hasher);
             end_ns.hash(&mut hasher);
-            pid.hash(&mut hasher);
+            rng_seed_extra.hash(&mut hasher);
             event_type.hash(&mut hasher);
             hasher.finish() | 1
         };
@@ -1663,6 +1666,32 @@ mod backend {
             total_samples,
             svg,
         })
+    }
+
+    pub async fn query_event_flamegraph(
+        start_ns: u64,
+        end_ns: u64,
+        pid: Option<u32>,
+        event_type: String,
+        max_stacks: usize,
+    ) -> BackendResult<EventFlamegraphResponse> {
+        let mut extra = Vec::new();
+        if let Some(pid) = pid {
+            extra.push(format!("pid = {}", pid));
+        }
+        let seed = pid.map(|p| p as u64).unwrap_or(0);
+        build_flamegraph(&extra, start_ns, end_ns, event_type, max_stacks, seed).await
+    }
+
+    pub async fn query_process_flamegraph(
+        start_ns: u64,
+        end_ns: u64,
+        tgid: u32,
+        event_type: String,
+        max_stacks: usize,
+    ) -> BackendResult<EventFlamegraphResponse> {
+        let extra = vec![format!("tgid = {}", tgid)];
+        build_flamegraph(&extra, start_ns, end_ns, event_type, max_stacks, tgid as u64).await
     }
 
     pub async fn query_event_list(
@@ -1789,6 +1818,16 @@ pub async fn query_event_flamegraph(
     max_stacks: usize,
 ) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
     backend::query_event_flamegraph(start_ns, end_ns, pid, event_type, max_stacks).await
+}
+
+pub async fn query_process_flamegraph(
+    start_ns: u64,
+    end_ns: u64,
+    tgid: u32,
+    event_type: String,
+    max_stacks: usize,
+) -> Result<EventFlamegraphResponse, Box<dyn std::error::Error + Send + Sync>> {
+    backend::query_process_flamegraph(start_ns, end_ns, tgid, event_type, max_stacks).await
 }
 
 pub async fn query_io_statistics(
