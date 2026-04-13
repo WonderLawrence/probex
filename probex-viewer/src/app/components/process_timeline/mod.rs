@@ -152,6 +152,8 @@ pub fn ProcessTimeline(
     let mut io_statistics_loading = use_signal(|| false);
     let mut memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
     let mut memory_statistics_loading = use_signal(|| false);
+    let mut process_io_statistics = use_signal(|| Option::<IoStatistics>::None);
+    let mut process_memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
 
     // All network requests run in parallel inside one resource. This means
     // signals are updated in a single batch after all responses arrive,
@@ -224,19 +226,40 @@ pub fn ProcessTimeline(
         };
 
         // 5. IO statistics
-        let io_fut = get_io_statistics(range.start_ns, range.end_ns, pid);
+        let io_fut = get_io_statistics(range.start_ns, range.end_ns, pid, None);
 
         // 6. Memory statistics
-        let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid);
+        let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid, None);
+
+        // 7. Process-level IO statistics (triggered by selected_tgid)
+        let process_io_fut = async {
+            if let Some(tgid) = tgid {
+                return get_io_statistics(range.start_ns, range.end_ns, None, Some(tgid))
+                    .await
+                    .ok();
+            }
+            None
+        };
+
+        // 8. Process-level Memory statistics (triggered by selected_tgid)
+        let process_mem_fut = async {
+            if let Some(tgid) = tgid {
+                return get_memory_statistics(range.start_ns, range.end_ns, None, Some(tgid))
+                    .await
+                    .ok();
+            }
+            None
+        };
 
         // Fire all requests concurrently, wait for all to finish.
-        let (events_res, counts_res, latency_res, flamegraph_res, proc_flamegraph_res, io_res, mem_res) = {
+        let (events_res, counts_res, latency_res, flamegraph_res, proc_flamegraph_res, io_res, mem_res, proc_io_res, proc_mem_res) = {
             let ab_fut = join(events_fut, counts_fut);
             let cd_fut = join(latency_fut, flamegraph_fut);
             let ef_fut = join(io_fut, mem_fut);
-            let ((ab, (cd, ef)), proc_fg) =
-                join(join(ab_fut, join(cd_fut, ef_fut)), process_flamegraph_fut).await;
-            (ab.0, ab.1, cd.0, cd.1, proc_fg, ef.0, ef.1)
+            let proc_extra_fut = join(process_io_fut, process_mem_fut);
+            let (((ab, (cd, ef)), proc_fg), proc_extra) =
+                join(join(join(ab_fut, join(cd_fut, ef_fut)), process_flamegraph_fut), proc_extra_fut).await;
+            (ab.0, ab.1, cd.0, cd.1, proc_fg, ef.0, ef.1, proc_extra.0, proc_extra.1)
         };
 
         // Batch-update all signals at once to trigger a single re-render.
@@ -272,6 +295,8 @@ pub fn ProcessTimeline(
             }
         }
         memory_statistics_loading.set(false);
+        process_io_statistics.set(proc_io_res);
+        process_memory_statistics.set(proc_mem_res);
     });
 
     // ── Derived state (memoized) ───────────────────────────────────────────
@@ -713,32 +738,108 @@ pub fn ProcessTimeline(
                     let process_flamegraph_loading_for_row = process_flamegraph_loading();
                     let flame_event_type_options_for_process = flame_event_type_options();
                     let selected_flame_event_type_for_process = selected_flame_event_type_value.clone();
+                    let process_io_for_row = process_io_statistics();
+                    let process_mem_for_row = process_memory_statistics();
+
+                    // Aggregate event markers from all threads of this process
+                    let view_duration_ns_proc = range.view_end_ns.saturating_sub(range.view_start_ns).max(1);
+                    let view_duration_proc = view_duration_ns_proc as f64;
+                    let process_event_markers: Vec<CanvasEventMarker> = {
+                        let tgid_pids: Vec<u32> = processes.iter().filter(|p| p.tgid == tgid).map(|p| p.pid).collect();
+                        let mut markers = Vec::new();
+                        for pid in &tgid_pids {
+                            if let Some(events) = events_map.get(pid) {
+                                for e in events.iter().filter(|e| {
+                                    enabled_event_types().contains(&e.event_type)
+                                        && e.ts_ns >= range.view_start_ns
+                                        && e.ts_ns <= range.view_end_ns
+                                }) {
+                                    let pct = ((e.ts_ns - range.view_start_ns) as f64 / view_duration_proc * 100.0).clamp(0.0, 100.0);
+                                    markers.push(CanvasEventMarker { pct, color_hex: get_event_marker_color(&e.event_type) });
+                                }
+                            }
+                        }
+                        markers
+                    };
+
+                    // Aggregate CPU usage from all threads of this process
+                    let process_cpu_usage_points: Vec<f64> = {
+                        let tgid_pids: Vec<u32> = processes.iter().filter(|p| p.tgid == tgid).map(|p| p.pid).collect();
+                        if cpu_sample_bucket_count == 0 {
+                            Vec::new()
+                        } else {
+                            let mut combined = vec![0u16; cpu_sample_bucket_count];
+                            for pid in &tgid_pids {
+                                if let Some(bucket_counts) = cpu_sample_counts_map.get(pid) {
+                                    for (i, count) in bucket_counts.iter().enumerate() {
+                                        if i < combined.len() {
+                                            combined[i] = combined[i].saturating_add(*count);
+                                        }
+                                    }
+                                }
+                            }
+                            build_cpu_usage_points(&combined, cpu_sample_bucket_count, sample_frequency_hz, view_duration_ns_proc)
+                        }
+                    };
 
                     rsx! {
                         div {
                             key: "process-{tgid}",
-                            class: "mb-1",
-                            // Clickable process row header
+                            class: "mb-1 space-y-1",
+                            // Clickable process row header (same layout as thread rows)
                             div {
                                 class: if is_process_selected {
-                                    "flex items-center gap-2 px-2 py-1 rounded cursor-pointer border-2 border-blue-400 bg-blue-50"
+                                    "flex items-center gap-2 h-7 border-2 border-blue-400 bg-blue-50 rounded cursor-pointer"
                                 } else {
-                                    "flex items-center gap-2 px-2 py-1 rounded cursor-pointer border-2 border-blue-200 bg-white hover:bg-blue-50/50"
+                                    "flex items-center gap-2 h-7 border-2 border-blue-200 bg-white hover:bg-blue-50/50 rounded cursor-pointer"
                                 },
                                 onclick: move |_| toggle_tgid(tgid),
-                                span { class: "text-xs font-medium text-blue-700", "{proc_label}" }
-                                span { class: "text-[11px] text-gray-400", "Process {tgid}" }
-                                span { class: "text-[11px] text-gray-400", "\u{00b7} {thread_count} threads" }
+
+                                // Label column (same width as thread rows)
+                                div {
+                                    class: "w-56 shrink-0 flex items-center px-1",
+                                    if is_process_selected {
+                                        span { class: "inline-block w-1.5 h-1.5 rounded-full bg-blue-600 shrink-0 mr-1" }
+                                    }
+                                    span { class: "text-xs font-medium text-blue-700 truncate", "Process {proc_label}" }
+                                    span { class: "text-[10px] font-mono text-gray-400 ml-1 shrink-0", "TGID {tgid}" }
+                                    span { class: "text-[10px] text-gray-400 ml-1 shrink-0", "\u{00b7} {thread_count} threads" }
+                                }
+
+                                // Activity bar (same layout as thread rows)
+                                div {
+                                    class: "flex-1 relative h-5 bg-gray-100 rounded overflow-hidden",
+                                    ProcessActivityCanvas {
+                                        usage_points: process_cpu_usage_points,
+                                        event_markers: process_event_markers,
+                                        fork_pct: None::<f64>,
+                                        exit_pct: None::<f64>,
+                                        exit_ok: false,
+                                    }
+                                }
+
+                                // Duration column placeholder
+                                div { class: "w-20 shrink-0" }
                             }
                             // Expanded analysis panel
                             if is_process_selected {
-                                div { class: "ml-4 mt-1 space-y-1",
+                                div { class: "ml-56 pl-2 space-y-1",
                                     // Tab bar
                                     div { class: "flex items-center gap-0.5 border-b border-gray-200",
                                         button {
                                             class: AnalysisTab::Flamegraph.class(process_analysis_tab()),
                                             onclick: move |_| process_analysis_tab.set(AnalysisTab::Flamegraph),
                                             "Flamegraph"
+                                        }
+                                        button {
+                                            class: AnalysisTab::IoStatistics.class(process_analysis_tab()),
+                                            onclick: move |_| process_analysis_tab.set(AnalysisTab::IoStatistics),
+                                            "IO / Memory"
+                                        }
+                                        button {
+                                            class: AnalysisTab::Events.class(process_analysis_tab()),
+                                            onclick: move |_| process_analysis_tab.set(AnalysisTab::Events),
+                                            "Events"
                                         }
                                     }
                                     // Tab content
@@ -764,7 +865,24 @@ pub fn ProcessTimeline(
                                                 },
                                             }
                                         },
-                                        _ => rsx! {},
+                                        AnalysisTab::IoStatistics => rsx! {
+                                            IoMemoryCard {
+                                                data: IoMemoryCardData {
+                                                    io_stats: process_io_for_row,
+                                                    mem_stats: process_mem_for_row,
+                                                },
+                                            }
+                                        },
+                                        AnalysisTab::Events => rsx! {
+                                            EventListCard {
+                                                pid: None::<u32>,
+                                                tgid: Some(tgid),
+                                                view_start_ns: range.view_start_ns,
+                                                view_end_ns: range.view_end_ns,
+                                                full_start_ns: range.full_start_ns,
+                                                event_types: enabled_event_types().iter().cloned().collect::<Vec<String>>(),
+                                            }
+                                        },
                                     }
                                 }
                             }
@@ -1163,7 +1281,8 @@ pub fn ProcessTimeline(
                                         },
                                         AnalysisTab::Events => rsx! {
                                             EventListCard {
-                                                pid: proc.pid,
+                                                pid: Some(proc.pid),
+                                                tgid: None::<u32>,
                                                 view_start_ns: range.view_start_ns,
                                                 view_end_ns: range.view_end_ns,
                                                 full_start_ns: range.full_start_ns,

@@ -76,13 +76,15 @@ struct IoStatisticsQuery {
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
+    tgid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct EventListQuery {
     start_ns: u64,
     end_ns: u64,
-    pid: u32,
+    pid: Option<u32>,
+    tgid: Option<u32>,
     limit: usize,
     offset: usize,
     #[serde(default)]
@@ -215,13 +217,15 @@ async fn get_process_flamegraph(Query(query): Query<ProcessFlamegraphQuery>) -> 
 
 async fn get_io_statistics(Query(query): Query<IoStatisticsQuery>) -> Response {
     into_json_response(
-        viewer_backend::query_io_statistics(query.start_ns, query.end_ns, query.pid).await,
+        viewer_backend::query_io_statistics(query.start_ns, query.end_ns, query.pid, query.tgid)
+            .await,
     )
 }
 
 async fn get_memory_statistics(Query(query): Query<IoStatisticsQuery>) -> Response {
     into_json_response(
-        viewer_backend::query_memory_statistics(query.start_ns, query.end_ns, query.pid).await,
+        viewer_backend::query_memory_statistics(query.start_ns, query.end_ns, query.pid, query.tgid)
+            .await,
     )
 }
 
@@ -237,6 +241,7 @@ async fn get_event_list(Query(query): Query<EventListQuery>) -> Response {
             query.start_ns,
             query.end_ns,
             query.pid,
+            query.tgid,
             query.limit,
             query.offset,
             &event_types,

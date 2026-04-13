@@ -1102,6 +1102,7 @@ mod backend {
         start_ns: u64,
         end_ns: u64,
         pid: Option<u32>,
+        tgid: Option<u32>,
     ) -> BackendResult<IoStatistics> {
         if end_ns < start_ns {
             return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
@@ -1111,6 +1112,9 @@ mod backend {
         let mut conditions = vec![format!("ts_ns >= {start_ns}"), format!("ts_ns <= {end_ns}")];
         if let Some(pid) = pid {
             conditions.push(format!("pid = {pid}"));
+        }
+        if let Some(tgid) = tgid {
+            conditions.push(format!("tgid = {tgid}"));
         }
 
         let sql = format!(
@@ -1361,6 +1365,7 @@ mod backend {
         start_ns: u64,
         end_ns: u64,
         pid: Option<u32>,
+        tgid: Option<u32>,
     ) -> BackendResult<MemoryStatistics> {
         if end_ns < start_ns {
             return Err(IoError::new(ErrorKind::InvalidInput, "end_ns must be >= start_ns").into());
@@ -1370,6 +1375,9 @@ mod backend {
         let mut conditions = vec![format!("ts_ns >= {start_ns}"), format!("ts_ns <= {end_ns}")];
         if let Some(pid) = pid {
             conditions.push(format!("pid = {pid}"));
+        }
+        if let Some(tgid) = tgid {
+            conditions.push(format!("tgid = {tgid}"));
         }
 
         let sql = format!(
@@ -1697,12 +1705,26 @@ mod backend {
     pub async fn query_event_list(
         start_ns: u64,
         end_ns: u64,
-        pid: u32,
+        pid: Option<u32>,
+        tgid: Option<u32>,
         limit: usize,
         offset: usize,
         event_types: &[String],
     ) -> BackendResult<EventListResponse> {
         let ctx = get_ctx()?;
+
+        let mut id_filters = Vec::new();
+        if let Some(pid) = pid {
+            id_filters.push(format!("pid = {pid}"));
+        }
+        if let Some(tgid) = tgid {
+            id_filters.push(format!("tgid = {tgid}"));
+        }
+        let id_filter = if id_filters.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", id_filters.join(" AND "))
+        };
 
         let type_filter = if event_types.is_empty() {
             String::new()
@@ -1712,7 +1734,7 @@ mod backend {
         };
 
         let count_sql = format!(
-            "SELECT COUNT(*) as cnt FROM events WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter}"
+            "SELECT COUNT(*) as cnt FROM events WHERE ts_ns >= {start_ns} AND ts_ns <= {end_ns}{id_filter}{type_filter}"
         );
         let count_df = ctx.sql(&count_sql).await?;
         let count_batches = count_df.collect().await?;
@@ -1726,7 +1748,7 @@ mod backend {
 
         let sql = format!(
             "SELECT ts_ns, event_type, pid, stack_trace FROM events \
-             WHERE pid = {pid} AND ts_ns >= {start_ns} AND ts_ns <= {end_ns}{type_filter} \
+             WHERE ts_ns >= {start_ns} AND ts_ns <= {end_ns}{id_filter}{type_filter} \
              ORDER BY ts_ns LIMIT {limit} OFFSET {offset}"
         );
         let df = ctx.sql(&sql).await?;
@@ -1834,25 +1856,28 @@ pub async fn query_io_statistics(
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
+    tgid: Option<u32>,
 ) -> Result<IoStatistics, Box<dyn std::error::Error + Send + Sync>> {
-    backend::query_io_statistics(start_ns, end_ns, pid).await
+    backend::query_io_statistics(start_ns, end_ns, pid, tgid).await
 }
 
 pub async fn query_memory_statistics(
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
+    tgid: Option<u32>,
 ) -> Result<MemoryStatistics, Box<dyn std::error::Error + Send + Sync>> {
-    backend::query_memory_statistics(start_ns, end_ns, pid).await
+    backend::query_memory_statistics(start_ns, end_ns, pid, tgid).await
 }
 
 pub async fn query_event_list(
     start_ns: u64,
     end_ns: u64,
-    pid: u32,
+    pid: Option<u32>,
+    tgid: Option<u32>,
     limit: usize,
     offset: usize,
     event_types: &[String],
 ) -> Result<EventListResponse, Box<dyn std::error::Error + Send + Sync>> {
-    backend::query_event_list(start_ns, end_ns, pid, limit, offset, event_types).await
+    backend::query_event_list(start_ns, end_ns, pid, tgid, limit, offset, event_types).await
 }
