@@ -152,8 +152,6 @@ pub fn ProcessTimeline(
     let mut io_statistics_loading = use_signal(|| false);
     let mut memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
     let mut memory_statistics_loading = use_signal(|| false);
-    let mut process_io_statistics = use_signal(|| Option::<IoStatistics>::None);
-    let mut process_memory_statistics = use_signal(|| Option::<MemoryStatistics>::None);
 
     // All network requests run in parallel inside one resource. This means
     // signals are updated in a single batch after all responses arrive,
@@ -226,40 +224,19 @@ pub fn ProcessTimeline(
         };
 
         // 5. IO statistics
-        let io_fut = get_io_statistics(range.start_ns, range.end_ns, pid, None);
+        let io_fut = get_io_statistics(range.start_ns, range.end_ns, pid);
 
         // 6. Memory statistics
-        let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid, None);
-
-        // 7. Process-level IO statistics (triggered by selected_tgid)
-        let process_io_fut = async {
-            if let Some(tgid) = tgid {
-                return get_io_statistics(range.start_ns, range.end_ns, None, Some(tgid))
-                    .await
-                    .ok();
-            }
-            None
-        };
-
-        // 8. Process-level Memory statistics (triggered by selected_tgid)
-        let process_mem_fut = async {
-            if let Some(tgid) = tgid {
-                return get_memory_statistics(range.start_ns, range.end_ns, None, Some(tgid))
-                    .await
-                    .ok();
-            }
-            None
-        };
+        let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid);
 
         // Fire all requests concurrently, wait for all to finish.
-        let (events_res, counts_res, latency_res, flamegraph_res, proc_flamegraph_res, io_res, mem_res, proc_io_res, proc_mem_res) = {
+        let (events_res, counts_res, latency_res, flamegraph_res, proc_flamegraph_res, io_res, mem_res) = {
             let ab_fut = join(events_fut, counts_fut);
             let cd_fut = join(latency_fut, flamegraph_fut);
             let ef_fut = join(io_fut, mem_fut);
-            let proc_extra_fut = join(process_io_fut, process_mem_fut);
-            let (((ab, (cd, ef)), proc_fg), proc_extra) =
-                join(join(join(ab_fut, join(cd_fut, ef_fut)), process_flamegraph_fut), proc_extra_fut).await;
-            (ab.0, ab.1, cd.0, cd.1, proc_fg, ef.0, ef.1, proc_extra.0, proc_extra.1)
+            let ((ab, (cd, ef)), proc_fg) =
+                join(join(ab_fut, join(cd_fut, ef_fut)), process_flamegraph_fut).await;
+            (ab.0, ab.1, cd.0, cd.1, proc_fg, ef.0, ef.1)
         };
 
         // Batch-update all signals at once to trigger a single re-render.
@@ -295,8 +272,6 @@ pub fn ProcessTimeline(
             }
         }
         memory_statistics_loading.set(false);
-        process_io_statistics.set(proc_io_res);
-        process_memory_statistics.set(proc_mem_res);
     });
 
     // ── Derived state (memoized) ───────────────────────────────────────────
@@ -738,8 +713,6 @@ pub fn ProcessTimeline(
                     let process_flamegraph_loading_for_row = process_flamegraph_loading();
                     let flame_event_type_options_for_process = flame_event_type_options();
                     let selected_flame_event_type_for_process = selected_flame_event_type_value.clone();
-                    let process_io_for_row = process_io_statistics();
-                    let process_mem_for_row = process_memory_statistics();
 
                     // Aggregate event markers from all threads of this process
                     let view_duration_ns_proc = range.view_end_ns.saturating_sub(range.view_start_ns).max(1);
@@ -831,16 +804,6 @@ pub fn ProcessTimeline(
                                             onclick: move |_| process_analysis_tab.set(AnalysisTab::Flamegraph),
                                             "Flamegraph"
                                         }
-                                        button {
-                                            class: AnalysisTab::IoStatistics.class(process_analysis_tab()),
-                                            onclick: move |_| process_analysis_tab.set(AnalysisTab::IoStatistics),
-                                            "IO / Memory"
-                                        }
-                                        button {
-                                            class: AnalysisTab::Events.class(process_analysis_tab()),
-                                            onclick: move |_| process_analysis_tab.set(AnalysisTab::Events),
-                                            "Events"
-                                        }
                                     }
                                     // Tab content
                                     match process_analysis_tab() {
@@ -865,24 +828,7 @@ pub fn ProcessTimeline(
                                                 },
                                             }
                                         },
-                                        AnalysisTab::IoStatistics => rsx! {
-                                            IoMemoryCard {
-                                                data: IoMemoryCardData {
-                                                    io_stats: process_io_for_row,
-                                                    mem_stats: process_mem_for_row,
-                                                },
-                                            }
-                                        },
-                                        AnalysisTab::Events => rsx! {
-                                            EventListCard {
-                                                pid: None::<u32>,
-                                                tgid: Some(tgid),
-                                                view_start_ns: range.view_start_ns,
-                                                view_end_ns: range.view_end_ns,
-                                                full_start_ns: range.full_start_ns,
-                                                event_types: enabled_event_types().iter().cloned().collect::<Vec<String>>(),
-                                            }
-                                        },
+                                        _ => rsx! {},
                                     }
                                 }
                             }
@@ -1281,8 +1227,7 @@ pub fn ProcessTimeline(
                                         },
                                         AnalysisTab::Events => rsx! {
                                             EventListCard {
-                                                pid: Some(proc.pid),
-                                                tgid: None::<u32>,
+                                                pid: proc.pid,
                                                 view_start_ns: range.view_start_ns,
                                                 view_end_ns: range.view_end_ns,
                                                 full_start_ns: range.full_start_ns,

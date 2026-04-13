@@ -168,8 +168,7 @@ pub async fn get_process_flamegraph(
 pub async fn get_event_list(
     start_ns: u64,
     end_ns: u64,
-    pid: Option<u32>,
-    tgid: Option<u32>,
+    pid: u32,
     limit: usize,
     offset: usize,
     event_types: &[String],
@@ -177,15 +176,10 @@ pub async fn get_event_list(
     let mut query = vec![
         ("start_ns", start_ns.to_string()),
         ("end_ns", end_ns.to_string()),
+        ("pid", pid.to_string()),
         ("limit", limit.to_string()),
         ("offset", offset.to_string()),
     ];
-    if let Some(pid) = pid {
-        query.push(("pid", pid.to_string()));
-    }
-    if let Some(tgid) = tgid {
-        query.push(("tgid", tgid.to_string()));
-    }
     if !event_types.is_empty() {
         query.push(("event_types", event_types.join(",")));
     }
@@ -196,7 +190,6 @@ pub async fn get_io_statistics(
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
-    tgid: Option<u32>,
 ) -> ApiResult<IoStatistics> {
     let mut query = vec![
         ("start_ns", start_ns.to_string()),
@@ -205,9 +198,6 @@ pub async fn get_io_statistics(
     if let Some(pid) = pid {
         query.push(("pid", pid.to_string()));
     }
-    if let Some(tgid) = tgid {
-        query.push(("tgid", tgid.to_string()));
-    }
     get_json("/api/io_statistics", &query).await
 }
 
@@ -215,7 +205,6 @@ pub async fn get_memory_statistics(
     start_ns: u64,
     end_ns: u64,
     pid: Option<u32>,
-    tgid: Option<u32>,
 ) -> ApiResult<MemoryStatistics> {
     let mut query = vec![
         ("start_ns", start_ns.to_string()),
@@ -223,9 +212,6 @@ pub async fn get_memory_statistics(
     ];
     if let Some(pid) = pid {
         query.push(("pid", pid.to_string()));
-    }
-    if let Some(tgid) = tgid {
-        query.push(("tgid", tgid.to_string()));
     }
     get_json("/api/memory_statistics", &query).await
 }
