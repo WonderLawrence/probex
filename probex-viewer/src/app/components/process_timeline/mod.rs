@@ -230,7 +230,15 @@ pub fn ProcessTimeline(
         let mem_fut = get_memory_statistics(range.start_ns, range.end_ns, pid);
 
         // Fire all requests concurrently, wait for all to finish.
-        let (events_res, counts_res, latency_res, flamegraph_res, proc_flamegraph_res, io_res, mem_res) = {
+        let (
+            events_res,
+            counts_res,
+            latency_res,
+            flamegraph_res,
+            proc_flamegraph_res,
+            io_res,
+            mem_res,
+        ) = {
             let ab_fut = join(events_fut, counts_fut);
             let cd_fut = join(latency_fut, flamegraph_fut);
             let ef_fut = join(io_fut, mem_fut);

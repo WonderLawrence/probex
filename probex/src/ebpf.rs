@@ -48,8 +48,8 @@ pub fn attach_cpu_sampler(
         // In attach mode, OneProcessAnyCpu only monitors the main thread and
         // misses existing worker threads. Instead, attach to every online CPU
         // and let the eBPF program's TRACED_PIDS filter select the target process.
-        let num_cpus = aya::util::online_cpus()
-            .map_err(|e| anyhow!("failed to get online CPUs: {:?}", e))?;
+        let num_cpus =
+            aya::util::online_cpus().map_err(|e| anyhow!("failed to get online CPUs: {:?}", e))?;
         for cpu in num_cpus {
             program.attach(
                 PerfTypeId::Software,

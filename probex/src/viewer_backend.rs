@@ -1691,7 +1691,15 @@ mod backend {
         max_stacks: usize,
     ) -> BackendResult<EventFlamegraphResponse> {
         let extra = vec![format!("tgid = {}", tgid)];
-        build_flamegraph(&extra, start_ns, end_ns, event_type, max_stacks, tgid as u64).await
+        build_flamegraph(
+            &extra,
+            start_ns,
+            end_ns,
+            event_type,
+            max_stacks,
+            tgid as u64,
+        )
+        .await
     }
 
     pub async fn query_event_list(
